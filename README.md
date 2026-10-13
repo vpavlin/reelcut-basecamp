@@ -15,12 +15,16 @@ Reelcut on [apps.vpavlin.xyz](https://apps.vpavlin.xyz)) and install **Reelcut**
 - **Paste and go:** the video is downloaded and transcribed **on your computer** (Parakeet, on the
   CPU, nothing leaves it). Then the best moments are picked from the transcript and the reels are
   cut, 1080×1920 with captions and a hook title.
-- **Picking the moments, two ways:**
-  - **Any AI chat, no setup:** "Copy the prompt" puts the instructions and the transcript on the
-    clipboard; paste them into Claude, ChatGPT or any other chat, then paste its answer back.
-  - **An agent on your [shrooms](https://github.com/vpavlin/shrooms) mesh, automatic:** with
-    `shrooms-agent` installed, choose a session in ⚙ and every new video is sent to it as a task;
-    its answer is cut straight away.
+- **Picking the moments:**
+  - **An agent on this computer, automatic:** with [shrooms-agent](https://github.com/vpavlin/shrooms)
+    installed (no mesh needed) and podman, Reelcut starts a session of its own in a container (a
+    cage) and every new video goes to it; its answer is cut straight away. Choose in ⚙ which agent:
+    **Claude Code** with your existing Claude login, or **pi** with the model and key in pi's own
+    settings. "Automatic" takes Claude Code when it is there, else pi.
+  - **An agent on your shrooms mesh:** any session on your other machines, chosen in ⚙.
+  - **Any AI chat, no setup:** without an agent, "Copy the prompt" puts the instructions and the
+    transcript on the clipboard; paste them into Claude, ChatGPT or any other chat, then paste its
+    answer back.
 - **Or a file:** "use a video file…" takes a video from disk instead of an address.
 - **Edit the clips:** the clip list (`N | START H:MM:SS | END H:MM:SS | speaker | hook | until LASTWORD`)
   can be edited by hand, with the transcript a click away.
@@ -48,9 +52,11 @@ One of, in this order:
 2. **reelcut on PATH** with its tools (yt-dlp, ffmpeg, parakeet-cli and the model): see the
    reelcut README.
 
-Picking needs nothing more: copy the prompt into any AI chat. Picking by an agent instead needs
-[shrooms](https://github.com/vpavlin/shrooms) (`shrooms-agent`) and a session on the mesh to ask,
-chosen in ⚙; the transcript goes to that agent as a task.
+Picking needs nothing more: copy the prompt into any AI chat. For automatic picking, install
+`shrooms-agent` from [shrooms](https://github.com/vpavlin/shrooms): on its own it serves this
+computer only, on a socket only you can open, and Reelcut makes its sessions there (`reelcut-claude`,
+`reelcut-pi`, caged, in `~/Videos/Reelcut/.picker`). The agent needs a key: your Claude login for
+Claude Code, or a provider in pi's settings. A shrooms mesh adds your other machines' sessions.
 
 Basecamp 0.3 sandboxes views (no network, no files outside the view's own folder), so everything
 runs in `reelcut_core`; the reel previews are copied to `<view folder>/cache/`.

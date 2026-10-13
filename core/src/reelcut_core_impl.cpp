@@ -38,6 +38,8 @@ using json = nlohmann::json;
 namespace fs = std::filesystem;
 
 static const char* kVersion = "0.1.2";
+// Reelcut's own sessions on this computer's shrooms-agent: "reelcut-claude", "reelcut-pi".
+static const char* kLocalSession = "reelcut";
 static const char* kImage = "ghcr.io/vpavlin/reelcut:latest";
 static const size_t kLogLines = 40;
 // reelcut moves with YouTube (yt-dlp, format choice): look for a newer image at most this often.
@@ -266,8 +268,10 @@ struct Running {
 struct ReelcutCorePrivate {
     ReelcutCoreImpl* q;
     std::vector<Job> jobs;
-    // No agent by default: a fresh install picks through any AI chat (copy the prompt, paste the answer).
-    std::string agent;
+    // "auto" by default: a caged agent on this computer when shrooms-agent is here (Claude Code, else pi),
+    // else the person copies the prompt into any AI chat. "local:claude" / "local:pi" = that one;
+    // "" = always by hand; "MACHINE/SESSION" = that mesh session.
+    std::string agent = "auto";
     int count = 6;
     std::string runnerPref = "auto";
     bool autoCut = true;
@@ -444,6 +448,7 @@ struct ReelcutCorePrivate {
             {"settings", settingsJson()},
             {"agents", agents},
             {"shrooms", !findExe("shrooms-agent").empty()},
+            {"localAgent", localAgent},
             {"thumbsOk", !viewDir.empty()},
             {"jobs", js},
         };
@@ -660,19 +665,104 @@ struct ReelcutCorePrivate {
         });
     }
 
-    // ── picking: a mesh agent reads the transcript and answers with clip lines
+    // ── picking: an agent reads the transcript and answers with clip lines
+    //   "auto", "local:claude", "local:pi": a session of Reelcut's own, in a cage, on this computer's
+    //           shrooms-agent (its unix socket, ADR-056: no mesh needed). Claude Code uses the owner's
+    //           Claude login, pi its own model settings. Without one, the person copies the prompt into a chat
+    //   "MACHINE/SESSION": a session on the shrooms mesh, through the shrooms-agent CLI
+    //   "": nobody, the person pastes the clips
+    static std::string agentSocket()
+    {
+        if (const char* e = std::getenv("SHROOMS_AGENT_SOCKET")) if (*e) return e;
+        if (const char* r = std::getenv("XDG_RUNTIME_DIR")) if (*r) return std::string(r) + "/shrooms-agent/agent.sock";
+        return QDir::homePath().toStdString() + "/.local/state/shrooms-agent/agent.sock";
+    }
+    // One request to this computer's agent, over its socket; the reply's JSON (or null).
+    json agentCall(const std::string& method, const std::string& path, const std::string& body, int timeoutS)
+    {
+        std::string curl = findExe("curl");
+        if (curl.empty()) return json();
+        QStringList a = {"-s", "--max-time", QString::number(timeoutS), "--unix-socket", QString::fromStdString(agentSocket()),
+                         "-X", QString::fromStdString(method), "-H", "Content-Type: application/json"};
+        if (!body.empty()) a << "--data-binary" << "@-";
+        a << QString::fromStdString("http://agent" + path);
+        QProcess p;
+        p.setProcessEnvironment(processEnv());
+        p.start(QString::fromStdString(curl), a);
+        if (!body.empty()) { p.write(body.data(), (qint64)body.size()); }
+        p.closeWriteChannel();
+        if (!p.waitForFinished((timeoutS + 2) * 1000)) { p.kill(); return json(); }
+        return json::parse(p.readAllStandardOutput().toStdString(), nullptr, false);
+    }
+    // Whether "auto" can ask a local agent: a shrooms-agent on its socket, with pi and cages.
+    json localAgent;
+    void detectLocalAgent()
+    {
+        std::error_code ec;
+        std::string why;
+        json h;
+        if (!fs::exists(agentSocket(), ec)) why = "no shrooms-agent on this computer";
+        else if (findExe("curl").empty()) why = "curl is not installed";
+        else if (!(h = agentCall("GET", "/v1/harnesses", "", 5)).is_object()) why = "shrooms-agent does not answer on its socket";
+        else {
+            bool cage = h.contains("cage") && jbool(h["cage"], "available", false);
+            if (!cage) why = "shrooms-agent here cannot make cages (no podman)";
+        }
+        json hs = json::array();
+        if (h.is_object() && h.contains("harnesses") && h["harnesses"].is_array())
+            for (auto& x : h["harnesses"]) { std::string n = jstr(x, "name", ""); if (n == "claude" || n == "pi") hs.push_back(n); }
+        if (why.empty() && hs.empty()) why = "shrooms-agent here has neither Claude Code nor pi";
+        localAgent = {{"ok", why.empty()}, {"why", why}, {"harnesses", hs}};
+    }
+    // Which harness a local choice means, of those this computer's agent runs; "" when none fits.
+    std::string localHarness(const std::string& choice)
+    {
+        auto has = [&](const char* n) {
+            if (localAgent.is_object() && localAgent.contains("harnesses") && localAgent["harnesses"].is_array())
+                for (auto& x : localAgent["harnesses"]) if (x.is_string() && x.get<std::string>() == n) return true;
+            return false;
+        };
+        if (choice == "local:claude") return has("claude") ? "claude" : "";
+        if (choice == "local:pi") return has("pi") ? "pi" : "";
+        if (choice == "auto") return has("claude") ? "claude" : has("pi") ? "pi" : "";
+        return "";
+    }
+    static std::string harnessLabel(const std::string& h)
+    {
+        return h == "claude" ? "Claude Code on this computer" : "pi on this computer";
+    }
+    static std::string localSessionName(const std::string& h) { return std::string(kLocalSession) + "-" + h; }
+    // Reelcut's own session on this computer for a harness, caged, made the first time.
+    std::string ensureLocalSession(const std::string& harness)
+    {
+        const std::string name = localSessionName(harness);
+        json ss = agentCall("GET", "/v1/sessions", "", 10);
+        if (ss.is_object() && ss.contains("sessions") && ss["sessions"].is_array())
+            for (auto& x : ss["sessions"]) if (jstr(x, "name", "") == name) return "";
+        json made = agentCall("POST", "/v1/sessions",
+            json({{"name", name}, {"dir", rootDir() + "/.picker"}, {"harness", harness}, {"cage", json::object()}}).dump(), 30);
+        if (made.is_object() && jstr(made, "name", "") == name) return "";
+        return "Could not make a " + harness + " session on this computer's shrooms-agent: " +
+               (made.is_object() ? jstr(made, "error", made.dump().substr(0, 200)) : std::string("no answer"));
+    }
+
     void startPick(Job& b, const std::string& who)
     {
         if (who.empty()) { b.step = "clips"; b.status = "waiting"; save(); changed(); return; }
         if (runner.empty()) { b.status = "failed"; b.error = runnerError; save(); changed(); return; }
+        const bool local = who == "auto" || who.rfind("local:", 0) == 0;
+        std::string harness;
+        if (local) { detectLocalAgent(); if (jbool(localAgent, "ok", false)) harness = localHarness(who); }
         std::string shrooms = findExe("shrooms-agent");
-        if (shrooms.empty()) {
+        if (local ? harness.empty() : shrooms.empty()) {
+            // Nothing to ask: the person copies the prompt into any chat (the view shows how).
             b.step = "clips"; b.status = "waiting";
-            b.error = "No agent could pick: shrooms-agent is not installed here. Copy the prompt into any AI chat instead.";
+            b.error = local ? "" : "No agent could pick: shrooms-agent is not installed here. Copy the prompt into any AI chat instead.";
             save(); changed(); return;
         }
+        const std::string label = local ? harnessLabel(harness) : who;
         b.step = "pick"; b.status = "running"; b.agent = who; b.error.clear(); b.pickTask.clear(); b.pickReply.clear();
-        b.activity = "Asking " + who + " to pick " + std::to_string(count) + " clips";
+        b.activity = "Asking " + label + " to pick " + std::to_string(count) + " clips";
         save(); changed();
         // First the prompt (reelcut prompt prints the instructions and the transcript)...
         QStringList pa = {"prompt", work(b, ""), "-n", QString::number(count)};
@@ -681,7 +771,7 @@ struct ReelcutCorePrivate {
         p->setProcessEnvironment(processEnv());
         picks[b.id] = p;
         QObject::connect(p, qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
-                         guarded("prompt", [this, p, id = b.id, who, shrooms](int code, QProcess::ExitStatus st) {
+                         guarded("prompt", [this, p, id = b.id, who, label, local, harness, shrooms](int code, QProcess::ExitStatus st) {
             p->deleteLater();
             std::string prompt = p->readAllStandardOutput().toStdString();
             Job* j = find(id);
@@ -693,56 +783,187 @@ struct ReelcutCorePrivate {
             std::string ask = "From the Reelcut app on Basecamp (" + QSysInfo::machineHostName().toStdString() +
                 "). Pick the clips below and reply with ONLY the clip lines in the format given, "
                 "one per line, nothing else. Your reply is parsed by a program.\n\n" + prompt;
-            if (ask.size() > kMaxPrompt) {
+            if (!local && ask.size() > kMaxPrompt) {
                 pickFailed(*j, "The transcript is too long to send to an agent in one message (" +
-                           std::to_string(ask.size() / 1024) + " KiB). Write the clips yourself, or pick from a shorter part.");
+                           std::to_string(ask.size() / 1024) + " KiB). Copy the prompt into an AI chat instead.");
                 return;
             }
-            // ...then the agent, as a task on the mesh. --wait prints its reply.
-            auto* a = new QProcess();
-            a->setProcessEnvironment(processEnv());
-            picks[id] = a;
-            QObject::connect(a, qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
-                             guarded("pick", [this, a, id, who, shrooms](int code2, QProcess::ExitStatus st2) {
-                a->deleteLater();
-                std::string reply = a->readAllStandardOutput().toStdString();
-                std::string err = trim(a->readAllStandardError().toStdString());
-                Job* j2 = find(id);
-                if (!j2 || j2->step != "pick") return;
-                picks.erase(id);
-                // The task id ("MACHINE/SESSION:ID"), to close the task once the reply is in.
-                static const QRegularExpression task("\\b([\\w.-]+/[\\w.-]+:[\\w-]{8,})\\b");
-                auto m = task.match(QString::fromStdString(reply + "\n" + err));
-                if (m.hasMatch()) {
-                    j2->pickTask = m.captured(1).toStdString();
-                    detached(shrooms, {"a2a", "ack", m.captured(1)});
-                }
-                j2->pickReply = reply;
-                auto clips = parseClips(reply);
-                if (st2 != QProcess::NormalExit || code2 != 0 || clips.empty()) {
-                    pickFailed(*j2, clips.empty() && code2 == 0
-                        ? who + " answered, but with no clip lines. Its reply is below; write the clips yourself or ask again."
-                        : "Asking " + who + " failed: " + (err.empty() ? trim(reply) : err));
-                    return;
-                }
-                // Only the clip lines go into the list the person sees and edits.
-                std::string text;
-                for (auto& c : clips) {
-                    text += std::to_string(c.n) + " | " + c.start + " | " + c.end + " | " + c.speaker + " | " + c.hook;
-                    if (!c.until.empty()) text += " | until " + c.until;
-                    text += "\n";
-                }
-                j2->clipsText = text;
-                j2->activity.clear();
-                if (autoCut) { j2->step = "cut"; j2->status = "queued"; }
-                else { j2->step = "clips"; j2->status = "waiting"; }
-                save(); changed();
-                schedule();
-            }));
-            a->start(QString::fromStdString(shrooms),
-                     {"a2a", "send", "--wait", "--title", "Pick reel clips", QString::fromStdString(who), QString::fromStdString(ask)});
+            writeFile(j->dir + "/prompt-" + std::to_string(count) + ".txt", prompt);
+            if (local) askLocal(*j, harness, ask);
+            else askMesh(*j, who, ask, shrooms);
         }));
         p->start(QString::fromStdString(runnerBin), args);
+        (void)label;
+    }
+
+    // This computer's agent: the task sent without blocking, then polled, so a slow first turn (the
+    // cage's image is built then) is waited for as long as it takes.
+    void askLocal(Job& b, const std::string& harness, const std::string& ask, qint64 since = 0)
+    {
+        if (!since) since = QDateTime::currentMSecsSinceEpoch();
+        std::string err = ensureLocalSession(harness);
+        if (!err.empty()) { pickFailed(b, err); return; }
+        // The first caged session builds the agent's image, and it takes no messages until that is done.
+        json h = agentCall("GET", "/v1/harnesses", "", 5);
+        json cage = h.is_object() && h.contains("cage") ? h["cage"] : json();
+        if (!jbool(cage, "ready", true)) {
+            std::string why = jstr(cage, "error", "");
+            if (!why.empty() && !jbool(cage, "building", false)) { pickFailed(b, "The agent's cage could not be built: " + why); return; }
+            if (QDateTime::currentMSecsSinceEpoch() - since > 45LL * 60 * 1000) { pickFailed(b, "The agent's cage was still being built after 45 minutes."); return; }
+            b.activity = "Preparing the agent's cage (a few minutes, only the first time)";
+            changed();
+            QTimer::singleShot(15000, guarded("cage wait", [this, id = b.id, harness, ask, since] {
+                Job* j = find(id);
+                if (j && j->step == "pick" && j->status == "running") askLocal(*j, harness, ask, since);
+            }));
+            return;
+        }
+        json msg = {{"messageId", "reelcut-" + b.id + "-" + std::to_string(QDateTime::currentMSecsSinceEpoch())},
+                    {"role", "ROLE_USER"}, {"parts", json::array({{{"text", ask}}})},
+                    {"metadata", {{"shrooms/title", "Pick reel clips: " + (b.title.empty() ? b.id : b.title)}}}};
+        json rq = {{"jsonrpc", "2.0"}, {"id", 1}, {"method", "SendMessage"},
+                   {"params", {{"message", msg}, {"configuration", {{"blocking", false}}}}}};
+        json r = agentCall("POST", "/a2a/" + localSessionName(harness), rq.dump(), 30);
+        json t = r.is_object() && r.contains("result") && r["result"].is_object() && r["result"].contains("task") ? r["result"]["task"] : json();
+        std::string task = jstr(t, "id", "");
+        if (task.empty()) {
+            std::string e = r.is_object() && r.contains("error") ? jstr(r["error"], "message", "") : "no answer";
+            pickFailed(b, "Could not ask " + harnessLabel(harness) + ": " + e);
+            return;
+        }
+        b.pickTask = task;
+        b.activity = harnessLabel(harness) + " is picking the clips";
+        save(); changed();
+        pollLocal(b.id, harness, task, QDateTime::currentMSecsSinceEpoch());
+    }
+    static std::string taskState(const json& t)
+    {
+        std::string st = t.is_object() && t.contains("status") ? jstr(t["status"], "state", "") : "";
+        st = QString::fromStdString(st).toLower().remove("task_state_").toStdString();
+        return st;
+    }
+    static std::string taskText(const json& t)
+    {
+        std::string out;
+        if (!t.is_object() || !t.contains("status") || !t["status"].is_object()) return out;
+        auto& s = t["status"];
+        if (s.contains("message") && s["message"].is_object() && s["message"].contains("parts") && s["message"]["parts"].is_array())
+            for (auto& part : s["message"]["parts"]) out += jstr(part, "text", "") + "\n";
+        return out;
+    }
+    void pollLocal(const std::string& id, const std::string& harness, const std::string& task, qint64 since)
+    {
+        QTimer::singleShot(8000, guarded("poll", [this, id, harness, task, since] {
+            const std::string label = harnessLabel(harness);
+            Job* j = find(id);
+            if (!j || j->step != "pick" || j->status != "running" || j->pickTask != task) return;
+            json r = agentCall("POST", "/a2a", json({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "GetTask"}, {"params", {{"id", task}}}}).dump(), 15);
+            json t = r.is_object() && r.contains("result") && r["result"].is_object() && r["result"].contains("task") ? r["result"]["task"] : json();
+            std::string st = taskState(t);
+            // A worker that cannot mark its task done (no shrooms tools in its cage) still answers:
+            // its turn has ended (the session is idle) and the answer is the task's status message.
+            if (st == "working" && !trim(taskText(t)).empty()) {
+                json ss = agentCall("GET", "/v1/sessions", "", 10);
+                const std::string session = task.substr(0, task.find(':'));
+                if (ss.is_object() && ss.contains("sessions") && ss["sessions"].is_array())
+                    for (auto& x : ss["sessions"])
+                        if (jstr(x, "name", "") == session && jstr(x, "state", "") == "idle") st = "completed";
+            }
+            if (st == "completed") {
+                // Close a task its worker left open, or the session never takes the next one.
+                if (taskState(t) == "working")
+                    agentCall("POST", "/v1/tasks/" + task, json({{"state", "done"}, {"summary", "Reelcut took the clips."},
+                                                                 {"session", task.substr(0, task.find(':'))}}).dump(), 10);
+                agentCall("POST", "/a2a", json({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "AckTask"}, {"params", {{"id", task}}}}).dump(), 10);
+                finishPick(*j, label, taskText(t), "");
+            } else if (st == "failed" || st == "canceled" || st == "rejected" || st == "input_required") {
+                std::string text = trim(taskText(t));
+                finishPick(*j, label, st == "input_required" ? "" : text,
+                           st == "input_required" ? "it asked: " + text : "its task " + st + (text.empty() ? "" : ": " + text));
+            } else if (QDateTime::currentMSecsSinceEpoch() - since > 60LL * 60 * 1000) {
+                pickFailed(*j, label + " did not answer within an hour. Copy the prompt into an AI chat instead.");
+            } else {
+                pollLocal(id, harness, task, since);
+            }
+        }));
+    }
+
+    // A session on the mesh, through the CLI; --wait holds for up to ten minutes, then it is polled.
+    void askMesh(Job& b, const std::string& who, const std::string& ask, const std::string& shrooms)
+    {
+        auto* a = new QProcess();
+        a->setProcessEnvironment(processEnv());
+        picks[b.id] = a;
+        QObject::connect(a, qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
+                         guarded("pick", [this, a, id = b.id, who, shrooms](int code, QProcess::ExitStatus st) {
+            a->deleteLater();
+            std::string out = a->readAllStandardOutput().toStdString();
+            std::string err = trim(a->readAllStandardError().toStdString());
+            Job* j = find(id);
+            if (!j || j->step != "pick" || j->status != "running") return;
+            meshReply(*j, who, shrooms, out, st == QProcess::NormalExit && code == 0 ? "" : (err.empty() ? trim(out) : err));
+        }));
+        a->start(QString::fromStdString(shrooms),
+                 {"a2a", "send", "--wait", "--title", "Pick reel clips", QString::fromStdString(who), QString::fromStdString(ask)});
+    }
+    // The CLI prints "task MACHINE/SESSION:ID: state", then what the session said.
+    void meshReply(Job& j, const std::string& who, const std::string& shrooms, const std::string& out, const std::string& err)
+    {
+        if (!err.empty()) { finishPick(j, who, "", err); return; }
+        static const QRegularExpression head("^task (\\S+): ([\\w-]+)");
+        auto m = head.match(QString::fromStdString(out));
+        std::string task = m.hasMatch() ? m.captured(1).toStdString() : "";
+        std::string st = m.hasMatch() ? m.captured(2).toStdString() : "completed";
+        if (!task.empty()) j.pickTask = task;
+        if (st == "completed" || st == "failed" || st == "canceled" || st == "rejected" || st == "input-required" || task.empty()) {
+            if (!task.empty() && st == "completed") detached(shrooms, {"a2a", "ack", QString::fromStdString(task)});
+            finishPick(j, who, out, st == "completed" ? "" : who + "'s task " + st + ".");
+            return;
+        }
+        // Still working: look again.
+        j.activity = who + " is still picking";
+        changed();
+        QTimer::singleShot(20000, guarded("mesh poll", [this, id = j.id, who, shrooms, task] {
+            Job* k = find(id);
+            if (!k || k->step != "pick" || k->status != "running" || k->pickTask != task) return;
+            auto* g = new QProcess();
+            g->setProcessEnvironment(processEnv());
+            picks[id] = g;
+            QObject::connect(g, qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
+                             guarded("mesh get", [this, g, id, who, shrooms](int code, QProcess::ExitStatus st) {
+                g->deleteLater();
+                Job* k2 = find(id);
+                if (!k2 || k2->step != "pick" || k2->status != "running") return;
+                std::string out = g->readAllStandardOutput().toStdString();
+                meshReply(*k2, who, shrooms, out, st == QProcess::NormalExit && code == 0 ? "" : trim(g->readAllStandardError().toStdString()));
+            }));
+            g->start(QString::fromStdString(shrooms), {"a2a", "get", QString::fromStdString(task)});
+        }));
+    }
+
+    void finishPick(Job& j, const std::string& who, const std::string& reply, const std::string& err)
+    {
+        picks.erase(j.id);
+        j.pickReply = reply;
+        auto clips = parseClips(reply);
+        if (!err.empty() || clips.empty()) {
+            pickFailed(j, !err.empty() ? "Asking " + who + " failed: " + err
+                                       : who + " answered, but with no clip lines. Its reply is below; copy the prompt into an AI chat, or ask again.");
+            return;
+        }
+        // Only the clip lines go into the list the person sees and edits.
+        std::string text;
+        for (auto& c : clips) {
+            text += std::to_string(c.n) + " | " + c.start + " | " + c.end + " | " + c.speaker + " | " + c.hook;
+            if (!c.until.empty()) text += " | until " + c.until;
+            text += "\n";
+        }
+        j.clipsText = text;
+        j.activity.clear();
+        if (autoCut) { j.step = "cut"; j.status = "queued"; }
+        else { j.step = "clips"; j.status = "waiting"; }
+        save(); changed();
+        schedule();
     }
     void pickFailed(Job& b, const std::string& why)
     {
@@ -845,10 +1066,18 @@ struct ReelcutCorePrivate {
             QTimer::singleShot(3000, guarded("kill", [p = QPointer<QProcess>(p), pid] { if (p && pid > 0) ::kill(-pid, SIGKILL); }));
         }
         auto it = picks.find(b.id);
-        if (it != picks.end()) {
-            if (it->second) it->second->kill();
-            picks.erase(it);
-            b.step = "clips"; b.status = "waiting"; b.error = "Cancelled; the agent may still answer its task."; b.activity.clear();
+        if (it != picks.end() || (b.step == "pick" && b.status == "running")) {
+            if (it != picks.end()) { if (it->second) it->second->kill(); picks.erase(it); }
+            // This computer's agent: its task is cancelled too, so it stops spending on it.
+            const bool localPick = b.agent == "auto" || b.agent.rfind("local:", 0) == 0;
+            if (localPick && !b.pickTask.empty()) {
+                agentCall("POST", "/a2a", json({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "CancelTask"}, {"params", {{"id", b.pickTask}}}}).dump(), 5);
+                // The task's session is the part of its id before the colon; stop its turn too.
+                std::string session = b.pickTask.substr(0, b.pickTask.find(':'));
+                agentCall("POST", "/v1/sessions/" + session + "/interrupt", "", 5);
+            }
+            b.step = "clips"; b.status = "waiting"; b.error = "Cancelled."; b.activity.clear();
+            if (!localPick) b.error = "Cancelled; the agent may still answer its task.";
         }
         if (b.status == "queued") { b.status = "cancelled"; b.error = "Cancelled."; }
     }
@@ -885,7 +1114,7 @@ ReelcutCoreImpl::~ReelcutCoreImpl()
 void ReelcutCoreImpl::onContextReady()
 {
     // No calls to other modules here (Basecamp 0.3 rejects them).
-    QTimer::singleShot(0, guarded("start", [this] { d->detectRunner(); d->changed(); d->schedule(); }));
+    QTimer::singleShot(0, guarded("start", [this] { d->detectRunner(); d->detectLocalAgent(); d->changed(); d->schedule(); }));
 }
 
 std::string ReelcutCoreImpl::snapshot()
@@ -920,6 +1149,7 @@ std::string ReelcutCoreImpl::setSettings(const std::string& settingsJson)
 
 std::string ReelcutCoreImpl::listAgents()
 {
+    d->detectLocalAgent();
     std::string shrooms = findExe("shrooms-agent");
     if (shrooms.empty()) return json({{"ok", false}, {"error", "shrooms-agent is not installed here."}}).dump();
     if (d->listingAgents) return d->state().dump();

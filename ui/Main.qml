@@ -141,6 +141,36 @@ Item {
             if (o.jobs && o.jobs.length) root.selectedId = o.jobs[0].id
         })
     }
+    // Who can pick the clips: an agent on this computer (shrooms-agent, no mesh needed), sessions on the
+    // mesh, or nobody (the person copies the prompt into a chat). [{value, label}]
+    function pickerOptions(withNobody) {
+        var o = [], la = root.st.localAgent || {}, hs = la.harnesses || []
+        if (la.ok) {
+            o.push({ value: "auto", label: "Automatic: an agent on this computer" })
+            if (hs.indexOf("claude") >= 0) o.push({ value: "local:claude", label: "Claude Code on this computer (your Claude login)" })
+            if (hs.indexOf("pi") >= 0) o.push({ value: "local:pi", label: "pi on this computer (pi's own model and key)" })
+        }
+        ;(root.st.agents || []).forEach(function (a) {
+            // Reelcut's own sessions are reached as "on this computer", not by name.
+            if (!/\/reelcut-(claude|pi)$/.test(a.name)) o.push({ value: a.name, label: a.name + " (on the mesh)" })
+        })
+        if (withNobody) o.push({ value: "", label: "Nobody: I paste from an AI chat" })
+        return o
+    }
+    // Kept as is until the choices change, so a poll does not reset a ComboBox's selection.
+    property var pickOpts: []
+    onStChanged: {
+        var n = pickerOptions(false)
+        if (JSON.stringify(n) !== JSON.stringify(root.pickOpts)) root.pickOpts = n
+    }
+    readonly property var pickOptsAll: root.pickOpts.concat([{ value: "", label: "Nobody: I paste from an AI chat" }])
+    function pickerLabel(v) {
+        if (v === "auto") return "an agent on this computer"
+        if (v === "local:claude") return "Claude Code on this computer"
+        if (v === "local:pi") return "pi on this computer"
+        return v
+    }
+
     // The prompt for any AI chat, to the clipboard.
     function copyPrompt() {
         callVia(coreName, "getPrompt", [root.job.id], function (raw) {
@@ -558,25 +588,25 @@ Item {
                             Section { text: "CLIPS"; Layout.fillWidth: true }
                             Text {
                                 visible: !!root.job && root.job.step === "pick" && root.job.status === "running"
-                                text: "Asking " + (root.job ? root.job.agent : "") + "…"; color: root.cAccent; font.pixelSize: 12; textFormat: Text.PlainText
+                                text: "Asking " + (root.job ? root.pickerLabel(root.job.agent) : "") + "…"; color: root.cAccent; font.pixelSize: 12; textFormat: Text.PlainText
                             }
                             ComboBox {
                                 id: agentBox
-                                visible: !!root.st.shrooms && (root.st.agents || []).length > 0
-                                Layout.preferredWidth: 200
-                                model: (root.st.agents || []).map(function (a) { return a.name })
+                                readonly property var opts: root.pickOpts
+                                visible: opts.length > 0
+                                Layout.preferredWidth: 300
+                                model: opts.map(function (o) { return o.label })
                                 currentIndex: {
                                     var want = root.job && root.job.agent ? root.job.agent : (root.st.settings ? root.st.settings.agent : "")
-                                    var m = model; for (var i = 0; i < m.length; i++) if (m[i] === want) return i
-                                    return -1
+                                    for (var i = 0; i < opts.length; i++) if (opts[i].value === want) return i
+                                    return opts.length ? 0 : -1
                                 }
-                                displayText: currentIndex >= 0 ? currentText : "Choose an agent"
                             }
                             LogosButton {
                                 visible: agentBox.visible
-                                text: root.job && root.job.clips.length ? "Ask again" : "Ask an agent"
+                                text: root.job && root.job.clips.length ? "Ask again" : "Ask"
                                 enabled: !!root.job && root.job.status !== "running" && agentBox.currentIndex >= 0
-                                onClicked: root.act("pickClips", [root.job.id, agentBox.currentText])
+                                onClicked: root.act("pickClips", [root.job.id, agentBox.opts[agentBox.currentIndex].value])
                             }
                         }
 
@@ -629,13 +659,13 @@ Item {
                                     Text {
                                         Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText
                                         color: root.cFaint; font.pixelSize: 12
-                                        text: root.st.shrooms
-                                            ? ((root.st.agents || []).length ? "Or ask an agent on your shrooms mesh, above." : "shrooms-agent is here but found no sessions to ask.")
-                                            : "With shrooms, an agent on your mesh picks them for you, no copying."
+                                        text: (root.st.localAgent && root.st.localAgent.ok) || (root.st.agents || []).length
+                                            ? "Or ask an agent, above."
+                                            : "With shrooms-agent on this computer (no mesh needed), Claude Code or pi picks them for you, no copying."
                                     }
                                     Text {
-                                        visible: !root.st.shrooms
-                                        text: "About shrooms"
+                                        visible: !(root.st.localAgent && root.st.localAgent.ok)
+                                        text: "About shrooms-agent"
                                         color: shMouse.containsMouse ? root.cAccent : root.cSub; font.pixelSize: 12; textFormat: Text.PlainText
                                         MouseArea { id: shMouse; anchors.fill: parent; anchors.margins: -4; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.act("openUrl", ["https://github.com/vpavlin/shrooms"]) }
                                     }
@@ -820,14 +850,15 @@ Item {
             var s = root.st.settings || {}
             countBox.value = s.count || 6
             autoCutBox.checked = s.autoCut !== false
-            var names = (root.st.agents || []).map(function (a) { return a.name })
-            setAgent.currentIndex = s.agent ? Math.max(0, names.indexOf(s.agent) + 1) : 0
+            var vals = setAgent.opts.map(function (o) { return o.value })
+            var want = s.agent === undefined ? "auto" : s.agent
+            setAgent.currentIndex = Math.max(0, vals.indexOf(want))
             runnerBox.currentIndex = Math.max(0, ["auto", "podman", "docker", "local"].indexOf(s.runner || "auto"))
             open()
             root.callVia(root.coreName, "listAgents", [], function (raw) { var o = root.parse(raw); if (o && o.jobs) root.apply(o) })
         }
         function save() {
-            var agent = setAgent.currentIndex > 0 ? setAgent.currentText : ""
+            var agent = setAgent.currentIndex >= 0 ? setAgent.opts[setAgent.currentIndex].value : ""
             root.act("setSettings", [JSON.stringify({ agent: agent, count: countBox.value, autoCut: autoCutBox.checked,
                 runner: ["auto", "podman", "docker", "local"][runnerBox.currentIndex] })], "Saved")
             close()
@@ -841,13 +872,21 @@ Item {
             spacing: 8
             Text { text: "Settings"; color: root.cText; font.pixelSize: 17; font.bold: true; textFormat: Text.PlainText }
             Label2 { text: "Who picks the clips"; Layout.topMargin: 6 }
+            ComboBox {
+                id: setAgent
+                readonly property var opts: root.pickOptsAll
+                Layout.fillWidth: true
+                model: opts.map(function (o) { return o.label })
+            }
             Text {
-                visible: !root.st.shrooms
                 Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText
                 color: root.cFaint; font.pixelSize: 12
-                text: "An agent on a shrooms mesh can pick them for you; this computer has no shrooms-agent, so you copy the prompt into any AI chat."
+                text: {
+                    var la = root.st.localAgent || {}
+                    if (la.ok) return "An agent on this computer runs in a container of its own (a cage), with its own folder; it reads the transcript and answers with the clips. Claude Code uses your Claude login; pi uses the model and key in pi's own settings."
+                    return "No agent on this computer (" + (la.why || "no shrooms-agent") + "), so you copy the prompt into any AI chat. With shrooms-agent (no mesh needed) and podman, Claude Code or pi picks them for you."
+                }
             }
-            ComboBox { id: setAgent; Layout.fillWidth: true; enabled: !!root.st.shrooms; model: ["Nobody: I paste from an AI chat"].concat((root.st.agents || []).map(function (a) { return a.name })) }
             RowLayout {
                 Layout.fillWidth: true
                 Label2 { text: "Reels per video"; Layout.fillWidth: true }

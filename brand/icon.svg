@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2a2433"/><stop offset="1" stop-color="#141218"/>
+    </linearGradient>
+    <linearGradient id="frame" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3b3446"/><stop offset="1" stop-color="#231f2a"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#bg)"/>
+  <!-- a 9:16 reel -->
+  <rect x="82" y="34" width="92" height="164" rx="14" fill="url(#frame)" stroke="#f3f1f7" stroke-width="6"/>
+  <path d="M116 86 l30 18 l-30 18 Z" fill="#f3f1f7"/>
+  <!-- word-by-word caption: the word being spoken in yellow -->
+  <rect x="94" y="150" width="30" height="12" rx="6" fill="#f3f1f7"/>
+  <rect x="130" y="150" width="32" height="12" rx="6" fill="#ffe14d"/>
+  <rect x="104" y="170" width="48" height="10" rx="5" fill="#f3f1f7" opacity="0.6"/>
+  <!-- the long video it came from -->
+  <rect x="40" y="214" width="176" height="10" rx="5" fill="#f3f1f7" opacity="0.25"/>
+  <rect x="112" y="214" width="34" height="10" rx="5" fill="#ffe14d"/>
+</svg>

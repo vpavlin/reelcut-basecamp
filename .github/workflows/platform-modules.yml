@@ -1,0 +1,78 @@
+# Build Basecamp modules for another platform on a GitHub runner — macOS Apple Silicon (macos-14)
+# or Linux ARM64 (ubuntu-24.04-arm) — so the Linux x86_64 packages we publish can be merged into
+# multi-platform .lgx files (`lgx merge`).
+#
+# Each line of `modules` is `name=flakeref [extra nix args]` (pin commits for reproducible packages;
+# extra args e.g. `--override-input keycard github:…` to build against a patched dependency). One module
+# failing doesn't stop the rest: the summary says OK/FAILED per module, every build log's tail is
+# uploaded, and the built .lgx files land in the `lgx-<runner>` artifact.
+#
+# Copy to .github/workflows/platform-modules.yml and replace the default list (the Scala chain) with
+# your own pinned modules.
+#
+#   gh workflow run platform-modules.yml --repo <owner>/<repo>            # the default list, macOS
+#   gh workflow run platform-modules.yml --repo <owner>/<repo> -f runner=ubuntu-24.04-arm
+#   gh workflow run platform-modules.yml --repo <owner>/<repo> -f modules="$(cat list.txt)"
+name: Platform modules
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "GitHub runner: macos-14 (darwin-arm64) or ubuntu-24.04-arm (linux-arm64)"
+        required: false
+        default: macos-14
+      modules:
+        description: "name=flakeref, one per line (empty = reelcut_core + reelcut from this checkout)"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner || 'macos-14' }}
+    timeout-minutes: 360
+    steps:
+      # The repo is private and the view takes its core as path:../core, so build from a checkout.
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            extra-substituters = https://cache.nix.logos.co/public
+            extra-trusted-public-keys = public:Z1wyVBEx8PHbXujYB52Mysv9Rd8rWIhyQ3bQyef9yy4=
+            accept-flake-config = true
+      - name: Build modules
+        shell: bash
+        env:
+          MODULES: ${{ inputs.modules }}
+        run: |
+          set -u -o pipefail
+          if [ -z "$MODULES" ]; then MODULES=$(cat <<'LIST'
+          reelcut_core=./core
+          reelcut=./ui
+          LIST
+          ); fi
+          mkdir -p out logs; : > out/summary.txt
+          while IFS='=' read -r name rest; do
+            # rest = "<flakeref> [extra nix args, e.g. --override-input keycard github:…]"
+            name=$(echo "$name" | xargs); ref=$(echo "$rest" | awk '{print $1}'); extra=$(echo "$rest" | awk '{$1=""; print}' | xargs)
+            [ -n "$name" ] || continue
+            echo "::group::$name ($ref)"
+            start=$(date +%s)
+            # shellcheck disable=SC2086
+            if nix build --accept-flake-config "${ref}#lgx-portable" $extra -o "res-$name" > "logs/$name.log" 2>&1; then
+              cp res-$name/*.lgx "out/$name.lgx"
+              echo "$name OK ($(( $(date +%s) - start ))s)" | tee -a out/summary.txt
+            else
+              echo "$name FAILED ($(( $(date +%s) - start ))s)" | tee -a out/summary.txt
+              tail -60 "logs/$name.log"
+            fi
+            echo "::endgroup::"
+          done <<< "$MODULES"
+          echo "== summary"; cat out/summary.txt
+          for f in logs/*.log; do tail -200 "$f" > "$f.tail"; done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lgx-${{ inputs.runner || 'macos-14' }}
+          path: |
+            out/
+            logs/*.tail

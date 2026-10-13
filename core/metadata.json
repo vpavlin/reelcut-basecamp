@@ -1,0 +1,25 @@
+{
+  "name": "reelcut_core",
+  "display_name": "Reelcut Core",
+  "icon": "icon.png",
+  "version": "0.1.0",
+  "type": "core",
+  "interface": "universal",
+  "category": "tools",
+  "description": "Turns a long video into captioned vertical reels with reelcut: fetch, transcribe locally, pick clips, cut",
+  "main": "reelcut_core_plugin",
+  "dependencies": [],
+  "nix": {
+    "packages": {
+      "build": [],
+      "runtime": []
+    },
+    "external_libraries": [],
+    "cmake": {
+      "find_packages": [],
+      "extra_sources": [],
+      "extra_include_dirs": ["src"],
+      "extra_link_libraries": []
+    }
+  }
+}

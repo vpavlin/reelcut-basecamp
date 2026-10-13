@@ -32,7 +32,7 @@ jobs:
     runs-on: ${{ inputs.runner || 'macos-14' }}
     timeout-minutes: 360
     steps:
-      # The repo is private and the view takes its core as path:../core, so build from a checkout.
+      # Build from a checkout; the view builds against this checkout's core (--override-input).
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
         with:

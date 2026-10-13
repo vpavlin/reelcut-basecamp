@@ -37,9 +37,11 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-static const char* kVersion = "0.1.0";
+static const char* kVersion = "0.1.1";
 static const char* kImage = "ghcr.io/vpavlin/reelcut:latest";
 static const size_t kLogLines = 40;
+// reelcut moves with YouTube (yt-dlp, format choice): look for a newer image at most this often.
+static const qint64 kImageMaxAgeMs = 24LL * 3600 * 1000;
 // The prompt goes to the agent as one command-line argument; Linux caps a single one at 128 KiB.
 static const size_t kMaxPrompt = 120 * 1024;
 
@@ -272,6 +274,7 @@ struct ReelcutCorePrivate {
     // detected
     std::string runner, runnerBin, runnerError;
     bool imageChecked = false, imagePresent = false;
+    qint64 lastPull = 0;
 
     json agents = json::array();
     bool listingAgents = false;
@@ -301,6 +304,7 @@ struct ReelcutCorePrivate {
         count = (int)std::clamp<int64_t>(jnum(s, "count", count), 1, 20);
         runnerPref = jstr(s, "runner", runnerPref);
         autoCut = jbool(s, "autoCut", autoCut);
+        lastPull = jnum(s, "lastPull", 0);
         if (!j.contains("jobs") || !j["jobs"].is_array()) return;
         for (auto& x : j["jobs"]) {
             Job b;
@@ -330,7 +334,9 @@ struct ReelcutCorePrivate {
                            {"words", b.words}});
         std::error_code ec;
         fs::create_directories(rootDir(), ec);
-        writeFile(jobsFile(), json({{"settings", settingsJson()}, {"jobs", arr}}).dump(2));
+        json st = settingsJson();
+        st["lastPull"] = lastPull;
+        writeFile(jobsFile(), json({{"settings", st}, {"jobs", arr}}).dump(2));
     }
     json settingsJson() const
     {
@@ -530,7 +536,9 @@ struct ReelcutCorePrivate {
     {
         if (b.step == "fetch" && !b.file.empty()) { copyFile(b); return; }
         if (runner.empty()) { finishStep(b, runnerError.empty() ? "No way to run reelcut here." : runnerError); return; }
-        if (containerRunner() && !imagePresent) { ensureImage(b); return; }
+        // A new job looks for a newer image first (once a day), so a fix in reelcut reaches an existing install.
+        bool stale = b.step == "fetch" && QDateTime::currentMSecsSinceEpoch() - lastPull > kImageMaxAgeMs;
+        if (containerRunner() && (!imagePresent || stale)) { ensureImage(b); return; }
         const std::string name = "reelcut-" + b.id;
         if (b.step == "fetch") {
             b.activity = "Downloading the video";
@@ -617,12 +625,15 @@ struct ReelcutCorePrivate {
                                                   : QStringList{"image", "inspect", kImage};
             p.start(QString::fromStdString(runnerBin), args);
             imagePresent = p.waitForFinished(15000) && p.exitCode() == 0;
-            if (imagePresent) { runStep(b); return; }
         }
-        b.activity = "Downloading the reelcut image (about 1 GB, once)";
-        launch(b, runnerBin, {"pull", kImage}, "", [this, id = b.id](bool ok, const std::string&) {
+        const bool had = imagePresent;
+        b.activity = had ? "Looking for a newer reelcut image" : "Downloading the reelcut image (about 1 GB, once)";
+        launch(b, runnerBin, {"pull", kImage}, "", [this, id = b.id, had](bool ok, const std::string&) {
             Job* j = find(id); if (!j) return;
-            if (!ok) { finishStep(*j, "Could not download the reelcut image. " + lastLog(*j)); return; }
+            // Tried either way, so an offline machine doesn't try before every job.
+            lastPull = QDateTime::currentMSecsSinceEpoch();
+            if (!ok && !had) { finishStep(*j, "Could not download the reelcut image. " + lastLog(*j)); return; }
+            if (!ok) logLine(*j, "Could not look for a newer image; using the one already here.");
             imagePresent = true;
             j->status = "queued";
             finishStep(*j, "");
@@ -678,7 +689,7 @@ struct ReelcutCorePrivate {
                 return;
             }
             std::string ask = "From the Reelcut app on Basecamp (" + QSysInfo::machineHostName().toStdString() +
-                "), for vpavlin. Pick the clips below and reply with ONLY the clip lines in the format given, "
+                "). Pick the clips below and reply with ONLY the clip lines in the format given, "
                 "one per line, nothing else. Your reply is parsed by a program.\n\n" + prompt;
             if (ask.size() > kMaxPrompt) {
                 pickFailed(*j, "The transcript is too long to send to an agent in one message (" +

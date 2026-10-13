@@ -475,7 +475,7 @@ Item {
                         RowLayout {
                             Layout.fillWidth: true
                             Section { text: "REELS"; Layout.fillWidth: true }
-                            LogosButton { visible: !!root.job && !!root.job.page; text: "Open the page"; onClicked: root.act("openPath", [root.job.page]) }
+                            LogosButton { visible: !!root.job && !!root.job.page; text: "Watch in the browser"; onClicked: root.act("openPath", [root.job.page]) }
                         }
                         Flow {
                             Layout.fillWidth: true
@@ -485,7 +485,7 @@ Item {
                                 delegate: Rectangle {
                                     required property var modelData
                                     width: 180
-                                    height: 320 + 64
+                                    height: 320 + 84
                                     radius: 10
                                     color: root.cSurface
                                     border.width: 1; border.color: rMouse.containsMouse ? root.cAccent : root.cLine
@@ -515,11 +515,22 @@ Item {
                                             Text { id: durT; anchors.centerIn: parent; text: Math.round(modelData.seconds) + " s"; color: "#fff"; font.pixelSize: 11; textFormat: Text.PlainText }
                                         }
                                     }
-                                    MouseArea { id: rMouse; anchors.fill: thumbBox; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.act("openPath", [modelData.file]) }
+                                    // The browser plays them reliably; a desktop player may lack a working hardware decoder
+                                    // (VLC on NVIDIA without VDPAU: sound, no picture).
+                                    MouseArea {
+                                        id: rMouse; anchors.fill: thumbBox; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                                        onClicked: root.act("openPath", [root.job.page ? root.job.page : modelData.file])
+                                    }
                                     Text {
                                         x: 10; y: 328; width: parent.width - 20
                                         text: modelData.name; color: root.cText; font.pixelSize: 13; font.bold: true
                                         wrapMode: Text.WordWrap; maximumLineCount: 2; elide: Text.ElideRight; textFormat: Text.PlainText
+                                    }
+                                    Text {
+                                        x: 10; y: parent.height - 24
+                                        text: "Open in the video player"
+                                        color: vpMouse.containsMouse ? root.cAccent : root.cFaint; font.pixelSize: 11; textFormat: Text.PlainText
+                                        MouseArea { id: vpMouse; anchors.fill: parent; anchors.margins: -4; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.act("openPath", [modelData.file]) }
                                     }
                                 }
                             }

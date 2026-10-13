@@ -48,7 +48,7 @@ jobs:
           set -u -o pipefail
           if [ -z "$MODULES" ]; then MODULES=$(cat <<'LIST'
           reelcut_core=./core
-          reelcut=./ui
+          reelcut=./ui --override-input reelcut_core path:./core
           LIST
           ); fi
           mkdir -p out logs; : > out/summary.txt

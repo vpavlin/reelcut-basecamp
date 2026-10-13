@@ -572,7 +572,9 @@ Item {
                             }
                         }
 
-                        // raw list, editable
+                        // raw list, editable; the transcript to write it from
+                        RowLayout {
+                        spacing: 18
                         Text {
                             text: clipsArea.visible ? "Hide the list" : (root.job && root.job.clips.length ? "Edit the list" : "Write the clips yourself")
                             color: editMouse.containsMouse ? root.cAccent : root.cSub; font.pixelSize: 12; textFormat: Text.PlainText
@@ -580,6 +582,12 @@ Item {
                                 id: editMouse; anchors.fill: parent; anchors.margins: -4; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
                                 onClicked: { clipsArea.visible = !clipsArea.visible; if (clipsArea.visible) clipsEdit.text = root.job.clipsText }
                             }
+                        }
+                        Text {
+                            text: "Open the transcript"
+                            color: trMouse.containsMouse ? root.cAccent : root.cSub; font.pixelSize: 12; textFormat: Text.PlainText
+                            MouseArea { id: trMouse; anchors.fill: parent; anchors.margins: -4; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.act("openPath", [root.job.dir + "/transcript-ts.txt"]) }
+                        }
                         }
                         ColumnLayout {
                             id: clipsArea
@@ -720,7 +728,6 @@ Item {
             countBox.value = s.count || 6
             autoCutBox.checked = s.autoCut !== false
             var names = (root.st.agents || []).map(function (a) { return a.name })
-            setAgent.model = ["Nobody, I pick myself"].concat(names)
             setAgent.currentIndex = s.agent ? Math.max(0, names.indexOf(s.agent) + 1) : 0
             runnerBox.currentIndex = Math.max(0, ["auto", "podman", "docker", "local"].indexOf(s.runner || "auto"))
             open()
@@ -741,7 +748,7 @@ Item {
             spacing: 8
             Text { text: "Settings"; color: root.cText; font.pixelSize: 17; font.bold: true; textFormat: Text.PlainText }
             Label2 { text: "Who picks the clips (an agent on your shrooms mesh)"; Layout.topMargin: 6 }
-            ComboBox { id: setAgent; Layout.fillWidth: true }
+            ComboBox { id: setAgent; Layout.fillWidth: true; model: ["Nobody, I pick myself"].concat((root.st.agents || []).map(function (a) { return a.name })) }
             RowLayout {
                 Layout.fillWidth: true
                 Label2 { text: "Reels per video"; Layout.fillWidth: true }

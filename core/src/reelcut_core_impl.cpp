@@ -75,8 +75,9 @@ static auto guarded(const char* where, F fn)
     return [where, fn](auto&&... args) mutable {
         try {
             // QProcess's own signals carry a QPrivateSignal tag; a callback without parameters skips it.
+            // (Qt also probes the wrapper with other argument counts; those never run.)
             if constexpr (std::is_invocable_v<F&, decltype(args)...>) fn(std::forward<decltype(args)>(args)...);
-            else fn();
+            else if constexpr (std::is_invocable_v<F&>) fn();
         }
         catch (const std::exception& e) { std::fprintf(stderr, "[reelcut_core] %s: %s\n", where, e.what()); }
         catch (...) { std::fprintf(stderr, "[reelcut_core] %s: unknown exception\n", where); }

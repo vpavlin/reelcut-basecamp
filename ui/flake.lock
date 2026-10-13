@@ -16577,18 +16577,18 @@
       },
       "locked": {
         "dir": "core",
-        "lastModified": 1791895997,
-        "narHash": "sha256-W2f53Qnu8cT3Qoc8gjZDwnTwnA5sb+Q5l6RGlNANalg=",
+        "lastModified": 1791899543,
+        "narHash": "sha256-I/nJ2WZ0q3I1lEBx4FLl9wqYopwfLXAlaw7dBH7IrKA=",
         "owner": "vpavlin",
         "repo": "reelcut-basecamp",
-        "rev": "b2fa1a088a9b1fd73bb027ee01e31645a971ed6d",
+        "rev": "87310f23c4433fc4e0ad6c6fde5f51b825d15691",
         "type": "github"
       },
       "original": {
         "dir": "core",
         "owner": "vpavlin",
         "repo": "reelcut-basecamp",
-        "rev": "b2fa1a088a9b1fd73bb027ee01e31645a971ed6d",
+        "rev": "87310f23c4433fc4e0ad6c6fde5f51b825d15691",
         "type": "github"
       }
     },

@@ -30,6 +30,7 @@
 #include <spawn.h>
 #include <sys/wait.h>
 #include <thread>
+#include <type_traits>
 #include <unistd.h>
 #include <vector>
 
@@ -72,7 +73,11 @@ template <typename F>
 static auto guarded(const char* where, F fn)
 {
     return [where, fn](auto&&... args) mutable {
-        try { fn(std::forward<decltype(args)>(args)...); }
+        try {
+            // QProcess's own signals carry a QPrivateSignal tag; a callback without parameters skips it.
+            if constexpr (std::is_invocable_v<F&, decltype(args)...>) fn(std::forward<decltype(args)>(args)...);
+            else fn();
+        }
         catch (const std::exception& e) { std::fprintf(stderr, "[reelcut_core] %s: %s\n", where, e.what()); }
         catch (...) { std::fprintf(stderr, "[reelcut_core] %s: unknown exception\n", where); }
     };

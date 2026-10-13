@@ -559,7 +559,7 @@ struct ReelcutCorePrivate {
             std::error_code ec;
             fs::create_directories(b.dir + "/reels", ec);
             for (auto& e : fs::directory_iterator(b.dir + "/reels", ec))
-                if (e.path().extension() == ".mp4" || e.path().extension() == ".ass" || e.path().extension() == ".jpg")
+                if (e.path().extension() == ".mp4" || e.path().extension() == ".ass" || e.path().extension() == ".jpg" || e.path().extension() == ".dur")
                     fs::remove(e.path(), ec);
             writeFile(b.dir + "/clips.txt", b.clipsText + "\n");
             QStringList args{"cut", work(b, ""), work(b, "clips.txt"), work(b, "reels")};
@@ -577,7 +577,8 @@ struct ReelcutCorePrivate {
             // One frame per reel for the view, and the page that plays them all.
             const QString reels = work(b, "reels");
             QString script = QString("for f in '%1'/*.mp4; do ffmpeg -loglevel error -y -ss 2 -i \"$f\" -frames:v 1 "
-                                     "-vf scale=360:-2 \"${f%.mp4}.jpg\"; done").arg(reels);
+                                     "-vf scale=360:-2 \"${f%.mp4}.jpg\"; ffprobe -v error -show_entries format=duration "
+                                     "-of csv=p=0 \"$f\" > \"${f%.mp4}.dur\"; done").arg(reels);
             QString title = QString::fromStdString(b.title.empty() ? "Reels" : b.title);
             QStringList args;
             std::string bin = runnerBin;
@@ -775,6 +776,9 @@ struct ReelcutCorePrivate {
             r.name = dash != std::string::npos ? stem.substr(dash + 1) : stem;
             std::replace(r.name.begin(), r.name.end(), '-', ' ');
             if (n >= 1 && n <= (int)clips.size()) { r.name = clips[n - 1].hook; r.seconds = clips[n - 1].seconds; }
+            // The real length: cut runs on to the end of the sentence (or LASTWORD).
+            double real = QString::fromStdString(trim(readFile((f.parent_path() / (stem + ".dur")).string()))).toDouble();
+            if (real > 0) r.seconds = real;
             std::string jpg = (f.parent_path() / (stem + ".jpg")).string();
             if (!viewDir.empty() && fs::exists(jpg, ec)) {
                 std::string cache = viewDir + "/cache/" + b.id;

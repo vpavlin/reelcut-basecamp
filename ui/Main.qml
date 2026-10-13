@@ -193,17 +193,18 @@ Item {
     component Label2: Text { color: root.cSub; font.pixelSize: 12; textFormat: Text.PlainText }
     component Section: Text { color: root.cFaint; font.pixelSize: 11; font.letterSpacing: 1.2; textFormat: Text.PlainText }
     component Bar: Rectangle {
+        id: bar
         property real value: 0
         property bool indeterminate: false
         height: 6; radius: 3; color: root.cRaised; clip: true
         Rectangle {
             height: parent.height; radius: 3; color: root.cAccent
-            width: parent.indeterminate ? parent.width * 0.3 : parent.width * Math.max(0, Math.min(1, parent.value))
-            x: parent.indeterminate ? slide.x : 0
+            width: bar.indeterminate ? bar.width * 0.3 : bar.width * Math.max(0, Math.min(1, bar.value))
+            x: bar.indeterminate ? slide.x : 0
         }
         Item {
             id: slide
-            NumberAnimation on x { running: parent.indeterminate; from: -parent.width * 0.3; to: parent.width; duration: 1400; loops: Animation.Infinite }
+            NumberAnimation on x { running: bar.indeterminate && bar.visible; from: -bar.width * 0.3; to: bar.width; duration: 1400; loops: Animation.Infinite }
         }
     }
 

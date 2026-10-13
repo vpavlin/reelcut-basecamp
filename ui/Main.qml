@@ -141,6 +141,15 @@ Item {
             if (o.jobs && o.jobs.length) root.selectedId = o.jobs[0].id
         })
     }
+    // The prompt for any AI chat, to the clipboard.
+    function copyPrompt() {
+        callVia(coreName, "getPrompt", [root.job.id], function (raw) {
+            var o = parse(raw)
+            if (!o || o.ok === false) { toast(o && o.error ? o.error : "Could not build the prompt.", true); return }
+            clip.text = o.text; clip.selectAll(); clip.copy(); clip.deselect(); clip.text = ""
+            toast("Copied the prompt. Paste it into an AI chat, then paste the answer here.", false)
+        })
+    }
     function importUrl(u) {
         act("importFile", [String(u)], "", function (o) { if (o.jobs && o.jobs.length) root.selectedId = o.jobs[0].id })
     }
@@ -332,8 +341,9 @@ Item {
                     wrapMode: Text.WordWrap
                     color: root.cSub; font.pixelSize: 14; textFormat: Text.PlainText
                     text: "A livestream, a Space, a talk or a podcast. Reelcut downloads it, transcribes it on this computer, "
-                        + "asks " + (root.st.settings && root.st.settings.agent ? root.st.settings.agent : "you")
-                        + " for the best moments and cuts them into 9:16 reels with word-by-word captions."
+                        + (root.st.settings && root.st.settings.agent ? "asks " + root.st.settings.agent + " for the best moments"
+                                                                       : "helps you pick the best moments with any AI chat")
+                        + " and cuts them into 9:16 reels with word-by-word captions."
                 }
             }
 
@@ -552,6 +562,7 @@ Item {
                             }
                             ComboBox {
                                 id: agentBox
+                                visible: !!root.st.shrooms && (root.st.agents || []).length > 0
                                 Layout.preferredWidth: 200
                                 model: (root.st.agents || []).map(function (a) { return a.name })
                                 currentIndex: {
@@ -562,9 +573,78 @@ Item {
                                 displayText: currentIndex >= 0 ? currentText : "Choose an agent"
                             }
                             LogosButton {
-                                text: root.job && root.job.clips.length ? "Ask again" : "Ask for clips"
+                                visible: agentBox.visible
+                                text: root.job && root.job.clips.length ? "Ask again" : "Ask an agent"
                                 enabled: !!root.job && root.job.status !== "running" && agentBox.currentIndex >= 0
                                 onClicked: root.act("pickClips", [root.job.id, agentBox.currentText])
+                            }
+                        }
+
+                        // No clips yet: pick them through any AI chat (no setup), or an agent on the mesh.
+                        Rectangle {
+                            visible: !!root.job && root.job.clips.length === 0 && !(root.job.step === "pick" && root.job.status === "running")
+                            Layout.fillWidth: true
+                            implicitHeight: pickCol.implicitHeight + 32
+                            radius: 10
+                            color: root.cSurface
+                            border.width: 1; border.color: root.cLine
+                            ColumnLayout {
+                                id: pickCol
+                                anchors.fill: parent; anchors.margins: 16
+                                spacing: 10
+                                Text { text: "Pick the moments"; color: root.cText; font.pixelSize: 15; font.bold: true; textFormat: Text.PlainText }
+                                Text {
+                                    Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+                                    color: root.cSub; font.pixelSize: 13
+                                    text: "Copy the prompt (instructions and the transcript) into any AI chat, such as Claude or ChatGPT, then paste its answer below."
+                                }
+                                RowLayout {
+                                    spacing: 10
+                                    LogosButton { text: "Copy the prompt"; onClicked: root.copyPrompt() }
+                                    Text {
+                                        text: "Open the transcript"
+                                        color: tr2Mouse.containsMouse ? root.cAccent : root.cSub; font.pixelSize: 12; textFormat: Text.PlainText
+                                        MouseArea { id: tr2Mouse; anchors.fill: parent; anchors.margins: -4; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.act("openPath", [root.job.dir + "/transcript-ts.txt"]) }
+                                    }
+                                }
+                                Rectangle {
+                                    Layout.fillWidth: true
+                                    Layout.preferredHeight: 120
+                                    radius: 8; color: root.cBg
+                                    border.width: 1; border.color: answerEdit.activeFocus ? root.cAccent : root.cLine
+                                    ScrollView {
+                                        anchors.fill: parent; anchors.margins: 6
+                                        TextArea {
+                                            id: answerEdit
+                                            placeholderText: "Paste the answer here"
+                                            placeholderTextColor: root.cFaint
+                                            color: root.cText; font.pixelSize: 12; font.family: "monospace"
+                                            wrapMode: TextEdit.Wrap; selectByMouse: true
+                                            background: null
+                                        }
+                                    }
+                                }
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    Text {
+                                        Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+                                        color: root.cFaint; font.pixelSize: 12
+                                        text: root.st.shrooms
+                                            ? ((root.st.agents || []).length ? "Or ask an agent on your shrooms mesh, above." : "shrooms-agent is here but found no sessions to ask.")
+                                            : "With shrooms, an agent on your mesh picks them for you, no copying."
+                                    }
+                                    Text {
+                                        visible: !root.st.shrooms
+                                        text: "About shrooms"
+                                        color: shMouse.containsMouse ? root.cAccent : root.cSub; font.pixelSize: 12; textFormat: Text.PlainText
+                                        MouseArea { id: shMouse; anchors.fill: parent; anchors.margins: -4; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.act("openUrl", ["https://github.com/vpavlin/shrooms"]) }
+                                    }
+                                    LogosButton {
+                                        text: "Use these clips"
+                                        enabled: answerEdit.text.trim() !== ""
+                                        onClicked: root.act("setClips", [root.job.id, answerEdit.text], "", function () { answerEdit.text = "" })
+                                    }
+                                }
                             }
                         }
 
@@ -587,7 +667,8 @@ Item {
                         RowLayout {
                         spacing: 18
                         Text {
-                            text: clipsArea.visible ? "Hide the list" : (root.job && root.job.clips.length ? "Edit the list" : "Write the clips yourself")
+                            visible: !!root.job && root.job.clips.length > 0
+                            text: clipsArea.visible ? "Hide the list" : "Edit the list"
                             color: editMouse.containsMouse ? root.cAccent : root.cSub; font.pixelSize: 12; textFormat: Text.PlainText
                             MouseArea {
                                 id: editMouse; anchors.fill: parent; anchors.margins: -4; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
@@ -595,6 +676,7 @@ Item {
                             }
                         }
                         Text {
+                            visible: !!root.job && root.job.clips.length > 0
                             text: "Open the transcript"
                             color: trMouse.containsMouse ? root.cAccent : root.cSub; font.pixelSize: 12; textFormat: Text.PlainText
                             MouseArea { id: trMouse; anchors.fill: parent; anchors.margins: -4; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.act("openPath", [root.job.dir + "/transcript-ts.txt"]) }
@@ -758,8 +840,14 @@ Item {
         contentItem: ColumnLayout {
             spacing: 8
             Text { text: "Settings"; color: root.cText; font.pixelSize: 17; font.bold: true; textFormat: Text.PlainText }
-            Label2 { text: "Who picks the clips (an agent on your shrooms mesh)"; Layout.topMargin: 6 }
-            ComboBox { id: setAgent; Layout.fillWidth: true; model: ["Nobody, I pick myself"].concat((root.st.agents || []).map(function (a) { return a.name })) }
+            Label2 { text: "Who picks the clips"; Layout.topMargin: 6 }
+            Text {
+                visible: !root.st.shrooms
+                Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+                color: root.cFaint; font.pixelSize: 12
+                text: "An agent on a shrooms mesh can pick them for you; this computer has no shrooms-agent, so you copy the prompt into any AI chat."
+            }
+            ComboBox { id: setAgent; Layout.fillWidth: true; enabled: !!root.st.shrooms; model: ["Nobody: I paste from an AI chat"].concat((root.st.agents || []).map(function (a) { return a.name })) }
             RowLayout {
                 Layout.fillWidth: true
                 Label2 { text: "Reels per video"; Layout.fillWidth: true }

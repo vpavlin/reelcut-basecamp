@@ -37,7 +37,7 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-static const char* kVersion = "0.1.1";
+static const char* kVersion = "0.1.2";
 static const char* kImage = "ghcr.io/vpavlin/reelcut:latest";
 static const size_t kLogLines = 40;
 // reelcut moves with YouTube (yt-dlp, format choice): look for a newer image at most this often.
@@ -266,7 +266,8 @@ struct Running {
 struct ReelcutCorePrivate {
     ReelcutCoreImpl* q;
     std::vector<Job> jobs;
-    std::string agent = "proteus/proteus";
+    // No agent by default: a fresh install picks through any AI chat (copy the prompt, paste the answer).
+    std::string agent;
     int count = 6;
     std::string runnerPref = "auto";
     bool autoCut = true;
@@ -442,6 +443,7 @@ struct ReelcutCorePrivate {
                         {"imagePresent", imagePresent}}},
             {"settings", settingsJson()},
             {"agents", agents},
+            {"shrooms", !findExe("shrooms-agent").empty()},
             {"thumbsOk", !viewDir.empty()},
             {"jobs", js},
         };
@@ -666,7 +668,7 @@ struct ReelcutCorePrivate {
         std::string shrooms = findExe("shrooms-agent");
         if (shrooms.empty()) {
             b.step = "clips"; b.status = "waiting";
-            b.error = "shrooms-agent is not installed here, so no agent can pick. Write the clips yourself.";
+            b.error = "No agent could pick: shrooms-agent is not installed here. Copy the prompt into any AI chat instead.";
             save(); changed(); return;
         }
         b.step = "pick"; b.status = "running"; b.agent = who; b.error.clear(); b.pickTask.clear(); b.pickReply.clear();
@@ -985,12 +987,46 @@ std::string ReelcutCoreImpl::pickClips(const std::string& jobId, const std::stri
     return d->state().dump();
 }
 
+std::string ReelcutCoreImpl::getPrompt(const std::string& jobId)
+{
+    Job* b = d->find(jobId);
+    if (!b) return json({{"ok", false}, {"error", "No such job."}}).dump();
+    std::error_code ec;
+    if (!fs::exists(b->dir + "/transcript-ts.txt", ec)) return json({{"ok", false}, {"error", "Transcribe it first."}}).dump();
+    // One file per reel count, made once: reelcut prompt prints the instructions and the transcript.
+    const std::string file = b->dir + "/prompt-" + std::to_string(d->count) + ".txt";
+    std::string text = readFile(file);
+    if (text.empty()) {
+        if (d->runner.empty()) return json({{"ok", false}, {"error", d->runnerError}}).dump();
+        QStringList pa = {"prompt", d->work(*b, ""), "-n", QString::number(d->count)};
+        QStringList args = d->containerRunner() ? d->stepArgs(*b, pa, "reelcut-prompt-" + b->id, nullptr) : pa;
+        QProcess p;
+        p.setProcessEnvironment(processEnv());
+        p.start(QString::fromStdString(d->runnerBin), args);
+        if (!p.waitForFinished(30000) || p.exitCode() != 0)
+            return json({{"ok", false}, {"error", "Could not build the prompt: " + trim(p.readAllStandardError().toStdString())}}).dump();
+        text = p.readAllStandardOutput().toStdString();
+        writeFile(file, text);
+    }
+    return json({{"ok", true}, {"text", text}}).dump();
+}
+
 std::string ReelcutCoreImpl::setClips(const std::string& jobId, const std::string& clipsText)
 {
     Job* b = d->find(jobId);
     if (!b) return json({{"ok", false}, {"error", "No such job."}}).dump();
     if (b->status == "running") return json({{"ok", false}, {"error", "Wait for the current step to finish."}}).dump();
-    b->clipsText = clipsText;
+    // A pasted chat answer may wrap the clip lines in prose or a table: keep just the clip lines.
+    auto clips = parseClips(clipsText);
+    if (clips.empty() && !trim(clipsText).empty())
+        return json({{"ok", false}, {"error", "No clip lines in that. Each clip is one line: N | START H:MM:SS | END H:MM:SS | speaker | hook | until LASTWORD"}}).dump();
+    std::string text;
+    for (auto& c : clips) {
+        text += std::to_string(c.n) + " | " + c.start + " | " + c.end + " | " + c.speaker + " | " + c.hook;
+        if (!c.until.empty()) text += " | until " + c.until;
+        text += "\n";
+    }
+    b->clipsText = text;
     if (b->step == "pick" || b->step == "clips") b->error.clear();
     d->save();
     d->changed();
@@ -1056,14 +1092,9 @@ std::string ReelcutCoreImpl::removeJob(const std::string& jobId, bool deleteFile
     return d->state().dump();
 }
 
-std::string ReelcutCoreImpl::openPath(const std::string& path)
+// Spawns the desktop's opener (xdg-open, open on macOS) for a file or an http(s) link.
+static std::string spawnOpen(const std::string& target)
 {
-    std::error_code ec;
-    fs::path p = fs::weakly_canonical(localPathFrom(path), ec);
-    fs::path root = fs::weakly_canonical(rootDir(), ec);
-    std::string ps = p.string(), rs = root.string();
-    if (ps.rfind(rs + "/", 0) != 0 && ps != rs) return json({{"ok", false}, {"error", "Only files in the Reelcut folder open."}}).dump();
-    if (!fs::exists(p, ec)) return json({{"ok", false}, {"error", "It is not there any more."}}).dump();
 #ifdef __APPLE__
     std::string bin = "open";
 #else
@@ -1077,11 +1108,31 @@ std::string ReelcutCoreImpl::openPath(const std::string& path)
     posix_spawn_file_actions_init(&fa);
     posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
     posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
-    char* argv[] = {const_cast<char*>(bin.c_str()), const_cast<char*>(ps.c_str()), nullptr};
+    char* argv[] = {const_cast<char*>(bin.c_str()), const_cast<char*>(target.c_str()), nullptr};
     pid_t pid;
     int rc = posix_spawnp(&pid, argv[0], &fa, nullptr, argv, envp.data());
     posix_spawn_file_actions_destroy(&fa);
     if (rc != 0) return json({{"ok", false}, {"error", bin + ": " + std::strerror(rc)}}).dump();
     std::thread([pid]() { ::waitpid(pid, nullptr, 0); }).detach();
     return json({{"ok", true}}).dump();
+}
+
+std::string ReelcutCoreImpl::openUrl(const std::string& url)
+{
+    if ((url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) || url.size() > 4096)
+        return json({{"ok", false}, {"error", "Only http and https links open."}}).dump();
+    for (unsigned char c : url)
+        if (c <= 0x20 || c == 0x7f) return json({{"ok", false}, {"error", "That is not a link."}}).dump();
+    return spawnOpen(url);
+}
+
+std::string ReelcutCoreImpl::openPath(const std::string& path)
+{
+    std::error_code ec;
+    fs::path p = fs::weakly_canonical(localPathFrom(path), ec);
+    fs::path root = fs::weakly_canonical(rootDir(), ec);
+    std::string ps = p.string(), rs = root.string();
+    if (ps.rfind(rs + "/", 0) != 0 && ps != rs) return json({{"ok", false}, {"error", "Only files in the Reelcut folder open."}}).dump();
+    if (!fs::exists(p, ec)) return json({{"ok", false}, {"error", "It is not there any more."}}).dump();
+    return spawnOpen(ps);
 }

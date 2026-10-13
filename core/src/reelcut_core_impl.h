@@ -34,7 +34,7 @@ public:
     // sandboxed view may load a local image from.
     std::string setViewDir(const std::string& dir);
 
-    // settingsJson: {"agent": "MACHINE/SESSION" or "", "count": 6, "runner": "auto|podman|docker|local"}.
+    // settingsJson: {"agent": "MACHINE/SESSION" or "" (pick through an AI chat), "count": 6, "runner": "auto|podman|docker|local"}.
     std::string setSettings(const std::string& settingsJson);
 
     // The agents on the shrooms mesh, for the "who picks the clips" choice. Fills snapshot().agents.
@@ -50,7 +50,11 @@ public:
     // Ask a mesh agent to pick the clips from the transcript ("" = the agent from the settings).
     std::string pickClips(const std::string& jobId, const std::string& agent);
 
-    // The clip list, one line per clip: N | START H:MM:SS | END H:MM:SS | speaker | hook | until LASTWORD
+    // The prompt for picking the clips (instructions + the transcript), to paste into any AI chat:
+    // {"ok": true, "text": "…"}.
+    std::string getPrompt(const std::string& jobId);
+
+    // The clip list, one line per clip (a pasted chat answer is fine: only the clip lines are kept): N | START H:MM:SS | END H:MM:SS | speaker | hook | until LASTWORD
     std::string setClips(const std::string& jobId, const std::string& clipsText);
 
     // Cut the reels. fixesText: one "Heard=Meant" per line or comma, for misheard names.
@@ -68,6 +72,9 @@ public:
     // Open a job's folder, a reel or its page with the system's default app. Only paths inside
     // the Reelcut folder open.
     std::string openPath(const std::string& path);
+
+    // Opens an http(s) link in the browser (the sandboxed view's Qt.openUrlExternally can't).
+    std::string openUrl(const std::string& url);
 
     void onContextReady() override;
 

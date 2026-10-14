@@ -40,7 +40,7 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-static const char* kVersion = "0.1.5";
+static const char* kVersion = "0.1.6";
 // Reelcut's own sessions on this computer's shrooms-agent: "reelcut-claude", "reelcut-pi".
 static const char* kLocalSession = "reelcut";
 static const char* kImage = "ghcr.io/vpavlin/reelcut:latest";
@@ -1382,8 +1382,13 @@ struct ReelcutCorePrivate {
         }
         return out;
     }
+    // Why a step failed, for the person: yt-dlp's "ERROR: …" or reelcut's own "reelcut: …" line,
+    // not the Python traceback that follows it; else the last line.
     static std::string lastLog(const Job& b)
     {
+        for (auto it = b.log.rbegin(); it != b.log.rend(); ++it)
+            if (it->rfind("ERROR:", 0) == 0 || (it->rfind("reelcut: ", 0) == 0 && it->find("trying another way") == std::string::npos))
+                return *it;
         for (auto it = b.log.rbegin(); it != b.log.rend(); ++it)
             if (!it->empty()) return *it;
         return "";

@@ -20,6 +20,7 @@
 #include <cmath>
 #include <map>
 #include <set>
+#include <tuple>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -189,7 +190,7 @@ static double secs(std::string s)
 
 struct Clip {
     int n = 0;
-    std::string start, end, speaker, hook, until;
+    std::string start, end, speaker, hook, until, summary;
     double seconds = 0;
 };
 
@@ -220,6 +221,8 @@ static std::vector<Clip> parseClips(const std::string& text)
         c.speaker = p[3].toStdString();
         c.hook = p[4].toStdString();
         if (p.size() > 5) c.until = QString(p[5]).remove(untilW).toStdString();
+        // What is said and why it works (reelcut's prompt asks for it; a cell may hold a "|", so the rest).
+        if (p.size() > 6) c.summary = p.mid(6).join(" | ").toStdString();
         double a = secs(c.start), b = secs(c.end);
         if (a < 0 || b < 0) continue;
         c.seconds = b - a;
@@ -228,12 +231,25 @@ static std::vector<Clip> parseClips(const std::string& text)
     return out;
 }
 
+// The clip list as reelcut cut reads it, one line per clip.
+static std::string clipsText(const std::vector<Clip>& clips)
+{
+    std::string text;
+    for (auto& c : clips) {
+        text += std::to_string(c.n) + " | " + c.start + " | " + c.end + " | " + c.speaker + " | " + c.hook;
+        if (!c.until.empty() || !c.summary.empty()) text += " | " + (c.until.empty() ? std::string() : "until " + c.until);
+        if (!c.summary.empty()) text += " | " + c.summary;
+        text += "\n";
+    }
+    return text;
+}
+
 static json clipsJson(const std::vector<Clip>& v)
 {
     json a = json::array();
     for (auto& c : v)
         a.push_back({{"n", c.n}, {"start", c.start}, {"end", c.end}, {"speaker", c.speaker}, {"hook", c.hook},
-                     {"until", c.until}, {"seconds", c.seconds}});
+                     {"until", c.until}, {"summary", c.summary}, {"seconds", c.seconds}});
     return a;
 }
 
@@ -286,6 +302,9 @@ struct Job {
     bool fetched = false, transcribed = false, probed = false;
     std::string diar;           // who speaks: "" (not decided) | wanted | running | after (transcribe) | done | failed | off
     bool diarRetry = false;
+    std::string brief;          // what the person looks for: topics, people, tone, keywords
+    std::vector<int> chosen;    // the clips to cut, by number
+    std::string intro, outro;   // cards (images in the library), "" for none
     std::string frame;          // one frame of the video, copied where the view may load it
 };
 
@@ -302,7 +321,11 @@ struct ReelcutCorePrivate {
     // else the person copies the prompt into any AI chat. "local:claude" / "local:pi" = that one;
     // "" = always by hand; "MACHINE/SESSION" = that mesh session.
     std::string agent = "auto";
-    int count = 6;
+    int count = 12;             // clips to propose, best first (more than will be cut)
+    int minLen = 20, maxLen = 55;   // seconds per clip, for the prompt
+    int autoCount = 5;          // ticked (and cut, with autoCut) after the agent answers
+    double lead = 0.25, tail = 0.4, fade = 0.3, card = 2;   // cut's edges and cards
+    std::string brief, intro, outro;    // the last used, for a new job
     std::string runnerPref = "auto";
     bool autoCut = true;
     bool diarize = true;        // tell the speakers apart after transcribing
@@ -338,7 +361,9 @@ struct ReelcutCorePrivate {
         if (!j.is_object()) return;
         json s = j.contains("settings") ? j["settings"] : json::object();
         agent = jstr(s, "agent", agent);
-        count = (int)std::clamp<int64_t>(jnum(s, "count", count), 1, 20);
+        // "count" was the number of reels (6); now it proposes more, to choose from.
+        count = (int)std::clamp<int64_t>(jnum(s, "candidates", count), 1, 30);
+        readTuning(s);
         runnerPref = jstr(s, "runner", runnerPref);
         autoCut = jbool(s, "autoCut", autoCut);
         diarize = jbool(s, "diarize", diarize);
@@ -365,6 +390,10 @@ struct ReelcutCorePrivate {
             b.probed = jbool(x, "probed", !(mid || b.step == "diarize"));
             b.diar = jstr(x, "diar", mid || b.step == "diarize" ? "" : (jnum(b.spk, "found", 0) ? "done" : "off"));
             if (b.diar == "running") b.diar = "wanted";
+            b.brief = jstr(x, "brief", "");
+            b.intro = jstr(x, "intro", ""); b.outro = jstr(x, "outro", "");
+            if (x.contains("chosen") && x["chosen"].is_array())
+                for (auto& n : x["chosen"]) if (n.is_number_integer()) b.chosen.push_back(n.get<int>());
             if (b.id.empty() || b.dir.empty()) continue;
             // Whatever ran when Basecamp closed did not finish.
             if (b.status == "running") { b.status = "cancelled"; b.error = "Stopped when Basecamp closed. Retry to run it again."; }
@@ -383,7 +412,8 @@ struct ReelcutCorePrivate {
                            {"pickReply", b.pickReply}, {"clipsText", b.clipsText}, {"fixes", b.fixes},
                            {"words", b.words}, {"speakers", b.spk}, {"speakersWanted", b.speakersWanted},
                            {"layout", b.layout}, {"vw", b.vw}, {"vh", b.vh}, {"fetched", b.fetched},
-                           {"transcribed", b.transcribed}, {"probed", b.probed}, {"diar", b.diar}});
+                           {"transcribed", b.transcribed}, {"probed", b.probed}, {"diar", b.diar},
+                           {"brief", b.brief}, {"chosen", b.chosen}, {"intro", b.intro}, {"outro", b.outro}});
         std::error_code ec;
         fs::create_directories(rootDir(), ec);
         json st = settingsJson();
@@ -392,7 +422,29 @@ struct ReelcutCorePrivate {
     }
     json settingsJson() const
     {
-        return {{"agent", agent}, {"count", count}, {"runner", runnerPref}, {"autoCut", autoCut}, {"diarize", diarize}};
+        return {{"agent", agent}, {"candidates", count}, {"runner", runnerPref}, {"autoCut", autoCut}, {"diarize", diarize},
+                {"autoCount", autoCount}, {"min", minLen}, {"max", maxLen}, {"lead", lead}, {"tail", tail}, {"fade", fade},
+                {"card", card}, {"brief", brief}, {"intro", intro}, {"outro", outro}};
+    }
+    static double jdbl(const json& o, const char* k, double def)
+    {
+        if (!o.is_object()) return def;
+        auto it = o.find(k);
+        return (it != o.end() && it->is_number()) ? it->get<double>() : def;
+    }
+    // The numbers, kept in range; for load and setSettings alike.
+    void readTuning(const json& s)
+    {
+        autoCount = (int)std::clamp<int64_t>(jnum(s, "autoCount", autoCount), 1, 30);
+        minLen = (int)std::clamp<int64_t>(jnum(s, "min", minLen), 5, 170);
+        maxLen = (int)std::clamp<int64_t>(jnum(s, "max", maxLen), minLen + 5, 180);
+        lead = std::clamp(jdbl(s, "lead", lead), 0.0, 5.0);
+        tail = std::clamp(jdbl(s, "tail", tail), 0.0, 5.0);
+        fade = std::clamp(jdbl(s, "fade", fade), 0.0, 3.0);
+        card = std::clamp(jdbl(s, "card", card), 0.5, 10.0);
+        if (s.contains("brief") && s["brief"].is_string()) brief = s["brief"].get<std::string>().substr(0, 4000);
+        if (s.contains("intro") && s["intro"].is_string()) intro = s["intro"].get<std::string>();
+        if (s.contains("outro") && s["outro"].is_string()) outro = s["outro"].get<std::string>();
     }
 
     // ── runner
@@ -486,7 +538,8 @@ struct ReelcutCorePrivate {
                           {"fixes", b.fixes}, {"reels", reels}, {"words", b.words},
                           {"page", fs::exists(page, ec) ? page : ""},
                           {"speakers", b.spk}, {"speakersWanted", b.speakersWanted}, {"layout", b.layout},
-                          {"width", b.vw}, {"height", b.vh}, {"frame", b.frame}});
+                          {"width", b.vw}, {"height", b.vh}, {"frame", b.frame},
+                          {"brief", b.brief}, {"chosen", b.chosen}, {"intro", b.intro}, {"outro", b.outro}});
         }
         return {
             {"ok", true},
@@ -499,6 +552,7 @@ struct ReelcutCorePrivate {
             {"shrooms", !findExe("shrooms-agent").empty()},
             {"localAgent", localAgent},
             {"thumbsOk", !viewDir.empty()},
+            {"cards", cardsJson()},
             {"jobs", js},
         };
     }
@@ -854,7 +908,20 @@ struct ReelcutCorePrivate {
             if (!b.layout.empty()) args << "--frame" << QString::fromStdString(b.layout);
             std::string who = speakersArg(b);
             if (!who.empty()) args << "--speakers" << QString::fromStdString(who);
-            b.progressN = (int)parseClips(b.clipsText).size();
+            QStringList only;
+            for (int n : b.chosen) only << QString::number(n);
+            if (!only.isEmpty()) args << "--only" << only.join(",");
+            args << "--lead" << QString::number(lead) << "--tail" << QString::number(tail) << "--fade" << QString::number(fade);
+            // The cards go into the job's folder, where the container sees them.
+            for (auto [flag, path, name] : {std::tuple<const char*, std::string, std::string>{"--intro", b.intro, "card-intro"},
+                                            std::tuple<const char*, std::string, std::string>{"--outro", b.outro, "card-outro"}}) {
+                if (path.empty() || !fs::exists(path, ec)) continue;
+                const std::string dst = name + fs::path(path).extension().string();
+                fs::copy_file(path, b.dir + "/" + dst, fs::copy_options::overwrite_existing, ec);
+                if (!ec) args << flag << work(b, dst);
+            }
+            if (!b.intro.empty() || !b.outro.empty()) args << "--card" << QString::number(card);
+            b.progressN = b.chosen.empty() ? (int)parseClips(b.clipsText).size() : (int)b.chosen.size();
             launch(b, "heavy", runnerBin, stepArgs(b, args, name, nullptr), name, [this, id = b.id](bool ok, const std::string& out) {
                 Job* j = find(id); if (!j) return;
                 if (!ok) { finishStep(*j, "Cutting failed. " + lastLog(*j)); return; }
@@ -987,6 +1054,50 @@ struct ReelcutCorePrivate {
                ". Write their names in the speaker column.\n\n";
     }
 
+    // ── cards: images shown before and after a reel (a λ, a QR code, a URL), the last few used
+    static std::string cardsDir() { return rootDir() + "/.cards"; }
+    static const size_t kCards = 8;
+    std::vector<fs::path> cardFiles() const
+    {
+        std::vector<fs::path> v;
+        std::error_code ec;
+        for (auto& e : fs::directory_iterator(cardsDir(), ec)) if (e.is_regular_file(ec)) v.push_back(e.path());
+        // The most recently used first.
+        std::sort(v.begin(), v.end(), [](const fs::path& a, const fs::path& b) {
+            std::error_code e1, e2;
+            return fs::last_write_time(a, e1) > fs::last_write_time(b, e2);
+        });
+        return v;
+    }
+    json cardsJson() const
+    {
+        json a = json::array();
+        std::error_code ec;
+        for (auto& f : cardFiles()) {
+            std::string thumb;
+            if (!viewDir.empty()) {
+                // The view may load images only from its own folder.
+                std::string dst = viewDir + "/cache/cards/" + f.filename().string();
+                if (!fs::exists(dst, ec)) {
+                    fs::create_directories(viewDir + "/cache/cards", ec);
+                    fs::copy_file(f, dst, fs::copy_options::overwrite_existing, ec);
+                }
+                if (fs::exists(dst, ec)) thumb = dst;
+            }
+            std::string name = f.filename().string();
+            auto dash = name.find('-');
+            a.push_back({{"file", f.string()}, {"name", dash != std::string::npos ? name.substr(dash + 1) : name}, {"thumb", thumb}});
+        }
+        return a;
+    }
+    // A card in use stays in the library.
+    static void touchCard(const std::string& path)
+    {
+        std::error_code ec;
+        if (!path.empty() && path.rfind(cardsDir() + "/", 0) == 0 && fs::exists(path, ec))
+            fs::last_write_time(path, fs::file_time_type::clock::now(), ec);
+    }
+
     void loadFrame(Job& b)
     {
         b.frame.clear();
@@ -1109,10 +1220,10 @@ struct ReelcutCorePrivate {
         }
         const std::string label = local ? harnessLabel(harness) : who;
         b.step = "pick"; b.status = "running"; b.agent = who; b.error.clear(); b.pickTask.clear(); b.pickReply.clear();
-        b.activity = "Asking " + label + " to pick " + std::to_string(count) + " clips";
+        b.activity = "Asking " + label + " for " + std::to_string(count) + " clips to choose from";
         save(); changed();
         // First the prompt (reelcut prompt prints the instructions and the transcript)...
-        QStringList pa = {"prompt", work(b, ""), "-n", QString::number(count)};
+        QStringList pa = promptArgs(b);
         QStringList args = containerRunner() ? stepArgs(b, pa, "reelcut-prompt-" + b.id, nullptr) : pa;
         auto* p = new QProcess();
         p->setProcessEnvironment(processEnv());
@@ -1135,12 +1246,22 @@ struct ReelcutCorePrivate {
                            std::to_string(ask.size() / 1024) + " KiB). Copy the prompt into an AI chat instead.");
                 return;
             }
-            writeFile(j->dir + "/prompt-" + std::to_string(count) + ".txt", prompt);
             if (local) askLocal(*j, harness, ask);
             else askMesh(*j, who, ask, shrooms);
         }));
         p->start(QString::fromStdString(runnerBin), args);
         (void)label;
+    }
+
+    // reelcut prompt for a job: how many, how long, and the brief (from a file: it can be long).
+    QStringList promptArgs(const Job& b)
+    {
+        QStringList pa = {"prompt", work(b, ""), "-n", QString::number(count), "--min", QString::number(minLen),
+                          "--max", QString::number(maxLen)};
+        std::error_code ec;
+        if (!trim(b.brief).empty()) { writeFile(b.dir + "/brief.txt", b.brief + "\n"); pa << "--brief-file" << work(b, "brief.txt"); }
+        else fs::remove(b.dir + "/brief.txt", ec);
+        return pa;
     }
 
     // This computer's agent: the task sent without blocking, then polled, so a slow first turn (the
@@ -1299,14 +1420,11 @@ struct ReelcutCorePrivate {
             return;
         }
         // Only the clip lines go into the list the person sees and edits.
-        std::string text;
-        for (auto& c : clips) {
-            text += std::to_string(c.n) + " | " + c.start + " | " + c.end + " | " + c.speaker + " | " + c.hook;
-            if (!c.until.empty()) text += " | until " + c.until;
-            text += "\n";
-        }
-        j.clipsText = text;
+        j.clipsText = clipsText(clips);
         j.activity.clear();
+        // Best first: the top ones are ticked, and cut straight away when the settings say so.
+        j.chosen.clear();
+        for (size_t k = 0; k < clips.size() && (int)k < autoCount; k++) j.chosen.push_back(clips[k].n);
         if (autoCut) { j.step = "cut"; j.status = "queued"; }
         else { j.step = "clips"; j.status = "waiting"; }
         save(); changed();
@@ -1357,7 +1475,7 @@ struct ReelcutCorePrivate {
             int n = dash != std::string::npos ? std::atoi(stem.substr(0, dash).c_str()) : 0;
             r.name = dash != std::string::npos ? stem.substr(dash + 1) : stem;
             std::replace(r.name.begin(), r.name.end(), '-', ' ');
-            if (n >= 1 && n <= (int)clips.size()) { r.name = clips[n - 1].hook; r.seconds = clips[n - 1].seconds; }
+            for (auto& c : clips) if (c.n == n) { r.name = c.hook; r.seconds = c.seconds; break; }
             // The real length: cut runs on to the end of the sentence (or LASTWORD).
             double real = QString::fromStdString(trim(readFile((f.parent_path() / (stem + ".dur")).string()))).toDouble();
             if (real > 0) r.seconds = real;
@@ -1400,6 +1518,7 @@ struct ReelcutCorePrivate {
         b.id = QUuid::createUuid().toString(QUuid::WithoutBraces).left(8).toStdString();
         b.created = QDateTime::currentMSecsSinceEpoch();
         b.dir = rootDir() + "/" + QDateTime::currentDateTime().toString("yyyy-MM-dd-HHmm").toStdString() + "-" + b.id;
+        b.brief = brief; b.intro = intro; b.outro = outro;
         std::error_code ec;
         fs::create_directories(b.dir, ec);
         jobs.push_back(b);
@@ -1504,7 +1623,8 @@ std::string ReelcutCoreImpl::setSettings(const std::string& settingsJson)
     json s = json::parse(settingsJson, nullptr, false);
     if (!s.is_object()) return json({{"ok", false}, {"error", "Bad settings."}}).dump();
     if (s.contains("agent") && s["agent"].is_string()) d->agent = trim(s["agent"].get<std::string>());
-    if (s.contains("count")) d->count = (int)std::clamp<int64_t>(jnum(s, "count", d->count), 1, 20);
+    if (s.contains("candidates")) d->count = (int)std::clamp<int64_t>(jnum(s, "candidates", d->count), 1, 30);
+    d->readTuning(s);
     if (s.contains("autoCut")) d->autoCut = jbool(s, "autoCut", d->autoCut);
     if (s.contains("diarize")) d->diarize = jbool(s, "diarize", d->diarize);
     if (s.contains("runner") && s["runner"].is_string()) {
@@ -1592,12 +1712,11 @@ std::string ReelcutCoreImpl::getPrompt(const std::string& jobId)
     if (!b) return json({{"ok", false}, {"error", "No such job."}}).dump();
     std::error_code ec;
     if (!fs::exists(b->dir + "/transcript-ts.txt", ec)) return json({{"ok", false}, {"error", "Transcribe it first."}}).dump();
-    // One file per reel count, made once: reelcut prompt prints the instructions and the transcript.
-    const std::string file = b->dir + "/prompt-" + std::to_string(d->count) + ".txt";
-    std::string text = readFile(file);
-    if (text.empty()) {
+    // reelcut prompt prints the instructions (the brief, the lengths) and the transcript.
+    std::string text;
+    {
         if (d->runner.empty()) return json({{"ok", false}, {"error", d->runnerError}}).dump();
-        QStringList pa = {"prompt", d->work(*b, ""), "-n", QString::number(d->count)};
+        QStringList pa = d->promptArgs(*b);
         QStringList args = d->containerRunner() ? d->stepArgs(*b, pa, "reelcut-prompt-" + b->id, nullptr) : pa;
         QProcess p;
         p.setProcessEnvironment(processEnv());
@@ -1605,7 +1724,6 @@ std::string ReelcutCoreImpl::getPrompt(const std::string& jobId)
         if (!p.waitForFinished(30000) || p.exitCode() != 0)
             return json({{"ok", false}, {"error", "Could not build the prompt: " + trim(p.readAllStandardError().toStdString())}}).dump();
         text = p.readAllStandardOutput().toStdString();
-        writeFile(file, text);
     }
     return json({{"ok", true}, {"text", ReelcutCorePrivate::speakerNote(*b) + text}}).dump();
 }
@@ -1619,13 +1737,11 @@ std::string ReelcutCoreImpl::setClips(const std::string& jobId, const std::strin
     auto clips = parseClips(clipsText);
     if (clips.empty() && !trim(clipsText).empty())
         return json({{"ok", false}, {"error", "No clip lines in that. Each clip is one line: N | START H:MM:SS | END H:MM:SS | speaker | hook | until LASTWORD"}}).dump();
-    std::string text;
-    for (auto& c : clips) {
-        text += std::to_string(c.n) + " | " + c.start + " | " + c.end + " | " + c.speaker + " | " + c.hook;
-        if (!c.until.empty()) text += " | until " + c.until;
-        text += "\n";
-    }
-    b->clipsText = text;
+    b->clipsText = ::clipsText(clips);
+    // Ticks for clips that are gone go too.
+    std::vector<int> keep;
+    for (int n : b->chosen) for (auto& c : clips) if (c.n == n) { keep.push_back(n); break; }
+    b->chosen = keep;
     if (b->step == "pick" || b->step == "clips") b->error.clear();
     d->save();
     d->changed();
@@ -1781,4 +1897,92 @@ std::string ReelcutCoreImpl::setSpeakers(const std::string& jobId, const std::st
     d->save();
     d->changed();
     return d->state().dump();
+}
+
+std::string ReelcutCoreImpl::setJob(const std::string& jobId, const std::string& optionsJson)
+{
+    Job* b = d->find(jobId);
+    if (!b) return json({{"ok", false}, {"error", "No such job."}}).dump();
+    json o = json::parse(optionsJson, nullptr, false);
+    if (!o.is_object()) return json({{"ok", false}, {"error", "Bad options."}}).dump();
+    // The brief and the cards are also the defaults for the next job.
+    if (o.contains("brief") && o["brief"].is_string()) d->brief = b->brief = o["brief"].get<std::string>().substr(0, 4000);
+    for (const char* k : {"intro", "outro"}) {
+        if (!o.contains(k) || !o[k].is_string()) continue;
+        std::string v = o[k].get<std::string>();
+        if (!v.empty() && v.rfind(ReelcutCorePrivate::cardsDir() + "/", 0) != 0)
+            return json({{"ok", false}, {"error", "Add the image to the cards first."}}).dump();
+        ReelcutCorePrivate::touchCard(v);
+        (std::string(k) == "intro" ? b->intro : b->outro) = v;
+        (std::string(k) == "intro" ? d->intro : d->outro) = v;
+    }
+    if (o.contains("chosen") && o["chosen"].is_array()) {
+        auto clips = parseClips(b->clipsText);
+        b->chosen.clear();
+        for (auto& n : o["chosen"])
+            if (n.is_number_integer())
+                for (auto& c : clips) if (c.n == n.get<int>()) { b->chosen.push_back(c.n); break; }
+    }
+    d->save();
+    d->changed();
+    return d->state().dump();
+}
+
+std::string ReelcutCoreImpl::clipText(const std::string& jobId, int64_t n)
+{
+    Job* b = d->find(jobId);
+    if (!b) return json({{"ok", false}, {"error", "No such job."}}).dump();
+    const Clip* c = nullptr;
+    auto clips = parseClips(b->clipsText);
+    for (auto& x : clips) if (x.n == n) c = &x;
+    if (!c) return json({{"ok", false}, {"error", "No such clip."}}).dump();
+    // The sentences from START to END, as the transcript stamps them.
+    const double a = secs(c->start), e = secs(c->end);
+    static const QRegularExpression stamp("^\\[(\\d+:\\d\\d:\\d\\d)\\] ?(.*)$");
+    std::istringstream in(readFile(b->dir + "/transcript-ts.txt"));
+    std::string line, text;
+    while (std::getline(in, line)) {
+        auto m = stamp.match(QString::fromStdString(line));
+        if (!m.hasMatch()) continue;
+        double t = secs(m.captured(1).toStdString());
+        if (t < a - 0.5) continue;
+        if (t > e + 0.5) break;
+        text += line + "\n";
+    }
+    return json({{"ok", true}, {"n", n}, {"text", trim(text)}}).dump();
+}
+
+std::string ReelcutCoreImpl::addCard(const std::string& imagePath)
+{
+    std::string p = localPathFrom(imagePath);
+    std::error_code ec;
+    std::string ext = QString::fromStdString(fs::path(p).extension().string()).toLower().toStdString();
+    if (ext != ".png" && ext != ".jpg" && ext != ".jpeg" && ext != ".webp")
+        return json({{"ok", false}, {"error", "A card is an image: PNG, JPEG or WebP."}}).dump();
+    if (p.empty() || !fs::is_regular_file(p, ec) || fs::file_size(p, ec) > 20u * 1024 * 1024)
+        return json({{"ok", false}, {"error", "That is not an image file (or it is over 20 MB)."}}).dump();
+    const std::string dir = ReelcutCorePrivate::cardsDir();
+    fs::create_directories(dir, ec);
+    // The same image again: the one already there.
+    for (auto& f : d->cardFiles())
+        if (f.filename().string().substr(f.filename().string().find('-') + 1) == fs::path(p).filename().string() &&
+            fs::file_size(f, ec) == fs::file_size(p, ec)) {
+            ReelcutCorePrivate::touchCard(f.string());
+            json st = d->state(); st["added"] = f.string();
+            return st.dump();
+        }
+    std::string name = QString::fromStdString(fs::path(p).filename().string()).replace(QRegularExpression("[^\\w.-]"), "_").toStdString();
+    std::string dst = dir + "/" + std::to_string(QDateTime::currentMSecsSinceEpoch()) + "-" + name;
+    fs::copy_file(p, dst, ec);
+    if (ec) return json({{"ok", false}, {"error", "Could not copy the image: " + ec.message()}}).dump();
+    // The library keeps the last few; cards a job still uses stay.
+    auto files = d->cardFiles();
+    for (size_t k = ReelcutCorePrivate::kCards; k < files.size(); k++) {
+        bool used = false;
+        for (auto& j : d->jobs) used = used || j.intro == files[k].string() || j.outro == files[k].string();
+        if (!used) fs::remove(files[k], ec);
+    }
+    d->changed();
+    json st = d->state(); st["added"] = dst;
+    return st.dump();
 }

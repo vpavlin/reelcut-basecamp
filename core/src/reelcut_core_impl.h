@@ -34,7 +34,8 @@ public:
     // sandboxed view may load a local image from.
     std::string setViewDir(const std::string& dir);
 
-    // settingsJson: {"agent": "MACHINE/SESSION" or "" (pick through an AI chat), "count": 6, "runner": "auto|podman|docker|local", "diarize": true}.
+    // settingsJson: {"agent": "MACHINE/SESSION" or "" (pick through an AI chat), "candidates": 12, "runner": "auto|podman|docker|local",
+    // "diarize": true, "autoCut": false, "autoCount": 5, "min": 20, "max": 55, "lead": 0.25, "tail": 0.4, "fade": 0.3, "card": 2}.
     std::string setSettings(const std::string& settingsJson);
 
     // The agents on the shrooms mesh, for the "who picks the clips" choice. Fills snapshot().agents.
@@ -63,8 +64,19 @@ public:
     // The clip list, one line per clip (a pasted chat answer is fine: only the clip lines are kept): N | START H:MM:SS | END H:MM:SS | speaker | hook | until LASTWORD
     std::string setClips(const std::string& jobId, const std::string& clipsText);
 
-    // Cut the reels. fixesText: one "Heard=Meant" per line or comma, for misheard names.
+    // Cut the reels (the chosen ones, all when none is chosen). fixesText: one "Heard=Meant" per line or comma, for misheard names.
     std::string cutReels(const std::string& jobId, const std::string& fixesText);
+
+    // optionsJson: {"brief": "what I'm looking for", "chosen": [2, 5, 7] (the clips to cut), "intro": card, "outro": card}.
+    // The brief and the cards become the defaults for the next job.
+    std::string setJob(const std::string& jobId, const std::string& optionsJson);
+
+    // The transcript lines of one clip, to see what it holds: {"ok": true, "n": 3, "text": "[0:03:42] B: …"}.
+    std::string clipText(const std::string& jobId, int64_t n);
+
+    // An image for the opening or closing cards: copied into the card library (the last few used).
+    // The state comes back with "added": its path in the library.
+    std::string addCard(const std::string& imagePath);
 
     // Stop what the job is running now.
     std::string cancelJob(const std::string& jobId);

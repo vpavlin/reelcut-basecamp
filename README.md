@@ -36,6 +36,14 @@ Reelcut on [apps.vpavlin.xyz](https://apps.vpavlin.xyz)) and install **Reelcut**
   - **Any AI chat, no setup:** without an agent, "Copy the prompt" puts the instructions and the
     transcript on the clipboard; paste them into Claude, ChatGPT or any other chat, then paste its
     answer back.
+- **Steer it:** "What I'm looking for" (topics, people, tone, keywords) goes with every prompt and
+  counts more than the general advice; the last one is kept for the next video.
+- **Choose:** the agent proposes more clips than you will cut (12 by default, best first, 20–55 s
+  each), each with a sentence on what is said and why it works. Tick as many as you like ("Show
+  the words" shows the transcript of one), then "Cut these".
+- **Edges and cards:** a little air before the first word and after the last, and a fade in and
+  out ("Breathing room" in ⚙: 1.5 s each side, 0.8 s fades). An opening and a closing card per
+  job (a λ, a QR code, a URL), from a small library of the last images used.
 - **Or a file:** "use a video file…" takes a video from disk instead of an address.
 - **Edit the clips:** the clip list (`N | START H:MM:SS | END H:MM:SS | speaker | hook | until LASTWORD`)
   can be edited by hand, with the transcript a click away.

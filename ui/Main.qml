@@ -139,9 +139,10 @@ Item {
     function start() {
         var u = urlField.text.trim()
         if (!/^https?:\/\//i.test(u)) { toast("Paste a video address that starts with http:// or https://.", true); return }
+        var brief = briefNew.text.trim()
         act("startJob", [u], "", function (o) {
             urlField.text = ""
-            if (o.jobs && o.jobs.length) root.selectedId = o.jobs[0].id
+            if (o.jobs && o.jobs.length) { root.selectedId = o.jobs[0].id; root.setBrief(o.jobs[0].id, brief) }
         })
     }
     // Who can pick the clips: an agent on this computer (shrooms-agent, no mesh needed), sessions on the
@@ -169,6 +170,9 @@ Item {
     // The speakers of the selected job ([letter]), kept as is between polls so their fields keep what is typed.
     property var spkLetters: []
     onJobChanged: {
+        updateClipRows()
+        var cs = root.st.cards || []
+        if (JSON.stringify(cs) !== JSON.stringify(root.cards)) root.cards = cs
         var s = root.job && root.job.speakers ? root.job.speakers : {}
         var n = (s.found || 0) >= 2 ? Object.keys(s.talk || {}).sort() : []
         n = n.length ? [root.job.id].concat(n) : []
@@ -207,6 +211,48 @@ Item {
         return v
     }
 
+    // What the person is looking for, for one job (and the default for the next).
+    function setBrief(id, text, after) {
+        callVia(coreName, "setJob", [id, JSON.stringify({ brief: text })], function (raw) { var o = parse(raw); if (o && o.jobs) apply(o); if (after) after() })
+    }
+    // The clips to cut: ticked or not.
+    function tick(n, on) {
+        var c = (root.job.chosen || []).filter(function (x) { return x !== n })
+        if (on) c.push(n)
+        c.sort(function (a, b) { return a - b })
+        act("setJob", [root.job.id, JSON.stringify({ chosen: c })])
+    }
+    function tickAll(on) {
+        act("setJob", [root.job.id, JSON.stringify({ chosen: on ? root.job.clips.map(function (c) { return c.n }) : [] })])
+    }
+    // The candidates of the selected job, kept as is between polls (a row keeps its open transcript).
+    property var clipRows: []
+    property string clipRowsKey: ""
+    function updateClipRows() {
+        var k = root.job ? root.job.id + JSON.stringify(root.job.clips) : ""
+        if (k !== root.clipRowsKey) { root.clipRowsKey = k; root.clipRows = root.job ? root.job.clips : [] }
+    }
+    // The card library: [{file, name, thumb}], kept as is between polls (a ComboBox keeps its choice).
+    property var cards: []
+    function cardIndex(file) {
+        for (var i = 0; i < root.cards.length; i++) if (root.cards[i].file === file) return i + 1
+        return 0
+    }
+    function cardThumb(file) {
+        for (var i = 0; i < root.cards.length; i++) if (root.cards[i].file === file) return root.cards[i].thumb
+        return ""
+    }
+    property string cardFor: ""
+    function addCard(u) {
+        var which = root.cardFor
+        callVia(coreName, "addCard", [String(u)], function (raw) {
+            var o = parse(raw)
+            if (!o || o.ok === false) { toast(o && o.error ? o.error : "Could not add the image.", true); return }
+            apply(o)
+            if (which && root.job) act("setJob", [root.job.id, JSON.stringify(which === "intro" ? { intro: o.added } : { outro: o.added })])
+        })
+    }
+
     // The prompt for any AI chat, to the clipboard.
     function copyPrompt() {
         callVia(coreName, "getPrompt", [root.job.id], function (raw) {
@@ -217,7 +263,8 @@ Item {
         })
     }
     function importUrl(u) {
-        act("importFile", [String(u)], "", function (o) { if (o.jobs && o.jobs.length) root.selectedId = o.jobs[0].id })
+        var brief = briefNew.text.trim()
+        act("importFile", [String(u)], "", function (o) { if (o.jobs && o.jobs.length) { root.selectedId = o.jobs[0].id; root.setBrief(o.jobs[0].id, brief) } })
     }
 
     // ── formatting
@@ -318,6 +365,25 @@ Item {
                     Layout.preferredHeight: 38
                     placeholderText: "Paste a video address"
                     onAccepted: root.start()
+                }
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 64
+                    radius: 8; color: root.cBg
+                    border.width: 1; border.color: briefNew.activeFocus ? root.cAccent : root.cLine
+                    ScrollView {
+                        anchors.fill: parent; anchors.margins: 4
+                        TextArea {
+                            id: briefNew
+                            placeholderText: "What I'm looking for (optional): topics, people, tone, keywords"
+                            placeholderTextColor: root.cFaint
+                            color: root.cText; font.pixelSize: 12; wrapMode: TextEdit.Wrap; selectByMouse: true
+                            background: null
+                            // The last one used, until the person types.
+                            readonly property string seed: root.st.settings ? root.st.settings.brief || "" : ""
+                            onSeedChanged: if (!activeFocus) text = seed
+                        }
+                    }
                 }
                 LogosButton { text: "Make reels"; Layout.fillWidth: true; enabled: urlField.text.trim() !== "" && !!root.st.runner && !root.st.runner.error; onClicked: root.start() }
                 Text {
@@ -799,7 +865,36 @@ Item {
                                 visible: agentBox.visible
                                 text: root.job && root.job.clips.length ? "Ask again" : "Ask"
                                 enabled: !!root.job && root.job.status !== "running" && agentBox.currentIndex >= 0
-                                onClicked: root.act("pickClips", [root.job.id, agentBox.opts[agentBox.currentIndex].value])
+                                onClicked: {
+                                    var who = agentBox.opts[agentBox.currentIndex].value, id = root.job.id
+                                    root.setBrief(id, briefJob.text.trim(), function () { root.act("pickClips", [id, who]) })
+                                }
+                            }
+                        }
+                        // What the person is looking for: goes with the prompt, to an agent or a chat.
+                        ColumnLayout {
+                            visible: !!root.job && !(root.job.step === "pick" && root.job.status === "running")
+                            Layout.fillWidth: true
+                            spacing: 4
+                            Label2 { text: "What I'm looking for: topics, people, tone, keywords. It counts more than the general advice." }
+                            Rectangle {
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: 56
+                                radius: 8; color: root.cBg
+                                border.width: 1; border.color: briefJob.activeFocus ? root.cAccent : root.cLine
+                                ScrollView {
+                                    anchors.fill: parent; anchors.margins: 4
+                                    TextArea {
+                                        id: briefJob
+                                        placeholderText: "e.g. privacy and coercion, sharp one-liners from Corey, nothing about the roadmap"
+                                        placeholderTextColor: root.cFaint
+                                        color: root.cText; font.pixelSize: 12; wrapMode: TextEdit.Wrap; selectByMouse: true
+                                        background: null
+                                        readonly property string seed: root.job ? root.job.id + "\n" + (root.job.brief || "") : ""
+                                        onSeedChanged: text = root.job ? root.job.brief || "" : ""
+                                        onActiveFocusChanged: if (!activeFocus && root.job && text.trim() !== (root.job.brief || "")) root.setBrief(root.job.id, text.trim())
+                                    }
+                                }
                             }
                         }
 
@@ -823,7 +918,7 @@ Item {
                                 }
                                 RowLayout {
                                     spacing: 10
-                                    LogosButton { text: "Copy the prompt"; onClicked: root.copyPrompt() }
+                                    LogosButton { text: "Copy the prompt"; onClicked: root.setBrief(root.job.id, briefJob.text.trim(), root.copyPrompt) }
                                     Text {
                                         text: "Open the transcript"
                                         color: tr2Mouse.containsMouse ? root.cAccent : root.cSub; font.pixelSize: 12; textFormat: Text.PlainText
@@ -871,18 +966,88 @@ Item {
                             }
                         }
 
-                        // parsed list
-                        Repeater {
-                            model: root.job ? root.job.clips : []
-                            delegate: RowLayout {
-                                required property var modelData
+                        // the candidates, best first: tick the ones to cut
+                        RowLayout {
+                            visible: !!root.job && root.job.clips.length > 0
+                            Layout.fillWidth: true
+                            spacing: 14
+                            Text {
                                 Layout.fillWidth: true
-                                spacing: 12
-                                Text { text: modelData.n; color: root.cFaint; font.pixelSize: 13; Layout.preferredWidth: 18; textFormat: Text.PlainText }
-                                Text { text: modelData.start + " – " + modelData.end; color: root.cSub; font.pixelSize: 12; font.features: { "tnum": 1 }; Layout.preferredWidth: 140; textFormat: Text.PlainText }
-                                Text { text: Math.round(modelData.seconds) + " s"; color: modelData.seconds > 60 ? root.cBad : root.cFaint; font.pixelSize: 12; Layout.preferredWidth: 40; textFormat: Text.PlainText }
-                                Text { text: modelData.hook; color: root.cText; font.pixelSize: 13; font.bold: true; elide: Text.ElideRight; Layout.fillWidth: true; textFormat: Text.PlainText }
-                                Text { text: modelData.speaker; color: root.cSub; font.pixelSize: 12; elide: Text.ElideRight; Layout.preferredWidth: 120; textFormat: Text.PlainText }
+                                text: root.job ? (root.job.chosen || []).length + " of " + root.job.clips.length + " ticked to cut" : ""
+                                color: root.cSub; font.pixelSize: 12; textFormat: Text.PlainText
+                            }
+                            Text {
+                                text: "Tick all"
+                                color: allMouse.containsMouse ? root.cAccent : root.cSub; font.pixelSize: 12; textFormat: Text.PlainText
+                                MouseArea { id: allMouse; anchors.fill: parent; anchors.margins: -4; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.tickAll(true) }
+                            }
+                            Text {
+                                text: "None"
+                                color: noneMouse.containsMouse ? root.cAccent : root.cSub; font.pixelSize: 12; textFormat: Text.PlainText
+                                MouseArea { id: noneMouse; anchors.fill: parent; anchors.margins: -4; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.tickAll(false) }
+                            }
+                        }
+                        Repeater {
+                            model: root.clipRows
+                            delegate: Rectangle {
+                                id: cand
+                                required property var modelData
+                                readonly property bool picked: !!root.job && (root.job.chosen || []).indexOf(modelData.n) >= 0
+                                property bool open: false
+                                property string words: ""
+                                Layout.fillWidth: true
+                                implicitHeight: candCol.implicitHeight + 16
+                                radius: 8
+                                color: picked ? root.cRaised : "transparent"
+                                border.width: 1; border.color: picked ? root.cAccent : root.cLine
+                                ColumnLayout {
+                                    id: candCol
+                                    anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
+                                    anchors.margins: 8
+                                    spacing: 4
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        spacing: 10
+                                        CheckBox {
+                                            id: candBox
+                                            checked: cand.picked
+                                            onToggled: { root.tick(cand.modelData.n, checked); checked = Qt.binding(function () { return cand.picked }) }
+                                        }
+                                        Text { text: cand.modelData.n; color: root.cFaint; font.pixelSize: 13; Layout.preferredWidth: 18; textFormat: Text.PlainText }
+                                        Text { text: cand.modelData.hook; color: root.cText; font.pixelSize: 14; font.bold: true; elide: Text.ElideRight; Layout.fillWidth: true; textFormat: Text.PlainText }
+                                        Text { text: cand.modelData.speaker; color: root.cSub; font.pixelSize: 12; elide: Text.ElideRight; Layout.maximumWidth: 140; textFormat: Text.PlainText }
+                                        Text { text: Math.round(cand.modelData.seconds) + " s"; color: cand.modelData.seconds > 60 ? root.cBad : root.cSub; font.pixelSize: 12; font.features: { "tnum": 1 }; Layout.preferredWidth: 40; horizontalAlignment: Text.AlignRight; textFormat: Text.PlainText }
+                                        Text { text: cand.modelData.start + " – " + cand.modelData.end; color: root.cFaint; font.pixelSize: 12; font.features: { "tnum": 1 }; Layout.preferredWidth: 130; horizontalAlignment: Text.AlignRight; textFormat: Text.PlainText }
+                                    }
+                                    Text {
+                                        visible: !!cand.modelData.summary
+                                        Layout.fillWidth: true; Layout.leftMargin: 66
+                                        text: cand.modelData.summary || ""
+                                        color: root.cSub; font.pixelSize: 12; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+                                    }
+                                    Text {
+                                        Layout.leftMargin: 66
+                                        text: cand.open ? "Hide the words" : "Show the words"
+                                        color: wordsMouse.containsMouse ? root.cAccent : root.cFaint; font.pixelSize: 11; textFormat: Text.PlainText
+                                        MouseArea {
+                                            id: wordsMouse; anchors.fill: parent; anchors.margins: -4; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                                            onClicked: {
+                                                if (cand.open) { cand.open = false; return }
+                                                root.callVia(root.coreName, "clipText", [root.job.id, cand.modelData.n], function (raw) {
+                                                    var o = root.parse(raw)
+                                                    cand.words = o && o.ok ? (o.text || "(no lines in that range)") : "Could not read the transcript."
+                                                    cand.open = true
+                                                })
+                                            }
+                                        }
+                                    }
+                                    Text {
+                                        visible: cand.open
+                                        Layout.fillWidth: true; Layout.leftMargin: 66
+                                        text: cand.words
+                                        color: root.cText; font.pixelSize: 12; font.family: "monospace"; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+                                    }
+                                }
                             }
                         }
 
@@ -946,6 +1111,47 @@ Item {
                             color: root.cSub; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true; textFormat: Text.PlainText
                         }
 
+                        // the opening and closing cards (a λ, a QR code, a URL)
+                        RowLayout {
+                            visible: !!root.job && root.job.clips.length > 0
+                            Layout.fillWidth: true
+                            Layout.topMargin: 6
+                            spacing: 14
+                            Repeater {
+                                model: [{ key: "intro", label: "Opening card" }, { key: "outro", label: "Closing card" }]
+                                delegate: RowLayout {
+                                    required property var modelData
+                                    spacing: 8
+                                    readonly property string file: root.job ? root.job[modelData.key] || "" : ""
+                                    Rectangle {
+                                        width: 34; height: 34; radius: 4; color: "#000"; clip: true
+                                        border.width: 1; border.color: root.cLine
+                                        Image { anchors.fill: parent; anchors.margins: 1; fillMode: Image.PreserveAspectFit; asynchronous: true; source: root.cardThumb(parent.parent.file) ? root.fileUrl(root.cardThumb(parent.parent.file)) : "" }
+                                    }
+                                    ColumnLayout {
+                                        spacing: 2
+                                        Label2 { text: modelData.label }
+                                        ComboBox {
+                                            id: cardBox
+                                            Layout.preferredWidth: 220
+                                            Layout.preferredHeight: 32
+                                            model: ["None"].concat(root.cards.map(function (c) { return c.name })).concat(["Add an image…"])
+                                            readonly property string seed: parent.parent.file + "|" + root.cards.length
+                                            onSeedChanged: currentIndex = root.cardIndex(parent.parent.file)
+                                            Component.onCompleted: currentIndex = root.cardIndex(parent.parent.file)
+                                            onActivated: function (i) {
+                                                var key = parent.parent.modelData.key
+                                                if (i === count - 1) { currentIndex = root.cardIndex(parent.parent.file); root.cardFor = key; cardDialog.open(); return }
+                                                var o = {}; o[key] = i === 0 ? "" : root.cards[i - 1].file
+                                                root.act("setJob", [root.job.id, JSON.stringify(o)])
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Item { Layout.fillWidth: true }
+                        }
+
                         // names, then cut
                         RowLayout {
                             visible: !!root.job && root.job.clips.length > 0
@@ -984,7 +1190,11 @@ Item {
                             LogosButton {
                                 id: cutBtn
                                 Layout.alignment: Qt.AlignBottom
-                                text: root.job && root.job.reels.length ? "Cut again" : "Cut " + (root.job ? root.job.clips.length : 0) + " reels"
+                                text: {
+                                    if (!root.job) return "Cut"
+                                    var n = (root.job.chosen || []).length
+                                    return n ? "Cut these " + n : "Cut all " + root.job.clips.length
+                                }
                                 enabled: !!root.job && root.job.status !== "running" && root.job.status !== "queued"
                                 onClicked: root.act("cutReels", [root.job.id, fixField.text])
                             }
@@ -1029,6 +1239,14 @@ Item {
     TextEdit { id: clip; visible: false }
 
     FileDialog {
+        id: cardDialog
+        title: "An image for the card (a logo, a QR code, a URL)"
+        fileMode: FileDialog.OpenFile
+        nameFilters: ["Images (*.png *.jpg *.jpeg *.webp)"]
+        onAccepted: root.addCard(cardDialog.selectedFile)
+    }
+
+    FileDialog {
         id: fileDialog
         title: "A video to make reels from"
         fileMode: FileDialog.OpenFile
@@ -1064,9 +1282,14 @@ Item {
         id: settings
         function openIt() {
             var s = root.st.settings || {}
-            countBox.value = s.count || 6
+            countBox.value = s.candidates || 12
+            minBox.value = s.min || 20
+            maxBox.value = s.max || 55
             diarizeBox.checked = s.diarize !== false
-            autoCutBox.checked = s.autoCut !== false
+            autoCutBox.checked = s.autoCut === true
+            autoCountBox.value = s.autoCount || 5
+            setEdges(s.lead === undefined ? 0.25 : s.lead, s.tail === undefined ? 0.4 : s.tail, s.fade === undefined ? 0.3 : s.fade)
+            cardField.text = String(s.card || 2)
             var vals = setAgent.opts.map(function (o) { return o.value })
             var want = s.agent === undefined ? "auto" : s.agent
             setAgent.currentIndex = Math.max(0, vals.indexOf(want))
@@ -1074,78 +1297,147 @@ Item {
             open()
             root.callVia(root.coreName, "listAgents", [], function (raw) { var o = root.parse(raw); if (o && o.jobs) root.apply(o) })
         }
+        function setEdges(l, t, f) { leadField.text = String(l); tailField.text = String(t); fadeField.text = String(f) }
+        function num(field, def) { var v = parseFloat(String(field.text).replace(",", ".")); return isNaN(v) ? def : v }
         function save() {
             var agent = setAgent.currentIndex >= 0 ? setAgent.opts[setAgent.currentIndex].value : ""
-            root.act("setSettings", [JSON.stringify({ agent: agent, count: countBox.value, autoCut: autoCutBox.checked, diarize: diarizeBox.checked,
+            root.act("setSettings", [JSON.stringify({
+                agent: agent, candidates: countBox.value, min: minBox.value, max: Math.max(maxBox.value, minBox.value + 5),
+                autoCut: autoCutBox.checked, autoCount: autoCountBox.value, diarize: diarizeBox.checked,
+                lead: num(leadField, 0.25), tail: num(tailField, 0.4), fade: num(fadeField, 0.3), card: num(cardField, 2),
                 runner: ["auto", "podman", "docker", "local"][runnerBox.currentIndex] })], "Saved")
             close()
         }
         anchors.centerIn: parent
-        width: 460
+        width: Math.min(640, root.width - 40)
+        height: Math.min(setCol.implicitHeight + 40, root.height - 40)
         modal: true
         padding: 20
         background: Rectangle { radius: 12; color: root.cSurface; border.width: 1; border.color: root.cLine }
-        contentItem: ColumnLayout {
-            spacing: 8
-            Text { text: "Settings"; color: root.cText; font.pixelSize: 17; font.bold: true; textFormat: Text.PlainText }
-            Label2 { text: "Who picks the clips"; Layout.topMargin: 6 }
-            ComboBox {
-                id: setAgent
-                readonly property var opts: root.pickOptsAll
-                Layout.fillWidth: true
-                model: opts.map(function (o) { return o.label })
-            }
-            Text {
-                Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText
-                color: root.cFaint; font.pixelSize: 12
-                text: {
-                    var la = root.st.localAgent || {}
-                    if (la.ok) return "An agent on this computer runs in a container of its own (a cage), with its own folder; it reads the transcript and answers with the clips. Claude Code uses your Claude login; pi uses the model and key in pi's own settings."
-                    return "No agent on this computer (" + (la.why || "no shrooms-agent") + "), so you copy the prompt into any AI chat. With shrooms-agent (no mesh needed) and podman, Claude Code or pi picks them for you."
+        component Small: Field { Layout.preferredWidth: 64; Layout.preferredHeight: 32; validator: DoubleValidator { bottom: 0; top: 10 } }
+        component Check: CheckBox {
+            id: cb
+            contentItem: Text { text: cb.text; color: root.cText; font.pixelSize: 13; leftPadding: cb.indicator.width + 6; verticalAlignment: Text.AlignVCenter; wrapMode: Text.WordWrap; textFormat: Text.PlainText }
+        }
+        contentItem: Flickable {
+            clip: true
+            contentHeight: setCol.implicitHeight
+            boundsBehavior: Flickable.StopAtBounds
+            ScrollBar.vertical: ScrollBar {}
+            ColumnLayout {
+                id: setCol
+                width: parent.width
+                spacing: 8
+                Text { text: "Settings"; color: root.cText; font.pixelSize: 17; font.bold: true; textFormat: Text.PlainText }
+
+                Section { text: "PICKING"; Layout.topMargin: 8 }
+                Label2 { text: "Who picks the clips" }
+                ComboBox {
+                    id: setAgent
+                    readonly property var opts: root.pickOptsAll
+                    Layout.fillWidth: true
+                    model: opts.map(function (o) { return o.label })
                 }
-            }
-            RowLayout {
-                Layout.fillWidth: true
-                Label2 { text: "Reels per video"; Layout.fillWidth: true }
-                SpinBox { id: countBox; from: 1; to: 20; editable: true }
-            }
-            CheckBox {
-                id: autoCutBox
-                text: "Cut as soon as the agent answers"
-                contentItem: Text { text: autoCutBox.text; color: root.cText; font.pixelSize: 13; leftPadding: autoCutBox.indicator.width + 6; verticalAlignment: Text.AlignVCenter; textFormat: Text.PlainText }
-            }
-            CheckBox {
-                id: diarizeBox
-                text: "Tell the speakers apart (about 7 min per hour of video)"
-                contentItem: Text { text: diarizeBox.text; color: root.cText; font.pixelSize: 13; leftPadding: diarizeBox.indicator.width + 6; verticalAlignment: Text.AlignVCenter; textFormat: Text.PlainText }
-            }
-            Text {
-                Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText
-                color: root.cFaint; font.pixelSize: 12
-                text: "For interviews and calls: you name the people once, the reels show who speaks, and two people on a call are cut one above the other."
-            }
-            Label2 { text: "Run reelcut with"; Layout.topMargin: 6 }
-            ComboBox { id: runnerBox; Layout.fillWidth: true; model: ["Whatever is installed", "podman", "docker", "reelcut on PATH"] }
-            Text {
-                Layout.fillWidth: true
-                wrapMode: Text.WordWrap
-                textFormat: Text.PlainText
-                font.pixelSize: 12
-                color: root.st.runner && root.st.runner.error ? root.cBad : root.cFaint
-                text: {
-                    var r = root.st.runner || {}
-                    if (r.error) return r.error
-                    if (r.kind === "local") return "Using " + r.bin + "."
-                    if (r.kind) return "Using " + r.kind + " with " + r.image + (r.imagePresent ? "." : " (downloaded on the first job, about 1 GB).")
-                    return ""
+                Text {
+                    Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+                    color: root.cFaint; font.pixelSize: 12
+                    text: {
+                        var la = root.st.localAgent || {}
+                        if (la.ok) return "An agent on this computer runs in a container of its own (a cage), with its own folder; it reads the transcript and answers with the clips. Claude Code uses your Claude login; pi uses the model and key in pi's own settings."
+                        return "No agent on this computer (" + (la.why || "no shrooms-agent") + "), so you copy the prompt into any AI chat. With shrooms-agent (no mesh needed) and podman, Claude Code or pi picks them for you."
+                    }
                 }
-            }
-            RowLayout {
-                Layout.fillWidth: true
-                Layout.topMargin: 10
-                Item { Layout.fillWidth: true }
-                LogosButton { text: "Cancel"; onClicked: settings.close() }
-                LogosButton { text: "Save"; onClicked: settings.save() }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 8
+                    Label2 { text: "Clips to propose, best first"; Layout.fillWidth: true }
+                    SpinBox { id: countBox; from: 1; to: 30; editable: true }
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 8
+                    Label2 { text: "Each clip, in seconds"; Layout.fillWidth: true }
+                    SpinBox { id: minBox; from: 5; to: 170; editable: true }
+                    Label2 { text: "to" }
+                    SpinBox { id: maxBox; from: 10; to: 180; editable: true }
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 8
+                    Check { id: autoCutBox; text: "Cut the best ones as soon as the agent answers:"; Layout.fillWidth: true }
+                    SpinBox { id: autoCountBox; from: 1; to: 30; editable: true }
+                }
+                Text {
+                    Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+                    color: root.cFaint; font.pixelSize: 12
+                    text: "That many of the best are ticked when the clips come in; you can tick others and cut again."
+                }
+                Check { id: diarizeBox; text: "Tell the speakers apart (about 7 min per hour of video)"; Layout.fillWidth: true }
+                Text {
+                    Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+                    color: root.cFaint; font.pixelSize: 12
+                    text: "For interviews and calls: you name the people once, the reels show who speaks, and two people on a call are cut one above the other."
+                }
+
+                Section { text: "THE REELS"; Layout.topMargin: 10 }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 8
+                    Label2 { text: "Before the first word" }
+                    Small { id: leadField }
+                    Label2 { text: "s   after the last" }
+                    Small { id: tailField }
+                    Label2 { text: "s   fade" }
+                    Small { id: fadeField }
+                    Label2 { text: "s" }
+                    Item { Layout.fillWidth: true }
+                }
+                RowLayout {
+                    spacing: 14
+                    Text {
+                        text: "Tight (the default)"
+                        color: tightMouse.containsMouse ? root.cAccent : root.cSub; font.pixelSize: 12; textFormat: Text.PlainText
+                        MouseArea { id: tightMouse; anchors.fill: parent; anchors.margins: -4; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: settings.setEdges(0.25, 0.4, 0.3) }
+                    }
+                    Text {
+                        text: "Breathing room"
+                        color: roomMouse.containsMouse ? root.cAccent : root.cSub; font.pixelSize: 12; textFormat: Text.PlainText
+                        MouseArea { id: roomMouse; anchors.fill: parent; anchors.margins: -4; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: settings.setEdges(1.5, 1.5, 0.8) }
+                    }
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 8
+                    Label2 { text: "Opening and closing cards show for" }
+                    Small { id: cardField }
+                    Label2 { text: "s each" }
+                    Item { Layout.fillWidth: true }
+                }
+
+                Section { text: "RUNNING"; Layout.topMargin: 10 }
+                Label2 { text: "Run reelcut with" }
+                ComboBox { id: runnerBox; Layout.fillWidth: true; model: ["Whatever is installed", "podman", "docker", "reelcut on PATH"] }
+                Text {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    textFormat: Text.PlainText
+                    font.pixelSize: 12
+                    color: root.st.runner && root.st.runner.error ? root.cBad : root.cFaint
+                    text: {
+                        var r = root.st.runner || {}
+                        if (r.error) return r.error
+                        if (r.kind === "local") return "Using " + r.bin + "."
+                        if (r.kind) return "Using " + r.kind + " with " + r.image + (r.imagePresent ? "." : " (downloaded on the first job, about 1.4 GB).")
+                        return ""
+                    }
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.topMargin: 10
+                    Item { Layout.fillWidth: true }
+                    LogosButton { text: "Cancel"; onClicked: settings.close() }
+                    LogosButton { text: "Save"; onClicked: settings.save() }
+                }
             }
         }
     }

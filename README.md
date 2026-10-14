@@ -15,8 +15,10 @@ Reelcut on [apps.vpavlin.xyz](https://apps.vpavlin.xyz)) and install **Reelcut**
 - **Paste and go:** the video is downloaded and transcribed **on your computer** (Parakeet, on the
   CPU, nothing leaves it). Then the best moments are picked from the transcript and the reels are
   cut, 1080×1920 with captions and a hook title.
-- **Who speaks:** for an interview, a podcast or a call, the voices are told apart after
-  transcribing (also on your computer, about 7 minutes per hour of video). Reelcut shows how long
+- **Who speaks:** for an interview, a podcast or a call, the voices are told apart on your
+  computer too (about 7 minutes per hour of video; beside the transcription on a machine with 8 or
+  more cores, after it on a smaller one). Transcribing starts as soon as the audio is down, while
+  the video still downloads. Reelcut shows how long
   each one talks, a few of their lines and a frame of the video; you name them once and say who
   sits left and who right. The reels then show each name as that person starts to speak, captions
   come in each speaker's colour, and the agent is told who is who. Wrong count? Count again with

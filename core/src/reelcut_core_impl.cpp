@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cmath>
 #include <map>
+#include <set>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -39,7 +40,7 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-static const char* kVersion = "0.1.4";
+static const char* kVersion = "0.1.5";
 // Reelcut's own sessions on this computer's shrooms-agent: "reelcut-claude", "reelcut-pi".
 static const char* kLocalSession = "reelcut";
 static const char* kImage = "ghcr.io/vpavlin/reelcut:latest";
@@ -281,6 +282,10 @@ struct Job {
     int speakersWanted = 0;     // 0: counted from the voices
     std::string layout;         // cut --frame: "" (reelcut's own choice), fit, stack, speaker, crop
     int vw = 0, vh = 0;         // the video's size, for the layout
+    // Before picking, the steps overlap: what is done so far.
+    bool fetched = false, transcribed = false, probed = false;
+    std::string diar;           // who speaks: "" (not decided) | wanted | running | after (transcribe) | done | failed | off
+    bool diarRetry = false;
     std::string frame;          // one frame of the video, copied where the view may load it
 };
 
@@ -311,7 +316,8 @@ struct ReelcutCorePrivate {
     bool listingAgents = false;
     std::string viewDir;
 
-    Running heavy;              // fetch / transcribe / cut / thumbs: one at a time
+    std::map<std::string, Running> procs;   // by slot: see "running" below
+    std::set<std::string> audioWatch;       // jobs looking for their audio every 2 s
     std::map<std::string, QPointer<QProcess>> picks;  // agent picks run beside it
     bool emitPending = false;
 
@@ -352,6 +358,13 @@ struct ReelcutCorePrivate {
             b.speakersWanted = (int)std::clamp<int64_t>(jnum(x, "speakersWanted", 0), 0, 12);
             b.layout = jstr(x, "layout", "");
             b.vw = (int)jnum(x, "vw", 0); b.vh = (int)jnum(x, "vh", 0);
+            // Jobs from before 0.1.5 say only their step.
+            const bool early = b.step == "fetch", mid = early || b.step == "transcribe";
+            b.fetched = jbool(x, "fetched", !early);
+            b.transcribed = jbool(x, "transcribed", !mid);
+            b.probed = jbool(x, "probed", !(mid || b.step == "diarize"));
+            b.diar = jstr(x, "diar", mid || b.step == "diarize" ? "" : (jnum(b.spk, "found", 0) ? "done" : "off"));
+            if (b.diar == "running") b.diar = "wanted";
             if (b.id.empty() || b.dir.empty()) continue;
             // Whatever ran when Basecamp closed did not finish.
             if (b.status == "running") { b.status = "cancelled"; b.error = "Stopped when Basecamp closed. Retry to run it again."; }
@@ -369,7 +382,8 @@ struct ReelcutCorePrivate {
                            {"step", b.step}, {"status", b.status}, {"error", b.error}, {"agent", b.agent},
                            {"pickReply", b.pickReply}, {"clipsText", b.clipsText}, {"fixes", b.fixes},
                            {"words", b.words}, {"speakers", b.spk}, {"speakersWanted", b.speakersWanted},
-                           {"layout", b.layout}, {"vw", b.vw}, {"vh", b.vh}});
+                           {"layout", b.layout}, {"vw", b.vw}, {"vh", b.vh}, {"fetched", b.fetched},
+                           {"transcribed", b.transcribed}, {"probed", b.probed}, {"diar", b.diar}});
         std::error_code ec;
         fs::create_directories(rootDir(), ec);
         json st = settingsJson();
@@ -489,26 +503,58 @@ struct ReelcutCorePrivate {
         };
     }
 
-    // ── the heavy queue: one step of one job at a time
+    // ── running: the steps before picking run side by side where they can
+    //   "heavy"          transcribe, cut, previews, page: one at a time over all jobs (the CPU)
+    //   "pull"           the reelcut image: one pull at a time
+    //   "fetch/<id>"     the download (or the copy of a file); the audio comes first, then the video
+    //   "diarize/<id>"   who speaks when: needs only the audio, runs beside transcribe (4 threads)
+    //   "probe/<id>"     the video's size and one frame of it, for "who sits where"
+    bool busy(const std::string& slot) const
+    {
+        auto it = procs.find(slot);
+        return it != procs.end() && it->second.proc;
+    }
+    bool jobBusy(const std::string& id) const
+    {
+        for (auto& [k, r] : procs) if (r.proc && r.jobId == id) return true;
+        return false;
+    }
+    static bool preparing(const Job& b) { return b.step == "fetch" || b.step == "transcribe" || b.step == "diarize"; }
+
     void schedule()
     {
-        if (heavy.proc) return;
-        for (auto& b : jobs)
-            if (b.status == "queued") { runStep(b); return; }
+        for (auto& b : jobs) {
+            if (preparing(b)) { if (b.status == "queued" || b.status == "running") advance(b); }
+            else if (b.status == "queued" && !busy("heavy")) runStep(b);
+        }
     }
 
     void finishStep(Job& b, const std::string& error)
     {
         b.progressI = b.progressN = 0;
         b.activity.clear();
-        if (!error.empty()) { b.status = "failed"; b.error = error; }
+        if (!error.empty()) fail(b, error);
+        save();
+        changed();
+        QTimer::singleShot(0, guarded("schedule", [this] { schedule(); }));
+    }
+    // A step that failed stops the rest of the job.
+    void fail(Job& b, const std::string& error)
+    {
+        stopProcs(b.id, false);
+        b.status = "failed"; b.error = error; b.activity.clear();
+        if (b.diar == "running") b.diar = "";
+    }
+    // A process beside the queue ended: look at the job again.
+    void sideDone()
+    {
         save();
         changed();
         QTimer::singleShot(0, guarded("schedule", [this] { schedule(); }));
     }
 
-    // Starts a process for the job; done(exitOk, stdout) runs when it ends (not when cancelled).
-    void launch(Job& b, const std::string& bin, const QStringList& args, const std::string& container,
+    // Starts a process for the job in a slot; done(exitOk, stdout) runs when it ends (not when cancelled).
+    void launch(Job& b, const std::string& slot, const std::string& bin, const QStringList& args, const std::string& container,
                 std::function<void(bool, const std::string&)> done)
     {
         auto* p = new QProcess();
@@ -517,9 +563,15 @@ struct ReelcutCorePrivate {
         // Its own process group, so cancel stops reelcut's helpers (parakeet, ffmpeg) too.
         p->setChildProcessModifier([] { ::setsid(); });
         auto out = std::make_shared<std::string>();
-        auto errBuf = std::make_shared<std::string>();
         const std::string id = b.id;
-        heavy = Running{p, id, container, false};
+        const bool heavySlot = slot == "heavy";
+        // A container of the same name, stopped a moment ago, may still be on its way out.
+        if (!container.empty() && containerRunner()) {
+            QProcess rm; rm.setProcessEnvironment(processEnv());
+            rm.start(QString::fromStdString(runnerBin), {"rm", "-f", "--ignore", QString::fromStdString(container)});
+            rm.waitForFinished(20000);
+        }
+        procs[slot] = Running{p, id, container, false};
         b.status = "running";
         b.error.clear();
         QObject::connect(p, &QProcess::readyReadStandardOutput, guarded("stdout", [this, p, out, id] {
@@ -534,7 +586,7 @@ struct ReelcutCorePrivate {
                 changed();
             }
         }));
-        QObject::connect(p, &QProcess::readyReadStandardError, guarded("stderr", [this, p, errBuf, id] {
+        QObject::connect(p, &QProcess::readyReadStandardError, guarded("stderr", [this, p, id, heavySlot] {
             QString chunk = QString::fromUtf8(p->readAllStandardError());
             Job* j = find(id);
             if (!j) return;
@@ -543,99 +595,253 @@ struct ReelcutCorePrivate {
             for (auto& piece : chunk.split(QRegularExpression("[\r\n]"))) {
                 auto m = prog.match(piece.trimmed());
                 if (m.hasMatch() && piece.trimmed() == m.captured(0)) {
-                    j->progressI = m.captured(1).toInt(); j->progressN = m.captured(2).toInt();
+                    if (heavySlot) { j->progressI = m.captured(1).toInt(); j->progressN = m.captured(2).toInt(); }
                 } else {
                     logLine(*j, piece.toStdString());
                 }
             }
+            if (heavySlot && j->status == "running" && preparing(*j)) describe(*j);
             changed();
         }));
         QObject::connect(p, qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
-                         guarded("finished", [this, p, out, id, done](int code, QProcess::ExitStatus st) {
+                         guarded("finished", [this, p, out, id, slot, done](int code, QProcess::ExitStatus st) {
             p->deleteLater();
-            bool cancelled = heavy.jobId == id && heavy.cancelled;
-            if (heavy.proc == p || !heavy.proc) heavy = Running{};
+            auto it = procs.find(slot);
+            bool cancelled = false;
+            if (it != procs.end() && it->second.proc == p) { cancelled = it->second.cancelled; procs.erase(it); }
+            else cancelled = true;   // replaced or stopped: its result no longer counts
             Job* j = find(id);
             if (!j) { QTimer::singleShot(0, guarded("schedule", [this] { schedule(); })); return; }
-            if (cancelled) {
-                j->status = "cancelled"; j->error = "Cancelled.";
-                finishStep(*j, "");
-                return;
-            }
+            if (cancelled) { save(); changed(); QTimer::singleShot(0, guarded("schedule", [this] { schedule(); })); return; }
             done(st == QProcess::NormalExit && code == 0, *out);
         }));
-        QObject::connect(p, &QProcess::errorOccurred, guarded("start error", [this, p, id, bin](QProcess::ProcessError e) {
+        QObject::connect(p, &QProcess::errorOccurred, guarded("start error", [this, p, id, bin, slot](QProcess::ProcessError e) {
             if (e != QProcess::FailedToStart) return;
             p->deleteLater();
-            if (heavy.proc == p) heavy = Running{};
+            auto it = procs.find(slot);
+            if (it != procs.end() && it->second.proc == p) procs.erase(it);
             if (Job* j = find(id)) finishStep(*j, "Could not start " + bin + ".");
         }));
         p->start(QString::fromStdString(bin), args);
         changed();
     }
 
+    // The audio is down: a complete audio.* (yt-dlp downloads to *.part, then renames), or the
+    // whole download, or a copied file.
+    bool audioReady(const Job& b) const
+    {
+        if (b.fetched) return true;
+        if (!b.file.empty()) return false;
+        std::error_code ec;
+        for (auto& e : fs::directory_iterator(b.dir, ec)) {
+            std::string n = e.path().filename().string();
+            if (n.rfind("audio.", 0) != 0) continue;
+            std::string ext = e.path().extension().string();
+            if (ext != ".part" && ext != ".ytdl" && ext != ".tmp" && ext != ".temp") return true;
+        }
+        return false;
+    }
+
+    // The steps before picking: download, transcribe as soon as the audio is down, tell the speakers
+    // apart beside it, the frame once the video is down. Called whenever something changed.
+    void advance(Job& b)
+    {
+        if (b.status != "queued" && b.status != "running") return;
+        const std::string id = b.id;
+        if (runner.empty()) { finishStep(b, runnerError.empty() ? "No way to run reelcut here." : runnerError); return; }
+        if (b.diar.empty()) b.diar = diarize ? "wanted" : "off";
+        // The image first: a new download looks for a newer one (once a day), so a fix in reelcut reaches an existing install.
+        if (containerRunner()) {
+            if (!imageChecked) {
+                imageChecked = true;
+                QProcess p; p.setProcessEnvironment(processEnv());
+                p.start(QString::fromStdString(runnerBin), runner == "podman" ? QStringList{"image", "exists", kImage}
+                                                                               : QStringList{"image", "inspect", kImage});
+                imagePresent = p.waitForFinished(15000) && p.exitCode() == 0;
+            }
+            const bool stale = !b.fetched && b.file.empty() && !busy("fetch/" + id) &&
+                               QDateTime::currentMSecsSinceEpoch() - lastPull > kImageMaxAgeMs;
+            if (!imagePresent || stale) {
+                if (!busy("pull")) pullImage(b);
+                if (procs["pull"].jobId != id) { b.status = "queued"; describe(b); }
+                return;
+            }
+        }
+        // download
+        if (!b.fetched && !busy("fetch/" + id)) startFetch(b);
+        const bool audio = audioReady(b);
+        if (audio && b.duration <= 0) readMeta(b);
+        // transcribe: the CPU slot, shared with the other jobs
+        if (audio && !b.transcribed && !busy("heavy")) startTranscribe(b);
+        // who speaks, beside it (or after it, see startDiarize)
+        if (b.diar == "after" && b.transcribed) b.diar = "wanted";
+        // Side by side only with cores to spare: transcribe takes four, diarize four more. On a
+        // 4-core machine the two together took longer than one after the other (257 s against 185 s).
+        static const bool spare = std::thread::hardware_concurrency() >= 8;
+        if (audio && b.diar == "wanted" && (spare || b.transcribed) && !busy("diarize/" + id)) startDiarize(b);
+        // the frame, once the video is down
+        if (b.fetched && !b.probed && (b.duration > 0 || b.transcribed) && !busy("probe/" + id)) startProbe(b);
+        // The audio still downloading: look again in a moment.
+        if (!audio && busy("fetch/" + id) && audioWatch.insert(id).second)
+            QTimer::singleShot(2000, guarded("audio", [this, id] {
+                audioWatch.erase(id);
+                if (Job* j = find(id)) if (preparing(*j)) advance(*j);
+            }));
+        const bool diarDone = b.diar == "done" || b.diar == "failed" || b.diar == "off";
+        if (b.fetched && b.transcribed && diarDone && b.probed && !jobBusy(id)) { prepared(b); return; }
+        b.status = jobBusy(id) ? "running" : "queued";
+        b.step = !b.fetched ? "fetch" : !b.transcribed ? "transcribe" : "diarize";
+        describe(b);
+        changed();
+    }
+    // What runs now, in one line: "Transcribing 3/8 · Telling the speakers apart · Downloading the video".
+    void describe(Job& b)
+    {
+        const std::string id = b.id;
+        std::vector<std::string> parts;
+        auto h = procs.find("heavy");
+        const bool transcribing = h != procs.end() && h->second.proc && h->second.jobId == id && preparing(b);
+        if (busy("pull") && procs["pull"].jobId == id)
+            parts.push_back(imagePresent ? "Looking for a newer reelcut image" : "Downloading the reelcut image (about 1 GB, once)");
+        if (transcribing)
+            parts.push_back(b.progressN ? "Transcribing " + std::to_string(b.progressI) + "/" + std::to_string(b.progressN) : "Transcribing");
+        else if (preparing(b) && audioReady(b) && !b.transcribed && !busy("pull")) parts.push_back("Waiting to transcribe");
+        if (busy("diarize/" + id)) {
+            const int mins = std::max(1, (int)std::lround(b.duration / 3600.0 * 7));
+            parts.push_back("Telling the speakers apart" + (b.duration > 0 ? " (about " + std::to_string(mins) + " min)" : std::string()));
+        }
+        if (busy("fetch/" + id)) parts.push_back(!b.file.empty() ? "Copying the video" : audioReady(b) ? "Downloading the video" : "Downloading the audio");
+        if (busy("probe/" + id)) parts.push_back("Looking at the video");
+        std::string a;
+        for (auto& p : parts) a += (a.empty() ? "" : " · ") + p;
+        if (!a.empty()) b.activity = a;
+    }
+
+    void pullImage(Job& b)
+    {
+        const bool had = imagePresent;
+        launch(b, "pull", runnerBin, {"pull", kImage}, "", [this, id = b.id, had](bool ok, const std::string&) {
+            Job* j = find(id);
+            // Tried either way, so an offline machine doesn't try before every job.
+            lastPull = QDateTime::currentMSecsSinceEpoch();
+            if (!ok && !had) { if (j) finishStep(*j, "Could not download the reelcut image. " + lastLog(*j)); return; }
+            if (!ok && j) logLine(*j, "Could not look for a newer image; using the one already here.");
+            imagePresent = true;
+            // A cut that waited for the image runs now.
+            if (j && !preparing(*j) && j->status == "running") j->status = "queued";
+            sideDone();
+        });
+    }
+
+    void startFetch(Job& b)
+    {
+        if (!b.file.empty()) {
+            // A local video: copied into the job's folder, so the steps (and the container) see it.
+            std::string src = b.file;
+            std::string ext = fs::path(src).extension().string();
+            if (ext.empty()) ext = ".mp4";
+            launch(b, "fetch/" + b.id, "cp", {"--", QString::fromStdString(src), QString::fromStdString(b.dir + "/video" + ext)}, "",
+                   [this, id = b.id, src](bool ok, const std::string&) {
+                Job* j = find(id); if (!j) return;
+                if (!ok) { finishStep(*j, "Could not copy " + src + ". " + lastLog(*j)); return; }
+                if (j->title.empty()) j->title = fs::path(src).stem().string();
+                j->fetched = true;
+                sideDone();
+            });
+            return;
+        }
+        const std::string name = "reelcut-fetch-" + b.id;
+        launch(b, "fetch/" + b.id, runnerBin, stepArgs(b, {"fetch", QString::fromStdString(b.url), work(b, "")}, name, nullptr), name,
+               [this, id = b.id](bool ok, const std::string&) {
+            Job* j = find(id); if (!j) return;
+            if (!ok) { finishStep(*j, "Downloading failed. " + lastLog(*j)); return; }
+            readMeta(*j);
+            j->fetched = true;
+            sideDone();
+        });
+    }
+
+    void startTranscribe(Job& b)
+    {
+        const std::string name = "reelcut-" + b.id;
+        b.progressI = b.progressN = 0;
+        launch(b, "heavy", runnerBin, stepArgs(b, {"transcribe", work(b, "")}, name, nullptr), name,
+               [this, id = b.id](bool ok, const std::string&) {
+            Job* j = find(id); if (!j) return;
+            if (!ok) { finishStep(*j, "Transcribing failed. " + lastLog(*j)); return; }
+            countWords(*j);
+            j->transcribed = true;
+            j->progressI = j->progressN = 0;
+            sideDone();
+        });
+    }
+
+    // Who speaks when, into diarization.json; it labels the words if transcribe is done, else
+    // transcribe does when it finishes.
+    void startDiarize(Job& b)
+    {
+        const std::string name = "reelcut-diarize-" + b.id;
+        QStringList args{"diarize", work(b, "")};
+        if (b.speakersWanted > 0) args << "--speakers" << QString::number(b.speakersWanted);
+        b.diar = "running";
+        b.spk.erase("error");
+        launch(b, "diarize/" + b.id, runnerBin, stepArgs(b, args, name, nullptr), name, [this, id = b.id](bool ok, const std::string&) {
+            Job* j = find(id); if (!j) return;
+            // Not fatal: the reels are cut without names.
+            // A reelcut image from before 2026-10-14 needs the words first: once more after transcribing.
+            if (!ok && !j->transcribed && !j->diarRetry) { j->diar = "after"; j->diarRetry = true; logLine(*j, "Telling the speakers apart again once the transcript is done."); }
+            else if (!ok) { j->diar = "failed"; j->spk["error"] = "Could not tell the speakers apart. " + lastLog(*j); }
+            else j->diar = "done";
+            sideDone();
+        });
+    }
+
+    // The video's size and one frame of it (40% in), for "who sits where".
+    void startProbe(Job& b)
+    {
+        const std::string name = "reelcut-probe-" + b.id;
+        const std::string w = work(b, "").toStdString();
+        QString script = QString("v=$(ls %1/video.* 2>/dev/null | grep -v '\\.part$' | head -n 1); [ -n \"$v\" ] || exit 0; "
+                                 "ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x \"$v\" > %1/.size; "
+                                 "ffmpeg -loglevel error -y -ss %2 -i \"$v\" -frames:v 1 -vf scale=640:-2 %1/frame.jpg; exit 0")
+                             .arg(shq(w), QString::number(b.duration > 0 ? (int)(b.duration * 0.4) : 60));
+        QStringList args;
+        std::string bin = runnerBin;
+        if (containerRunner()) args = stepArgs(b, {"-c", script}, name, "sh");
+        else { bin = "sh"; args = {"-c", script}; }
+        launch(b, "probe/" + b.id, bin, args, name, [this, id = b.id](bool, const std::string&) {
+            Job* j = find(id); if (!j) return;
+            QStringList wh = QString::fromStdString(trim(readFile(j->dir + "/.size"))).split('x');
+            if (wh.size() == 2) { j->vw = wh[0].toInt(); j->vh = wh[1].toInt(); }
+            loadFrame(*j);
+            j->probed = true;
+            sideDone();
+        });
+    }
+
+    // Everything before picking is done: name the speakers, or pick.
+    void prepared(Job& b)
+    {
+        b.progressI = b.progressN = 0;
+        b.activity.clear();
+        if (b.diar == "done") {
+            readSpeakers(b);
+            // The transcript now says who speaks: the prompts made from the old one go.
+            std::error_code ec;
+            for (auto& e : fs::directory_iterator(b.dir, ec))
+                if (e.path().filename().string().rfind("prompt-", 0) == 0) fs::remove(e.path(), ec);
+            if (jnum(b.spk, "found", 0) >= 2) { b.step = "speakers"; b.status = "waiting"; finishStep(b, ""); return; }
+        }
+        toPicking(b);
+    }
+
+    // After picking: cut, previews, the page; one at a time over all jobs.
     void runStep(Job& b)
     {
-        if (b.step == "fetch" && !b.file.empty()) { copyFile(b); return; }
         if (runner.empty()) { finishStep(b, runnerError.empty() ? "No way to run reelcut here." : runnerError); return; }
-        // A new job looks for a newer image first (once a day), so a fix in reelcut reaches an existing install.
-        bool stale = b.step == "fetch" && QDateTime::currentMSecsSinceEpoch() - lastPull > kImageMaxAgeMs;
-        if (containerRunner() && (!imagePresent || stale)) { ensureImage(b); return; }
+        if (containerRunner() && !imagePresent) { if (!busy("pull")) pullImage(b); return; }
         const std::string name = "reelcut-" + b.id;
-        if (b.step == "fetch") {
-            b.activity = "Downloading the video";
-            launch(b, runnerBin, stepArgs(b, {"fetch", QString::fromStdString(b.url), work(b, "")}, name, nullptr), name,
-                   [this, id = b.id](bool ok, const std::string&) {
-                Job* j = find(id); if (!j) return;
-                if (!ok) { finishStep(*j, "Downloading failed. " + lastLog(*j)); return; }
-                readMeta(*j);
-                j->step = "transcribe"; j->status = "queued";
-                finishStep(*j, "");
-            });
-        } else if (b.step == "transcribe") {
-            b.activity = "Transcribing";
-            launch(b, runnerBin, stepArgs(b, {"transcribe", work(b, "")}, name, nullptr), name,
-                   [this, id = b.id](bool ok, const std::string&) {
-                Job* j = find(id); if (!j) return;
-                if (!ok) { finishStep(*j, "Transcribing failed. " + lastLog(*j)); return; }
-                countWords(*j);
-                if (diarize) { j->step = "diarize"; j->status = "queued"; finishStep(*j, ""); return; }
-                toPicking(*j);
-            });
-        } else if (b.step == "diarize") {
-            const int mins = std::max(1, (int)std::lround(b.duration / 3600.0 * 7));
-            b.activity = "Telling the speakers apart (about " + std::to_string(mins) + " min)";
-            // Who speaks, then the video's size and one frame of it, for "who sits where".
-            const std::string w = work(b, "").toStdString();
-            const QString reelcut = containerRunner() ? QString("reelcut") : shq(runnerBin);
-            QString script = QString("%1 diarize %2%3 || exit 1; "
-                                     "v=$(ls %2/video.* 2>/dev/null | grep -v '\\.part$' | head -n 1); [ -n \"$v\" ] || exit 0; "
-                                     "ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x \"$v\" > %2/.size; "
-                                     "ffmpeg -loglevel error -y -ss %4 -i \"$v\" -frames:v 1 -vf scale=640:-2 %2/frame.jpg; exit 0")
-                                 .arg(reelcut, shq(w),
-                                      b.speakersWanted > 0 ? QString(" --speakers %1").arg(b.speakersWanted) : QString(),
-                                      QString::number(b.duration > 0 ? (int)(b.duration * 0.4) : 60));
-            QStringList args;
-            std::string bin = runnerBin;
-            if (containerRunner()) args = stepArgs(b, {"-c", script}, name, "sh");
-            else { bin = "sh"; args = {"-c", script}; }
-            launch(b, bin, args, name, [this, id = b.id](bool ok, const std::string& out) {
-                Job* j = find(id); if (!j) return;
-                if (!ok) {
-                    // Not fatal: the reels are cut without names.
-                    j->spk["error"] = "Could not tell the speakers apart. " + lastLog(*j);
-                    toPicking(*j);
-                    return;
-                }
-                readSpeakers(*j, out);
-                // The transcript now says who speaks: the prompts made from the old one go.
-                std::error_code ec;
-                for (auto& e : fs::directory_iterator(j->dir, ec))
-                    if (e.path().filename().string().rfind("prompt-", 0) == 0) fs::remove(e.path(), ec);
-                if (jnum(j->spk, "found", 0) >= 2) { j->step = "speakers"; j->status = "waiting"; finishStep(*j, ""); }
-                else toPicking(*j);
-            });
-        } else if (b.step == "cut") {
+        if (b.step == "cut") {
             b.activity = "Cutting the reels";
             std::error_code ec;
             fs::create_directories(b.dir + "/reels", ec);
@@ -649,7 +855,7 @@ struct ReelcutCorePrivate {
             std::string who = speakersArg(b);
             if (!who.empty()) args << "--speakers" << QString::fromStdString(who);
             b.progressN = (int)parseClips(b.clipsText).size();
-            launch(b, runnerBin, stepArgs(b, args, name, nullptr), name, [this, id = b.id](bool ok, const std::string& out) {
+            launch(b, "heavy", runnerBin, stepArgs(b, args, name, nullptr), name, [this, id = b.id](bool ok, const std::string& out) {
                 Job* j = find(id); if (!j) return;
                 if (!ok) { finishStep(*j, "Cutting failed. " + lastLog(*j)); return; }
                 (void)out;
@@ -668,7 +874,7 @@ struct ReelcutCorePrivate {
             std::string bin = runnerBin;
             if (containerRunner()) args = stepArgs(b, {"-c", script}, name, "sh");
             else { bin = "sh"; args = {"-c", script}; }
-            launch(b, bin, args, name, [this, id = b.id, title](bool ok, const std::string&) {
+            launch(b, "heavy", bin, args, name, [this, id = b.id, title](bool ok, const std::string&) {
                 Job* j = find(id); if (!j) return;
                 if (!ok) logLine(*j, "Some previews could not be made.");
                 loadReels(*j);
@@ -691,23 +897,35 @@ struct ReelcutCorePrivate {
         startPick(j, agent);
     }
 
-    // diarize prints "2 speakers in 3639 s of audio, told apart in 416 s (9x real time): A 22.1 min, B 31.8 min";
-    // transcript-ts.txt now reads "[0:03:42] B: …".
-    void readSpeakers(Job& j, const std::string& out)
+    // diarization.json: [start, end, letter] per turn; transcript-ts.txt reads "[0:03:42] B: …".
+    void readSpeakers(Job& j)
     {
         json names = j.spk.contains("names") && j.spk["names"].is_object() ? j.spk["names"] : json::object();
         json sides = j.spk.contains("sides") && j.spk["sides"].is_object() ? j.spk["sides"] : json::object();
         json talk = json::object();
-        int found = 0;
-        static const QRegularExpression head("(\\d+) speakers? in");
-        static const QRegularExpression each("\\b([A-Z]) (\\d+(?:\\.\\d+)?) min");
-        for (auto& line : QString::fromStdString(out).split('\n')) {
-            auto m = head.match(line);
-            if (!m.hasMatch()) continue;
-            found = m.captured(1).toInt();
-            auto it = each.globalMatch(line.mid(line.indexOf(':')));
-            while (it.hasNext()) { auto x = it.next(); talk[x.captured(1).toStdString()] = x.captured(2).toDouble() * 60; }
+        json turns = json::parse(readFile(j.dir + "/diarization.json"), nullptr, false);
+        if (turns.is_array())
+            for (auto& t : turns) {
+                if (!t.is_array() || t.size() < 3 || !t[0].is_number() || !t[1].is_number() || !t[2].is_string()) continue;
+                std::string who = t[2].get<std::string>();
+                talk[who] = (talk.contains(who) ? talk[who].get<double>() : 0.0) + t[1].get<double>() - t[0].get<double>();
+            }
+        // An older reelcut labels only the words: each run of one speaker's words is a turn.
+        if (!turns.is_array()) {
+            json words = json::parse(readFile(j.dir + "/words.json"), nullptr, false);
+            std::string cur;
+            double t0 = 0, t1 = 0;
+            auto close = [&] { if (!cur.empty()) talk[cur] = (talk.contains(cur) ? talk[cur].get<double>() : 0.0) + t1 - t0; };
+            if (words.is_array())
+                for (auto& w : words) {
+                    if (!w.is_array() || w.size() < 4 || !w[0].is_number() || !w[1].is_number() || !w[3].is_string()) continue;
+                    std::string who = w[3].get<std::string>();
+                    if (who != cur) { close(); cur = who; t0 = w[0].get<double>(); }
+                    t1 = w[1].get<double>();
+                }
+            close();
         }
+        const int found = (int)talk.size();
         // A few lines each, spread over the recording, so the person can tell who is who.
         std::map<std::string, std::vector<std::string>> lines;
         static const QRegularExpression said("^\\[(\\d+:\\d\\d:\\d\\d)\\] ([A-Z]): (.*)$");
@@ -727,12 +945,8 @@ struct ReelcutCorePrivate {
             const size_t n = std::min<size_t>(3, v.size());
             for (size_t k = 0; k < n; k++) a.push_back(v[(k * 2 + 1) * v.size() / (n * 2)]);
             samples[who] = a;
-            if (!talk.contains(who)) talk[who] = 0;
         }
-        if (!found) found = (int)talk.size();
         j.spk = {{"found", found}, {"talk", talk}, {"samples", samples}, {"names", names}, {"sides", sides}};
-        QStringList wh = QString::fromStdString(trim(readFile(j.dir + "/.size"))).split('x');
-        if (wh.size() == 2) { j.vw = wh[0].toInt(); j.vh = wh[1].toInt(); }
         // Two people in a landscape recording (a call, an interview): one above the other.
         if (j.layout.empty() && found == 2 && j.vw > j.vh) j.layout = "stack";
         loadFrame(j);
@@ -790,52 +1004,10 @@ struct ReelcutCorePrivate {
     {
         const std::string name = "reelcut-" + b.id;
         b.activity = "Writing the page";
-        launch(b, runnerBin, stepArgs(b, {"page", work(b, "reels"), "--title", title}, name, nullptr), name,
+        launch(b, "heavy", runnerBin, stepArgs(b, {"page", work(b, "reels"), "--title", title}, name, nullptr), name,
                [this, id = b.id](bool, const std::string&) {
             Job* j = find(id); if (!j) return;
             j->step = "done"; j->status = "done";
-            finishStep(*j, "");
-        });
-    }
-
-    void ensureImage(Job& b)
-    {
-        if (!imageChecked) {
-            imageChecked = true;
-            QProcess p; p.setProcessEnvironment(processEnv());
-            QStringList args = runner == "podman" ? QStringList{"image", "exists", kImage}
-                                                  : QStringList{"image", "inspect", kImage};
-            p.start(QString::fromStdString(runnerBin), args);
-            imagePresent = p.waitForFinished(15000) && p.exitCode() == 0;
-        }
-        const bool had = imagePresent;
-        b.activity = had ? "Looking for a newer reelcut image" : "Downloading the reelcut image (about 1 GB, once)";
-        launch(b, runnerBin, {"pull", kImage}, "", [this, id = b.id, had](bool ok, const std::string&) {
-            Job* j = find(id); if (!j) return;
-            // Tried either way, so an offline machine doesn't try before every job.
-            lastPull = QDateTime::currentMSecsSinceEpoch();
-            if (!ok && !had) { finishStep(*j, "Could not download the reelcut image. " + lastLog(*j)); return; }
-            if (!ok) logLine(*j, "Could not look for a newer image; using the one already here.");
-            imagePresent = true;
-            j->status = "queued";
-            finishStep(*j, "");
-        });
-    }
-
-    void copyFile(Job& b)
-    {
-        // A local video: copied into the job's folder, so the steps (and the container) see it.
-        std::string src = b.file;
-        std::string ext = fs::path(src).extension().string();
-        if (ext.empty()) ext = ".mp4";
-        std::string dst = b.dir + "/video" + ext;
-        b.activity = "Copying the video";
-        launch(b, "cp", {"--", QString::fromStdString(src), QString::fromStdString(dst)}, "",
-               [this, id = b.id, src](bool ok, const std::string&) {
-            Job* j = find(id); if (!j) return;
-            if (!ok) { finishStep(*j, "Could not copy " + src + ". " + lastLog(*j)); return; }
-            if (j->title.empty()) j->title = fs::path(src).stem().string();
-            j->step = "transcribe"; j->status = "queued";
             finishStep(*j, "");
         });
     }
@@ -1229,16 +1401,30 @@ struct ReelcutCorePrivate {
         return jobs.back();
     }
 
-    void stop(Job& b)
+    // Ends every process of the job; their results no longer count. True when one ran.
+    bool stopProcs(const std::string& id, bool)
     {
-        if (heavy.proc && heavy.jobId == b.id) {
-            heavy.cancelled = true;
-            QProcess* p = heavy.proc;
+        bool any = false;
+        for (auto& [slot, r] : procs) {
+            if (!r.proc || r.jobId != id) continue;
+            any = true;
+            r.cancelled = true;
+            QProcess* p = r.proc;
             pid_t pid = (pid_t)p->processId();
             if (pid > 0) ::kill(-pid, SIGTERM);
-            if (!heavy.container.empty() && containerRunner())
-                detached(runnerBin, {"rm", "-f", QString::fromStdString(heavy.container)});
+            if (!r.container.empty() && containerRunner())
+                detached(runnerBin, {"rm", "-f", QString::fromStdString(r.container)});
             QTimer::singleShot(3000, guarded("kill", [p = QPointer<QProcess>(p), pid] { if (p && pid > 0) ::kill(-pid, SIGKILL); }));
+        }
+        return any;
+    }
+
+    void stop(Job& b)
+    {
+        if (stopProcs(b.id, true)) {
+            b.status = "cancelled"; b.error = "Cancelled."; b.activity.clear();
+            b.progressI = b.progressN = 0;
+            if (b.diar == "running") b.diar = "wanted";
         }
         auto it = picks.find(b.id);
         if (it != picks.end() || (b.step == "pick" && b.status == "running")) {
@@ -1279,9 +1465,11 @@ ReelcutCoreImpl::~ReelcutCoreImpl()
         p->waitForFinished(2000);
         delete p;
     };
-    if (d->heavy.proc && !d->heavy.container.empty() && d->containerRunner())
-        detached(d->runnerBin, {"rm", "-f", QString::fromStdString(d->heavy.container)});
-    end(d->heavy.proc);
+    for (auto& [slot, r] : d->procs) {
+        if (r.proc && !r.container.empty() && d->containerRunner())
+            detached(d->runnerBin, {"rm", "-f", QString::fromStdString(r.container)});
+        end(r.proc);
+    }
     for (auto& [id, p] : d->picks) end(p);
     delete d;
 }
@@ -1553,6 +1741,8 @@ std::string ReelcutCoreImpl::diarizeJob(const std::string& jobId, int64_t speake
     if (d->runner.empty()) return json({{"ok", false}, {"error", d->runnerError}}).dump();
     b->speakersWanted = (int)std::clamp<int64_t>(speakers, 0, 12);
     b->spk.erase("error");
+    b->diar = "wanted";
+    b->diarRetry = false;
     b->step = "diarize"; b->status = "queued"; b->error.clear();
     d->save();
     d->schedule();

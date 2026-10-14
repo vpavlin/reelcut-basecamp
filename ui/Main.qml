@@ -237,7 +237,8 @@ Item {
         if (j.status === "queued") return "Waiting for its turn"
         if (j.status === "waiting" && j.step === "speakers") return "Name the speakers"
         if (j.status === "waiting") return j.clips.length ? "Check the clips, then cut" : "Needs clips"
-        if (j.step === "transcribe" && j.progress.n) return "Transcribing " + j.progress.i + "/" + j.progress.n
+        // Before picking, several things run at once; the core says which, with the transcribe count.
+        if (j.step === "fetch" || j.step === "transcribe" || j.step === "diarize") return j.activity || "Working"
         if (j.step === "cut" && j.progress.n) return "Cutting " + Math.min(j.progress.i + 1, j.progress.n) + "/" + j.progress.n
         return j.activity || "Working"
     }

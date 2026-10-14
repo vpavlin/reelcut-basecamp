@@ -389,7 +389,7 @@ struct ReelcutCorePrivate {
         QStringList a;
         if (!containerRunner()) return reelcutArgs;
         a << "run" << "--rm" << "--name" << QString::fromStdString(name)
-          << "-v" << QString::fromStdString(b.dir) + (runner == "podman" ? ":/work:Z" : ":/work");
+          << "-v" << QString::fromStdString(b.dir) + (runner == "podman" ? ":/work:z" : ":/work");
         if (runner == "docker") a << "--user" << QString("%1:%2").arg(::getuid()).arg(::getgid());
         else a << "--userns" << "keep-id";
         if (entrypoint) a << "--entrypoint" << entrypoint;

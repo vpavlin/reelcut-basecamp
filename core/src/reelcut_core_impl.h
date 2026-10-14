@@ -34,7 +34,7 @@ public:
     // sandboxed view may load a local image from.
     std::string setViewDir(const std::string& dir);
 
-    // settingsJson: {"agent": "MACHINE/SESSION" or "" (pick through an AI chat), "count": 6, "runner": "auto|podman|docker|local"}.
+    // settingsJson: {"agent": "MACHINE/SESSION" or "" (pick through an AI chat), "count": 6, "runner": "auto|podman|docker|local", "diarize": true}.
     std::string setSettings(const std::string& settingsJson);
 
     // The agents on the shrooms mesh, for the "who picks the clips" choice. Fills snapshot().agents.
@@ -53,6 +53,12 @@ public:
     // The prompt for picking the clips (instructions + the transcript), to paste into any AI chat:
     // {"ok": true, "text": "…"}.
     std::string getPrompt(const std::string& jobId);
+
+    // Tell the speakers apart (again): speakers = how many people talk, 0 = counted from the voices.
+    std::string diarizeJob(const std::string& jobId, int64_t speakers);
+
+    // speakersJson: {"names": {"A": "Corey Petty"}, "sides": {"A": "left"}, "layout": "stack|fit|speaker|crop|"}; proceed: go on to picking.
+    std::string setSpeakers(const std::string& jobId, const std::string& speakersJson, bool proceed);
 
     // The clip list, one line per clip (a pasted chat answer is fine: only the clip lines are kept): N | START H:MM:SS | END H:MM:SS | speaker | hook | until LASTWORD
     std::string setClips(const std::string& jobId, const std::string& clipsText);

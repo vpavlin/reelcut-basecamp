@@ -20,7 +20,12 @@ public:
   QString ctl;
   Q_INVOKABLE void callModuleAsync(QString mod, QString method, QVariantList args, QJSValue cb, int) {
     QStringList a{QString::fromLocal8Bit(qgetenv("SESS").isEmpty() ? "reelcut" : qgetenv("SESS")), "call", mod, method};
-    for (auto& v : args) a << "str:" + v.toString();
+    // Typed as the view sent them: bools and numbers bare, the rest as strings.
+    for (auto& v : args) {
+      const int t = v.typeId();
+      if (t == QMetaType::Bool || t == QMetaType::Int || t == QMetaType::Double || t == QMetaType::LongLong) a << v.toString();
+      else a << "str:" + v.toString();
+    }
     auto* p = new QProcess(this);
     connect(p, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this, [p, cb](int, QProcess::ExitStatus) mutable {
       QByteArray out = p->readAllStandardOutput();

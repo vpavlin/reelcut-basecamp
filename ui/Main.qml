@@ -34,6 +34,9 @@ Item {
     readonly property color cBad: tok(pal.error, "#ef6f6c")
     // The caption yellow of the reels themselves.
     readonly property color cWord: "#ffe14d"
+    // Each speaker's caption colour in the reels (reelcut's SPEAKER_COLOURS): A, B, C, …
+    readonly property var speakerColours: ["#ffffff", "#8fd3ff", "#ffb86c", "#b9f18c", "#ffa0e0"]
+    function speakerColour(letter) { return root.speakerColours[(String(letter).charCodeAt(0) - 65) % root.speakerColours.length] }
     readonly property int sp: 8
 
     // ── core bridge
@@ -163,6 +166,39 @@ Item {
         var n = pickerOptions(false)
         if (JSON.stringify(n) !== JSON.stringify(root.pickOpts)) root.pickOpts = n
     }
+    // The speakers of the selected job ([letter]), kept as is between polls so their fields keep what is typed.
+    property var spkLetters: []
+    onJobChanged: {
+        var s = root.job && root.job.speakers ? root.job.speakers : {}
+        var n = (s.found || 0) >= 2 ? Object.keys(s.talk || {}).sort() : []
+        n = n.length ? [root.job.id].concat(n) : []
+        if (JSON.stringify(n) !== JSON.stringify(root.spkLetters)) root.spkLetters = n
+    }
+    // Names, sides and the layout from the speakers panel; proceed: go on to picking the clips.
+    function saveSpeakers(proceed) {
+        var names = {}, sides = {}
+        for (var i = 0; i < spkRep.count; i++) {
+            var it = spkRep.itemAt(i)
+            if (!it) continue
+            names[it.letter] = it.nameText
+            if (it.side) sides[it.letter] = it.side
+        }
+        act("setSpeakers", [root.job.id, JSON.stringify({ names: names, sides: sides, layout: layoutValue(spkLayout.currentIndex) }), !!proceed],
+            proceed ? "" : "Saved")
+    }
+    // The layouts cut --frame takes: "" lets reelcut choose (fit for landscape, crop for portrait).
+    readonly property var layouts: [
+        { value: "", label: "Automatic" },
+        { value: "fit", label: "The whole picture" },
+        { value: "stack", label: "Two people, one above the other" },
+        { value: "speaker", label: "Follow whoever speaks" },
+        { value: "crop", label: "Crop the middle" }
+    ]
+    function layoutValue(i) { return i >= 0 && i < root.layouts.length ? root.layouts[i].value : "" }
+    function layoutIndex(v) {
+        for (var i = 0; i < root.layouts.length; i++) if (root.layouts[i].value === (v || "")) return i
+        return 0
+    }
     readonly property var pickOptsAll: root.pickOpts.concat([{ value: "", label: "Nobody: I paste from an AI chat" }])
     function pickerLabel(v) {
         if (v === "auto") return "an agent on this computer"
@@ -191,7 +227,7 @@ Item {
         var h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60
         return (h ? h + ":" + (m < 10 ? "0" : "") : "") + m + ":" + (x < 10 ? "0" : "") + x
     }
-    function stepIndex(step) { return ({ fetch: 0, transcribe: 1, pick: 2, clips: 2, cut: 3, thumbs: 3, done: 4 })[step] || 0 }
+    function stepIndex(step) { return ({ fetch: 0, transcribe: 1, diarize: 2, speakers: 2, pick: 3, clips: 3, cut: 4, thumbs: 4, done: 5 })[step] || 0 }
     // One line saying where a job is, for the list and the header.
     function statusText(j) {
         if (!j) return ""
@@ -199,6 +235,7 @@ Item {
         if (j.status === "cancelled") return "Stopped"
         if (j.status === "done") return j.reels.length + (j.reels.length === 1 ? " reel" : " reels")
         if (j.status === "queued") return "Waiting for its turn"
+        if (j.status === "waiting" && j.step === "speakers") return "Name the speakers"
         if (j.status === "waiting") return j.clips.length ? "Check the clips, then cut" : "Needs clips"
         if (j.step === "transcribe" && j.progress.n) return "Transcribing " + j.progress.i + "/" + j.progress.n
         if (j.step === "cut" && j.progress.n) return "Cutting " + Math.min(j.progress.i + 1, j.progress.n) + "/" + j.progress.n
@@ -426,7 +463,7 @@ Item {
                         Layout.fillWidth: true
                         spacing: 6
                         Repeater {
-                            model: ["Download", "Transcribe", "Pick clips", "Cut"]
+                            model: ["Download", "Transcribe", "Speakers", "Pick clips", "Cut"]
                             delegate: ColumnLayout {
                                 required property string modelData
                                 required property int index
@@ -577,9 +614,164 @@ Item {
                         }
                     }
 
+                    // who speaks: names, where each sits, the layout
+                    Rectangle {
+                        visible: root.spkLetters.length > 0 && !!root.job && !(root.job.status === "running" && root.job.step === "diarize")
+                        Layout.fillWidth: true
+                        implicitHeight: spkCol.implicitHeight + 32
+                        radius: 10
+                        color: root.cSurface
+                        border.width: 1; border.color: root.job && root.job.step === "speakers" ? root.cWord : root.cLine
+                        ColumnLayout {
+                            id: spkCol
+                            anchors.fill: parent; anchors.margins: 16
+                            spacing: 12
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Text { text: "Who speaks"; color: root.cText; font.pixelSize: 15; font.bold: true; textFormat: Text.PlainText; Layout.fillWidth: true }
+                                Text {
+                                    text: "Open the transcript"
+                                    color: tr3Mouse.containsMouse ? root.cAccent : root.cSub; font.pixelSize: 12; textFormat: Text.PlainText
+                                    MouseArea { id: tr3Mouse; anchors.fill: parent; anchors.margins: -4; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.act("openPath", [root.job.dir + "/transcript-ts.txt"]) }
+                                }
+                            }
+                            Text {
+                                Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+                                color: root.cSub; font.pixelSize: 13
+                                text: (root.spkLetters.length - 1) + " voices. Give each a name, as it should show on the reels, and say where they sit in the picture. "
+                                    + "The names also tell the agent who is who."
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 16
+                                // One frame of the video, to see who sits where.
+                                Rectangle {
+                                    visible: !!root.job && !!root.job.frame
+                                    Layout.alignment: Qt.AlignTop
+                                    Layout.preferredWidth: 320
+                                    Layout.preferredHeight: root.job && root.job.width > 0 ? 320 * root.job.height / root.job.width : 180
+                                    radius: 6; color: "#000"; clip: true
+                                    Image {
+                                        anchors.fill: parent
+                                        source: root.job && root.job.frame ? root.fileUrl(root.job.frame) : ""
+                                        fillMode: Image.PreserveAspectFit
+                                        asynchronous: true
+                                        cache: false
+                                    }
+                                    Text { anchors.left: parent.left; anchors.bottom: parent.bottom; anchors.margins: 6; text: "left"; color: "#fff"; font.pixelSize: 11; style: Text.Outline; styleColor: "#000"; textFormat: Text.PlainText }
+                                    Text { anchors.right: parent.right; anchors.bottom: parent.bottom; anchors.margins: 6; text: "right"; color: "#fff"; font.pixelSize: 11; style: Text.Outline; styleColor: "#000"; textFormat: Text.PlainText }
+                                }
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    Layout.alignment: Qt.AlignTop
+                                    spacing: 14
+                                    Repeater {
+                                        id: spkRep
+                                        model: root.spkLetters.slice(1)
+                                        delegate: ColumnLayout {
+                                            id: spkRow
+                                            required property string modelData
+                                            required property int index
+                                            readonly property string letter: modelData
+                                            readonly property var spk: root.job && root.job.speakers ? root.job.speakers : ({})
+                                            readonly property string nameText: nameField.text.trim()
+                                            readonly property string side: ["", "left", "right"][sideBox.currentIndex] || ""
+                                            // What is stored: put in the fields when it changes, not on every poll.
+                                            readonly property string seedName: spk.names && spk.names[letter] ? spk.names[letter] : ""
+                                            readonly property string seedSide: spk.sides && spk.sides[letter] ? spk.sides[letter] : ""
+                                            onSeedNameChanged: nameField.text = seedName
+                                            onSeedSideChanged: sideBox.currentIndex = Math.max(0, ["", "left", "right"].indexOf(seedSide))
+                                            Component.onCompleted: { nameField.text = seedName; sideBox.currentIndex = Math.max(0, ["", "left", "right"].indexOf(seedSide)) }
+                                            Layout.fillWidth: true
+                                            spacing: 6
+                                            RowLayout {
+                                                Layout.fillWidth: true
+                                                spacing: 10
+                                                Rectangle {
+                                                    width: 26; height: 26; radius: 13
+                                                    color: root.cRaised; border.width: 2; border.color: root.speakerColour(spkRow.letter)
+                                                    Text { anchors.centerIn: parent; text: spkRow.letter; color: root.speakerColour(spkRow.letter); font.pixelSize: 13; font.bold: true; textFormat: Text.PlainText }
+                                                }
+                                                Text {
+                                                    text: {
+                                                        var t = spkRow.spk.talk ? spkRow.spk.talk[spkRow.letter] || 0 : 0
+                                                        return t >= 60 ? Math.round(t / 60) + " min" : Math.round(t) + " s"
+                                                    }
+                                                    color: root.cFaint; font.pixelSize: 12; font.features: { "tnum": 1 }; Layout.preferredWidth: 46; textFormat: Text.PlainText
+                                                }
+                                                Field {
+                                                    id: nameField
+                                                    Layout.fillWidth: true
+                                                    Layout.preferredHeight: 34
+                                                    placeholderText: "Name of " + spkRow.letter
+                                                }
+                                                ComboBox {
+                                                    id: sideBox
+                                                    Layout.preferredWidth: 150
+                                                    model: ["Sits: not sure", "On the left", "On the right"]
+                                                    // Two people: one side says the other.
+                                                    onActivated: {
+                                                        if (spkRep.count !== 2 || currentIndex === 0) return
+                                                        var other = spkRep.itemAt(1 - spkRow.index)
+                                                        if (other) other.setSide(currentIndex === 1 ? 2 : 1)
+                                                    }
+                                                }
+                                            }
+                                            function setSide(i) { sideBox.currentIndex = i }
+                                            Repeater {
+                                                model: spkRow.spk.samples && spkRow.spk.samples[spkRow.letter] ? spkRow.spk.samples[spkRow.letter] : []
+                                                delegate: Text {
+                                                    required property string modelData
+                                                    Layout.fillWidth: true
+                                                    Layout.leftMargin: 36
+                                                    text: (modelData.match(/^\[([^\]]*)\]/) || ["", ""])[1] + "   “" + modelData.replace(/^\[[^\]]*\] /, "") + "”"
+                                                    color: root.cSub; font.pixelSize: 12; font.italic: true
+                                                    elide: Text.ElideRight; textFormat: Text.PlainText
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 10
+                                Label2 { text: "Layout" }
+                                ComboBox {
+                                    id: spkLayout
+                                    Layout.preferredWidth: 270
+                                    model: root.layouts.map(function (l) { return l.label })
+                                    readonly property string seed: root.job ? root.job.layout || "" : ""
+                                    onSeedChanged: currentIndex = root.layoutIndex(seed)
+                                    Component.onCompleted: currentIndex = root.layoutIndex(seed)
+                                }
+                                Item { Layout.fillWidth: true }
+                                LogosButton { text: "Save"; visible: !!root.job && root.job.step !== "speakers"; onClicked: root.saveSpeakers(false) }
+                                LogosButton {
+                                    visible: !!root.job && root.job.step === "speakers"
+                                    text: "Go on: pick the clips"
+                                    onClicked: root.saveSpeakers(true)
+                                }
+                            }
+                            // The wrong count merges two people, or splits one.
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 8
+                                Text { text: "Not " + (root.spkLetters.length - 1) + " people? Count again with"; color: root.cFaint; font.pixelSize: 12; textFormat: Text.PlainText }
+                                SpinBox { id: spkCount; from: 1; to: 8; value: Math.max(1, root.spkLetters.length - 1); editable: true; Layout.preferredWidth: 110 }
+                                LogosButton {
+                                    text: "Count again"
+                                    enabled: !!root.job && root.job.status !== "running" && root.job.status !== "queued"
+                                    onClicked: root.act("diarizeJob", [root.job.id, spkCount.value], "Telling the speakers apart again")
+                                }
+                                Item { Layout.fillWidth: true }
+                            }
+                        }
+                    }
+
                     // the clips: who picks them, the list, the names to fix, cut
                     ColumnLayout {
-                        visible: !!root.job && root.stepIndex(root.job.step) >= 2 && !(root.job.status === "running" && root.job.step !== "pick")
+                        visible: !!root.job && root.stepIndex(root.job.step) >= 3 && !(root.job.status === "running" && root.job.step !== "pick")
                         Layout.fillWidth: true
                         spacing: 10
 
@@ -697,6 +889,13 @@ Item {
                         RowLayout {
                         spacing: 18
                         Text {
+                            visible: !!root.job && root.spkLetters.length === 0 && !(root.job.speakers && root.job.speakers.found)
+                                     && root.job.status !== "running" && root.job.status !== "queued"
+                            text: "Tell the speakers apart"
+                            color: daMouse.containsMouse ? root.cAccent : root.cSub; font.pixelSize: 12; textFormat: Text.PlainText
+                            MouseArea { id: daMouse; anchors.fill: parent; anchors.margins: -4; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.act("diarizeJob", [root.job.id, 0], "Telling the speakers apart") }
+                        }
+                        Text {
                             visible: !!root.job && root.job.clips.length > 0
                             text: clipsArea.visible ? "Hide the list" : "Edit the list"
                             color: editMouse.containsMouse ? root.cAccent : root.cSub; font.pixelSize: 12; textFormat: Text.PlainText
@@ -761,8 +960,24 @@ Item {
                                     Layout.fillWidth: true
                                     Layout.preferredHeight: 34
                                     placeholderText: "Sterling=Sterlin, Meakin=Mencken"
-                                    text: root.job ? root.job.fixes : ""
+                                    // Put in when the stored value changes, not on every poll (that would undo typing).
+                                    readonly property string seed: root.job ? root.job.id + "\n" + (root.job.fixes || "") : ""
+                                    onSeedChanged: text = root.job ? root.job.fixes || "" : ""
                                     onAccepted: cutBtn.clicked()
+                                }
+                            }
+                            ColumnLayout {
+                                spacing: 4
+                                Label2 { text: "Layout" }
+                                ComboBox {
+                                    id: cutLayout
+                                    Layout.preferredWidth: 250
+                                    Layout.preferredHeight: 34
+                                    model: root.layouts.map(function (l) { return l.label })
+                                    readonly property string seed: root.job ? root.job.layout || "" : ""
+                                    onSeedChanged: currentIndex = root.layoutIndex(seed)
+                                    Component.onCompleted: currentIndex = root.layoutIndex(seed)
+                                    onActivated: root.act("setSpeakers", [root.job.id, JSON.stringify({ layout: root.layoutValue(currentIndex) }), false])
                                 }
                             }
                             LogosButton {
@@ -849,6 +1064,7 @@ Item {
         function openIt() {
             var s = root.st.settings || {}
             countBox.value = s.count || 6
+            diarizeBox.checked = s.diarize !== false
             autoCutBox.checked = s.autoCut !== false
             var vals = setAgent.opts.map(function (o) { return o.value })
             var want = s.agent === undefined ? "auto" : s.agent
@@ -859,7 +1075,7 @@ Item {
         }
         function save() {
             var agent = setAgent.currentIndex >= 0 ? setAgent.opts[setAgent.currentIndex].value : ""
-            root.act("setSettings", [JSON.stringify({ agent: agent, count: countBox.value, autoCut: autoCutBox.checked,
+            root.act("setSettings", [JSON.stringify({ agent: agent, count: countBox.value, autoCut: autoCutBox.checked, diarize: diarizeBox.checked,
                 runner: ["auto", "podman", "docker", "local"][runnerBox.currentIndex] })], "Saved")
             close()
         }
@@ -896,6 +1112,16 @@ Item {
                 id: autoCutBox
                 text: "Cut as soon as the agent answers"
                 contentItem: Text { text: autoCutBox.text; color: root.cText; font.pixelSize: 13; leftPadding: autoCutBox.indicator.width + 6; verticalAlignment: Text.AlignVCenter; textFormat: Text.PlainText }
+            }
+            CheckBox {
+                id: diarizeBox
+                text: "Tell the speakers apart (about 7 min per hour of video)"
+                contentItem: Text { text: diarizeBox.text; color: root.cText; font.pixelSize: 13; leftPadding: diarizeBox.indicator.width + 6; verticalAlignment: Text.AlignVCenter; textFormat: Text.PlainText }
+            }
+            Text {
+                Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+                color: root.cFaint; font.pixelSize: 12
+                text: "For interviews and calls: you name the people once, the reels show who speaks, and two people on a call are cut one above the other."
             }
             Label2 { text: "Run reelcut with"; Layout.topMargin: 6 }
             ComboBox { id: runnerBox; Layout.fillWidth: true; model: ["Whatever is installed", "podman", "docker", "reelcut on PATH"] }

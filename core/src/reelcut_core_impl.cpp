@@ -17,6 +17,8 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cmath>
+#include <map>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -37,7 +39,7 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-static const char* kVersion = "0.1.2";
+static const char* kVersion = "0.1.4";
 // Reelcut's own sessions on this computer's shrooms-agent: "reelcut-claude", "reelcut-pi".
 static const char* kLocalSession = "reelcut";
 static const char* kImage = "ghcr.io/vpavlin/reelcut:latest";
@@ -234,6 +236,22 @@ static json clipsJson(const std::vector<Clip>& v)
     return a;
 }
 
+// For sh -c: a path in single quotes.
+static QString shq(const std::string& s)
+{
+    return "'" + QString::fromStdString(s).replace("'", "'\\''") + "'";
+}
+
+// A speaker's name as cut --speakers takes it ("A=NAME@left,…"): none of its separators, one line.
+static std::string cleanName(const std::string& s)
+{
+    QString n = QString::fromStdString(s);
+    n.replace(QRegularExpression("[,=@\\r\\n\\t]"), " ");
+    n = n.simplified();
+    if (n.size() > 40) n = n.left(40).trimmed();
+    return n.toStdString();
+}
+
 // ── state ───────────────────────────────────────────────────────────────────
 
 struct Reel {
@@ -242,7 +260,8 @@ struct Reel {
 };
 
 // A job's step is where it is in the pipeline; its status says whether that step runs, waits or stopped.
-//   steps:  fetch -> transcribe -> pick -> clips -> cut -> done
+//   steps:  fetch -> transcribe -> diarize -> speakers -> pick -> clips -> cut -> done
+//           (diarize: who speaks when; speakers: the person names them and says where they sit)
 //   status: queued (waits for its turn) | running | waiting (for the person: clips to check) |
 //           failed | cancelled | done
 struct Job {
@@ -257,6 +276,12 @@ struct Job {
     std::string clipsText, fixes;
     std::vector<Reel> reels;
     int words = 0;
+    // Who speaks (reelcut diarize): {found, talk:{A:s}, samples:{A:[lines]}, names:{A:…}, sides:{A:left|right}, error}
+    json spk = json::object();
+    int speakersWanted = 0;     // 0: counted from the voices
+    std::string layout;         // cut --frame: "" (reelcut's own choice), fit, stack, speaker, crop
+    int vw = 0, vh = 0;         // the video's size, for the layout
+    std::string frame;          // one frame of the video, copied where the view may load it
 };
 
 struct Running {
@@ -275,6 +300,7 @@ struct ReelcutCorePrivate {
     int count = 6;
     std::string runnerPref = "auto";
     bool autoCut = true;
+    bool diarize = true;        // tell the speakers apart after transcribing
 
     // detected
     std::string runner, runnerBin, runnerError;
@@ -309,6 +335,7 @@ struct ReelcutCorePrivate {
         count = (int)std::clamp<int64_t>(jnum(s, "count", count), 1, 20);
         runnerPref = jstr(s, "runner", runnerPref);
         autoCut = jbool(s, "autoCut", autoCut);
+        diarize = jbool(s, "diarize", diarize);
         lastPull = jnum(s, "lastPull", 0);
         if (!j.contains("jobs") || !j["jobs"].is_array()) return;
         for (auto& x : j["jobs"]) {
@@ -321,11 +348,16 @@ struct ReelcutCorePrivate {
             b.agent = jstr(x, "agent", ""); b.pickReply = jstr(x, "pickReply", "");
             b.clipsText = jstr(x, "clipsText", ""); b.fixes = jstr(x, "fixes", "");
             b.words = (int)jnum(x, "words", 0);
+            if (x.contains("speakers") && x["speakers"].is_object()) b.spk = x["speakers"];
+            b.speakersWanted = (int)std::clamp<int64_t>(jnum(x, "speakersWanted", 0), 0, 12);
+            b.layout = jstr(x, "layout", "");
+            b.vw = (int)jnum(x, "vw", 0); b.vh = (int)jnum(x, "vh", 0);
             if (b.id.empty() || b.dir.empty()) continue;
             // Whatever ran when Basecamp closed did not finish.
             if (b.status == "running") { b.status = "cancelled"; b.error = "Stopped when Basecamp closed. Retry to run it again."; }
             jobs.push_back(b);
             loadReels(jobs.back());
+            loadFrame(jobs.back());
         }
     }
     void save()
@@ -336,7 +368,8 @@ struct ReelcutCorePrivate {
                            {"channel", b.channel}, {"created", b.created}, {"duration", (int64_t)b.duration},
                            {"step", b.step}, {"status", b.status}, {"error", b.error}, {"agent", b.agent},
                            {"pickReply", b.pickReply}, {"clipsText", b.clipsText}, {"fixes", b.fixes},
-                           {"words", b.words}});
+                           {"words", b.words}, {"speakers", b.spk}, {"speakersWanted", b.speakersWanted},
+                           {"layout", b.layout}, {"vw", b.vw}, {"vh", b.vh}});
         std::error_code ec;
         fs::create_directories(rootDir(), ec);
         json st = settingsJson();
@@ -345,7 +378,7 @@ struct ReelcutCorePrivate {
     }
     json settingsJson() const
     {
-        return {{"agent", agent}, {"count", count}, {"runner", runnerPref}, {"autoCut", autoCut}};
+        return {{"agent", agent}, {"count", count}, {"runner", runnerPref}, {"autoCut", autoCut}, {"diarize", diarize}};
     }
 
     // ── runner
@@ -437,7 +470,9 @@ struct ReelcutCorePrivate {
                           {"log", log}, {"agent", b.agent}, {"pickTask", b.pickTask}, {"pickReply", b.pickReply},
                           {"clipsText", b.clipsText}, {"clips", clipsJson(parseClips(b.clipsText))},
                           {"fixes", b.fixes}, {"reels", reels}, {"words", b.words},
-                          {"page", fs::exists(page, ec) ? page : ""}});
+                          {"page", fs::exists(page, ec) ? page : ""},
+                          {"speakers", b.spk}, {"speakersWanted", b.speakersWanted}, {"layout", b.layout},
+                          {"width", b.vw}, {"height", b.vh}, {"frame", b.frame}});
         }
         return {
             {"ok", true},
@@ -564,11 +599,41 @@ struct ReelcutCorePrivate {
                 Job* j = find(id); if (!j) return;
                 if (!ok) { finishStep(*j, "Transcribing failed. " + lastLog(*j)); return; }
                 countWords(*j);
-                // Picking runs beside the queue, so the next job can start transcribing.
-                j->step = agent.empty() ? "clips" : "pick";
-                j->status = "waiting";
-                finishStep(*j, "");
-                if (!agent.empty()) startPick(*j, agent);
+                if (diarize) { j->step = "diarize"; j->status = "queued"; finishStep(*j, ""); return; }
+                toPicking(*j);
+            });
+        } else if (b.step == "diarize") {
+            const int mins = std::max(1, (int)std::lround(b.duration / 3600.0 * 7));
+            b.activity = "Telling the speakers apart (about " + std::to_string(mins) + " min)";
+            // Who speaks, then the video's size and one frame of it, for "who sits where".
+            const std::string w = work(b, "").toStdString();
+            const QString reelcut = containerRunner() ? QString("reelcut") : shq(runnerBin);
+            QString script = QString("%1 diarize %2%3 || exit 1; "
+                                     "v=$(ls %2/video.* 2>/dev/null | grep -v '\\.part$' | head -n 1); [ -n \"$v\" ] || exit 0; "
+                                     "ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x \"$v\" > %2/.size; "
+                                     "ffmpeg -loglevel error -y -ss %4 -i \"$v\" -frames:v 1 -vf scale=640:-2 %2/frame.jpg; exit 0")
+                                 .arg(reelcut, shq(w),
+                                      b.speakersWanted > 0 ? QString(" --speakers %1").arg(b.speakersWanted) : QString(),
+                                      QString::number(b.duration > 0 ? (int)(b.duration * 0.4) : 60));
+            QStringList args;
+            std::string bin = runnerBin;
+            if (containerRunner()) args = stepArgs(b, {"-c", script}, name, "sh");
+            else { bin = "sh"; args = {"-c", script}; }
+            launch(b, bin, args, name, [this, id = b.id](bool ok, const std::string& out) {
+                Job* j = find(id); if (!j) return;
+                if (!ok) {
+                    // Not fatal: the reels are cut without names.
+                    j->spk["error"] = "Could not tell the speakers apart. " + lastLog(*j);
+                    toPicking(*j);
+                    return;
+                }
+                readSpeakers(*j, out);
+                // The transcript now says who speaks: the prompts made from the old one go.
+                std::error_code ec;
+                for (auto& e : fs::directory_iterator(j->dir, ec))
+                    if (e.path().filename().string().rfind("prompt-", 0) == 0) fs::remove(e.path(), ec);
+                if (jnum(j->spk, "found", 0) >= 2) { j->step = "speakers"; j->status = "waiting"; finishStep(*j, ""); }
+                else toPicking(*j);
             });
         } else if (b.step == "cut") {
             b.activity = "Cutting the reels";
@@ -580,6 +645,9 @@ struct ReelcutCorePrivate {
             writeFile(b.dir + "/clips.txt", b.clipsText + "\n");
             QStringList args{"cut", work(b, ""), work(b, "clips.txt"), work(b, "reels")};
             for (auto& f : fixList(b.fixes)) args << "--fix" << QString::fromStdString(f);
+            if (!b.layout.empty()) args << "--frame" << QString::fromStdString(b.layout);
+            std::string who = speakersArg(b);
+            if (!who.empty()) args << "--speakers" << QString::fromStdString(who);
             b.progressN = (int)parseClips(b.clipsText).size();
             launch(b, runnerBin, stepArgs(b, args, name, nullptr), name, [this, id = b.id](bool ok, const std::string& out) {
                 Job* j = find(id); if (!j) return;
@@ -609,6 +677,113 @@ struct ReelcutCorePrivate {
         } else {
             finishStep(b, "Nothing to run at step " + b.step + ".");
         }
+    }
+
+    // After transcribing (and telling the speakers apart): an agent picks the clips, or the person.
+    // A job that has clips already (the speakers were told apart again) keeps them.
+    void toPicking(Job& j)
+    {
+        j.activity.clear();
+        if (!j.clipsText.empty() || agent.empty()) { j.step = "clips"; j.status = "waiting"; finishStep(j, ""); return; }
+        // Picking runs beside the queue, so the next job can start transcribing.
+        j.step = "pick"; j.status = "waiting";
+        finishStep(j, "");
+        startPick(j, agent);
+    }
+
+    // diarize prints "2 speakers in 3639 s of audio, told apart in 416 s (9x real time): A 22.1 min, B 31.8 min";
+    // transcript-ts.txt now reads "[0:03:42] B: …".
+    void readSpeakers(Job& j, const std::string& out)
+    {
+        json names = j.spk.contains("names") && j.spk["names"].is_object() ? j.spk["names"] : json::object();
+        json sides = j.spk.contains("sides") && j.spk["sides"].is_object() ? j.spk["sides"] : json::object();
+        json talk = json::object();
+        int found = 0;
+        static const QRegularExpression head("(\\d+) speakers? in");
+        static const QRegularExpression each("\\b([A-Z]) (\\d+(?:\\.\\d+)?) min");
+        for (auto& line : QString::fromStdString(out).split('\n')) {
+            auto m = head.match(line);
+            if (!m.hasMatch()) continue;
+            found = m.captured(1).toInt();
+            auto it = each.globalMatch(line.mid(line.indexOf(':')));
+            while (it.hasNext()) { auto x = it.next(); talk[x.captured(1).toStdString()] = x.captured(2).toDouble() * 60; }
+        }
+        // A few lines each, spread over the recording, so the person can tell who is who.
+        std::map<std::string, std::vector<std::string>> lines;
+        static const QRegularExpression said("^\\[(\\d+:\\d\\d:\\d\\d)\\] ([A-Z]): (.*)$");
+        std::istringstream in(readFile(j.dir + "/transcript-ts.txt"));
+        std::string l;
+        while (std::getline(in, l)) {
+            auto m = said.match(QString::fromStdString(l));
+            if (!m.hasMatch()) continue;
+            QString text = m.captured(3).trimmed();
+            if (text.split(' ', Qt::SkipEmptyParts).size() < 8) continue;
+            if (text.size() > 180) text = text.left(177).trimmed() + "…";
+            lines[m.captured(2).toStdString()].push_back("[" + m.captured(1).toStdString() + "] " + text.toStdString());
+        }
+        json samples = json::object();
+        for (auto& [who, v] : lines) {
+            json a = json::array();
+            const size_t n = std::min<size_t>(3, v.size());
+            for (size_t k = 0; k < n; k++) a.push_back(v[(k * 2 + 1) * v.size() / (n * 2)]);
+            samples[who] = a;
+            if (!talk.contains(who)) talk[who] = 0;
+        }
+        if (!found) found = (int)talk.size();
+        j.spk = {{"found", found}, {"talk", talk}, {"samples", samples}, {"names", names}, {"sides", sides}};
+        QStringList wh = QString::fromStdString(trim(readFile(j.dir + "/.size"))).split('x');
+        if (wh.size() == 2) { j.vw = wh[0].toInt(); j.vh = wh[1].toInt(); }
+        // Two people in a landscape recording (a call, an interview): one above the other.
+        if (j.layout.empty() && found == 2 && j.vw > j.vh) j.layout = "stack";
+        loadFrame(j);
+    }
+
+    // cut --speakers: "A=Corey Petty@left,B=Václav@right", the letters with a name or a side.
+    static std::string speakersArg(const Job& j)
+    {
+        if (jnum(j.spk, "found", 0) < 2) return "";
+        json names = j.spk.contains("names") ? j.spk["names"] : json::object();
+        json sides = j.spk.contains("sides") ? j.spk["sides"] : json::object();
+        std::string out;
+        for (char c = 'A'; c <= 'Z'; c++) {
+            const char k[2] = {c, 0};
+            std::string n = cleanName(jstr(names, k, "")), s = jstr(sides, k, "");
+            if (s != "left" && s != "right") s.clear();
+            if (n.empty() && s.empty()) continue;
+            if (!out.empty()) out += ",";
+            out += std::string(k) + "=" + n + (s.empty() ? "" : "@" + s);
+        }
+        return out;
+    }
+
+    // For the agent: who A and B are.
+    static std::string speakerNote(const Job& j)
+    {
+        if (jnum(j.spk, "found", 0) < 2) return "";
+        json names = j.spk.contains("names") ? j.spk["names"] : json::object();
+        std::string who;
+        for (char c = 'A'; c <= 'Z'; c++) {
+            const char k[2] = {c, 0};
+            std::string n = cleanName(jstr(names, k, ""));
+            if (n.empty()) continue;
+            who += (who.empty() ? "" : ", ") + std::string(k) + " is " + n;
+        }
+        if (who.empty()) return "";
+        return "Who speaks: the letters in the transcript are the speakers; " + who +
+               ". Write their names in the speaker column.\n\n";
+    }
+
+    void loadFrame(Job& b)
+    {
+        b.frame.clear();
+        std::error_code ec;
+        const std::string src = b.dir + "/frame.jpg";
+        if (viewDir.empty() || !fs::exists(src, ec)) return;
+        std::string cache = viewDir + "/cache/" + b.id;
+        fs::create_directories(cache, ec);
+        std::string dst = cache + "/frame.jpg";
+        fs::copy_file(src, dst, fs::copy_options::overwrite_existing, ec);
+        if (!ec) b.frame = dst;
     }
 
     void pageThenDone(Job& b, const QString& title)
@@ -782,7 +957,7 @@ struct ReelcutCorePrivate {
             }
             std::string ask = "From the Reelcut app on Basecamp (" + QSysInfo::machineHostName().toStdString() +
                 "). Pick the clips below and reply with ONLY the clip lines in the format given, "
-                "one per line, nothing else. Your reply is parsed by a program.\n\n" + prompt;
+                "one per line, nothing else. Your reply is parsed by a program.\n\n" + speakerNote(*j) + prompt;
             if (!local && ask.size() > kMaxPrompt) {
                 pickFailed(*j, "The transcript is too long to send to an agent in one message (" +
                            std::to_string(ask.size() / 1024) + " KiB). Copy the prompt into an AI chat instead.");
@@ -1127,7 +1302,7 @@ std::string ReelcutCoreImpl::setViewDir(const std::string& dir)
     std::string p = localPathFrom(dir);
     while (p.size() > 1 && p.back() == '/') p.pop_back();
     d->viewDir = p;
-    for (auto& b : d->jobs) d->loadReels(b);
+    for (auto& b : d->jobs) { d->loadReels(b); d->loadFrame(b); }
     return d->state().dump();
 }
 
@@ -1138,6 +1313,7 @@ std::string ReelcutCoreImpl::setSettings(const std::string& settingsJson)
     if (s.contains("agent") && s["agent"].is_string()) d->agent = trim(s["agent"].get<std::string>());
     if (s.contains("count")) d->count = (int)std::clamp<int64_t>(jnum(s, "count", d->count), 1, 20);
     if (s.contains("autoCut")) d->autoCut = jbool(s, "autoCut", d->autoCut);
+    if (s.contains("diarize")) d->diarize = jbool(s, "diarize", d->diarize);
     if (s.contains("runner") && s["runner"].is_string()) {
         std::string r = s["runner"].get<std::string>();
         if (r == "auto" || r == "podman" || r == "docker" || r == "local") { d->runnerPref = r; d->detectRunner(); }
@@ -1238,7 +1414,7 @@ std::string ReelcutCoreImpl::getPrompt(const std::string& jobId)
         text = p.readAllStandardOutput().toStdString();
         writeFile(file, text);
     }
-    return json({{"ok", true}, {"text", text}}).dump();
+    return json({{"ok", true}, {"text", ReelcutCorePrivate::speakerNote(*b) + text}}).dump();
 }
 
 std::string ReelcutCoreImpl::setClips(const std::string& jobId, const std::string& clipsText)
@@ -1298,7 +1474,7 @@ std::string ReelcutCoreImpl::retryJob(const std::string& jobId)
     if (d->runner.empty() || !d->runnerError.empty()) d->detectRunner();
     b->error.clear();
     if (b->step == "pick" || b->step == "clips") { d->startPick(*b, b->agent.empty() ? d->agent : b->agent); return d->state().dump(); }
-    if (b->step == "done") return d->state().dump();
+    if (b->step == "done" || b->step == "speakers") return d->state().dump();
     b->status = "queued";
     d->save();
     d->schedule();
@@ -1365,4 +1541,49 @@ std::string ReelcutCoreImpl::openPath(const std::string& path)
     if (ps.rfind(rs + "/", 0) != 0 && ps != rs) return json({{"ok", false}, {"error", "Only files in the Reelcut folder open."}}).dump();
     if (!fs::exists(p, ec)) return json({{"ok", false}, {"error", "It is not there any more."}}).dump();
     return spawnOpen(ps);
+}
+
+std::string ReelcutCoreImpl::diarizeJob(const std::string& jobId, int64_t speakers)
+{
+    Job* b = d->find(jobId);
+    if (!b) return json({{"ok", false}, {"error", "No such job."}}).dump();
+    if (b->status == "running" || b->status == "queued") return json({{"ok", false}, {"error", "Wait for the current step to finish."}}).dump();
+    std::error_code ec;
+    if (!fs::exists(b->dir + "/words.json", ec)) return json({{"ok", false}, {"error", "Transcribe it first."}}).dump();
+    if (d->runner.empty()) return json({{"ok", false}, {"error", d->runnerError}}).dump();
+    b->speakersWanted = (int)std::clamp<int64_t>(speakers, 0, 12);
+    b->spk.erase("error");
+    b->step = "diarize"; b->status = "queued"; b->error.clear();
+    d->save();
+    d->schedule();
+    d->changed();
+    return d->state().dump();
+}
+
+std::string ReelcutCoreImpl::setSpeakers(const std::string& jobId, const std::string& speakersJson, bool proceed)
+{
+    Job* b = d->find(jobId);
+    if (!b) return json({{"ok", false}, {"error", "No such job."}}).dump();
+    json s = json::parse(speakersJson, nullptr, false);
+    if (!s.is_object()) return json({{"ok", false}, {"error", "Bad speakers."}}).dump();
+    if (s.contains("names") && s["names"].is_object()) {
+        json names = json::object();
+        for (auto& [k, v] : s["names"].items())
+            if (k.size() == 1 && k[0] >= 'A' && k[0] <= 'Z' && v.is_string()) names[k] = cleanName(v.get<std::string>());
+        b->spk["names"] = names;
+    }
+    if (s.contains("sides") && s["sides"].is_object()) {
+        json sides = json::object();
+        for (auto& [k, v] : s["sides"].items())
+            if (k.size() == 1 && k[0] >= 'A' && k[0] <= 'Z' && v.is_string() && (v == "left" || v == "right")) sides[k] = v;
+        b->spk["sides"] = sides;
+    }
+    if (s.contains("layout") && s["layout"].is_string()) {
+        std::string l = s["layout"].get<std::string>();
+        if (l == "" || l == "fit" || l == "stack" || l == "speaker" || l == "crop") b->layout = l;
+    }
+    if (proceed && b->step == "speakers" && b->status == "waiting") d->toPicking(*b);
+    d->save();
+    d->changed();
+    return d->state().dump();
 }

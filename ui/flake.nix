@@ -6,7 +6,7 @@
     logos-module-builder.url = "github:logos-co/logos-module-builder/0.3.1";
     # A GitHub ref, not path:../core: a relative path lock breaks a clean clone on some Nix versions.
     # The view only needs the core's interface (LIDL), so this pins the commit that defines it.
-    reelcut_core.url = "github:vpavlin/reelcut-basecamp/edc0cb9ea8227ce35d892450e6ed44e1247fe5ea?dir=core";
+    reelcut_core.url = "github:vpavlin/reelcut-basecamp/883e266eb40eb4b603b838758fc97b7ae2c9d24b?dir=core";
     reelcut_core.inputs.logos-module-builder.follows = "logos-module-builder";
   };
 

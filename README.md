@@ -20,11 +20,12 @@ Reelcut on [apps.vpavlin.xyz](https://apps.vpavlin.xyz)) and install **Reelcut**
   more cores, after it on a smaller one). Transcribing starts as soon as the audio is down, while
   the video still downloads. Reelcut shows how long
   each one talks, a few of their lines and a frame of the video; you name them once and say who
-  sits left and who right. The reels then show each name as that person starts to speak, captions
+  sits left, in the middle or right. The reels then show each name as that person starts to speak, captions
   come in each speaker's colour, and the agent is told who is who. Wrong count? Count again with
   the right number. Off in ⚙ for a single speaker.
 - **Layout:** two people in a landscape recording are cut one above the other, each cropped to
-  their own picture (the listener slightly dimmed). Per job, choose the whole picture, follow
+  their own picture (the listener slightly dimmed); with three or more on screen, the two who talk
+  most in each clip. Per job, choose the whole picture, follow
   whoever speaks, or a crop of the middle instead.
 - **Picking the moments:**
   - **An agent on this computer, automatic:** with [shrooms-agent](https://github.com/vpavlin/shrooms)
@@ -44,6 +45,9 @@ Reelcut on [apps.vpavlin.xyz](https://apps.vpavlin.xyz)) and install **Reelcut**
 - **Edges and cards:** a little air before the first word and after the last, and a fade in and
   out ("Breathing room" in ⚙: 1.5 s each side, 0.8 s fades). An opening and a closing card per
   job (a λ, a QR code, a URL), from a small library of the last images used.
+- **Captions:** in ⚙, where they sit (where the layout puts them, near the bottom, lower third,
+  middle, upper third, near the top, or an exact height) and their colours as `#RRGGBB`: the words
+  still to come, the word being said and the words already said. Cut again to redo a job's reels.
 - **Or a file:** "use a video file…" takes a video from disk instead of an address.
 - **Edit the clips:** the clip list (`N | START H:MM:SS | END H:MM:SS | speaker | hook | until LASTWORD`)
   can be edited by hand, with the transcript a click away.

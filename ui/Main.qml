@@ -36,6 +36,7 @@ Item {
     readonly property color cWord: "#ffe14d"
     // Each speaker's caption colour in the reels (reelcut's SPEAKER_COLOURS): A, B, C, …
     readonly property var speakerColours: ["#ffffff", "#8fd3ff", "#ffb86c", "#b9f18c", "#ffa0e0"]
+    readonly property var sideValues: ["", "left", "middle", "right"]
     function speakerColour(letter) { return root.speakerColours[(String(letter).charCodeAt(0) - 65) % root.speakerColours.length] }
     readonly property int sp: 8
 
@@ -726,6 +727,7 @@ Item {
                                         cache: false
                                     }
                                     Text { anchors.left: parent.left; anchors.bottom: parent.bottom; anchors.margins: 6; text: "left"; color: "#fff"; font.pixelSize: 11; style: Text.Outline; styleColor: "#000"; textFormat: Text.PlainText }
+                                    Text { anchors.horizontalCenter: parent.horizontalCenter; anchors.bottom: parent.bottom; anchors.margins: 6; visible: root.spkLetters.length > 3; text: "middle"; color: "#fff"; font.pixelSize: 11; style: Text.Outline; styleColor: "#000"; textFormat: Text.PlainText }
                                     Text { anchors.right: parent.right; anchors.bottom: parent.bottom; anchors.margins: 6; text: "right"; color: "#fff"; font.pixelSize: 11; style: Text.Outline; styleColor: "#000"; textFormat: Text.PlainText }
                                 }
                                 ColumnLayout {
@@ -742,13 +744,13 @@ Item {
                                             readonly property string letter: modelData
                                             readonly property var spk: root.job && root.job.speakers ? root.job.speakers : ({})
                                             readonly property string nameText: nameField.text.trim()
-                                            readonly property string side: ["", "left", "right"][sideBox.currentIndex] || ""
+                                            readonly property string side: root.sideValues[sideBox.currentIndex] || ""
                                             // What is stored: put in the fields when it changes, not on every poll.
                                             readonly property string seedName: spk.names && spk.names[letter] ? spk.names[letter] : ""
                                             readonly property string seedSide: spk.sides && spk.sides[letter] ? spk.sides[letter] : ""
                                             onSeedNameChanged: nameField.text = seedName
-                                            onSeedSideChanged: sideBox.currentIndex = Math.max(0, ["", "left", "right"].indexOf(seedSide))
-                                            Component.onCompleted: { nameField.text = seedName; sideBox.currentIndex = Math.max(0, ["", "left", "right"].indexOf(seedSide)) }
+                                            onSeedSideChanged: sideBox.currentIndex = Math.max(0, root.sideValues.indexOf(seedSide))
+                                            Component.onCompleted: { nameField.text = seedName; sideBox.currentIndex = Math.max(0, root.sideValues.indexOf(seedSide)) }
                                             Layout.fillWidth: true
                                             spacing: 6
                                             RowLayout {
@@ -775,12 +777,12 @@ Item {
                                                 ComboBox {
                                                     id: sideBox
                                                     Layout.preferredWidth: 150
-                                                    model: ["Sits: not sure", "On the left", "On the right"]
+                                                    model: ["Sits: not sure", "On the left", "In the middle", "On the right"]
                                                     // Two people: one side says the other.
                                                     onActivated: {
-                                                        if (spkRep.count !== 2 || currentIndex === 0) return
+                                                        if (spkRep.count !== 2 || (currentIndex !== 1 && currentIndex !== 3)) return
                                                         var other = spkRep.itemAt(1 - spkRow.index)
-                                                        if (other) other.setSide(currentIndex === 1 ? 2 : 1)
+                                                        if (other) other.setSide(currentIndex === 1 ? 3 : 1)
                                                     }
                                                 }
                                             }
@@ -1290,6 +1292,13 @@ Item {
             autoCountBox.value = s.autoCount || 5
             setEdges(s.lead === undefined ? 0.25 : s.lead, s.tail === undefined ? 0.4 : s.tail, s.fade === undefined ? 0.3 : s.fade)
             cardField.text = String(s.card || 2)
+            var m = s.captionMargin === undefined ? -1 : s.captionMargin
+            var at = capPlace.margins.indexOf(m)
+            capPlace.currentIndex = at >= 0 ? at : capPlace.margins.length
+            capExact.value = m >= 0 ? m : 470
+            colourRow.field.text = s.colour || ""
+            sayingRow.field.text = s.sayingColour || ""
+            saidRow.field.text = s.saidColour || ""
             var vals = setAgent.opts.map(function (o) { return o.value })
             var want = s.agent === undefined ? "auto" : s.agent
             setAgent.currentIndex = Math.max(0, vals.indexOf(want))
@@ -1298,6 +1307,8 @@ Item {
             root.callVia(root.coreName, "listAgents", [], function (raw) { var o = root.parse(raw); if (o && o.jobs) root.apply(o) })
         }
         function setEdges(l, t, f) { leadField.text = String(l); tailField.text = String(t); fadeField.text = String(f) }
+        // "#ffaa00", "ffaa00" -> "#FFAA00"; anything else -> "" (the default).
+        function hex(t) { var c = String(t).trim().replace(/^#/, ""); return /^[0-9A-Fa-f]{6}$/.test(c) ? "#" + c.toUpperCase() : "" }
         function num(field, def) { var v = parseFloat(String(field.text).replace(",", ".")); return isNaN(v) ? def : v }
         function save() {
             var agent = setAgent.currentIndex >= 0 ? setAgent.opts[setAgent.currentIndex].value : ""
@@ -1305,6 +1316,7 @@ Item {
                 agent: agent, candidates: countBox.value, min: minBox.value, max: Math.max(maxBox.value, minBox.value + 5),
                 autoCut: autoCutBox.checked, autoCount: autoCountBox.value, diarize: diarizeBox.checked,
                 lead: num(leadField, 0.25), tail: num(tailField, 0.4), fade: num(fadeField, 0.3), card: num(cardField, 2),
+                captionMargin: capPlace.margin, colour: hex(colourRow.field.text), sayingColour: hex(sayingRow.field.text), saidColour: hex(saidRow.field.text),
                 runner: ["auto", "podman", "docker", "local"][runnerBox.currentIndex] })], "Saved")
             close()
         }
@@ -1318,6 +1330,19 @@ Item {
         component Check: CheckBox {
             id: cb
             contentItem: Text { text: cb.text; color: root.cText; font.pixelSize: 13; leftPadding: cb.indicator.width + 6; verticalAlignment: Text.AlignVCenter; wrapMode: Text.WordWrap; textFormat: Text.PlainText }
+        }
+        component ColourRow: RowLayout {
+            id: cr
+            property alias field: crField
+            property string label
+            property string hint
+            property color fallback
+            readonly property color shown: settings.hex(crField.text) || fallback
+            Layout.fillWidth: true
+            spacing: 8
+            Label2 { text: cr.label; Layout.fillWidth: true }
+            Rectangle { width: 22; height: 22; radius: 4; color: cr.shown; border.width: 1; border.color: root.cLine }
+            Field { id: crField; Layout.preferredWidth: 150; Layout.preferredHeight: 32; placeholderText: cr.hint; maximumLength: 7 }
         }
         contentItem: Flickable {
             clip: true
@@ -1412,6 +1437,56 @@ Item {
                     Small { id: cardField }
                     Label2 { text: "s each" }
                     Item { Layout.fillWidth: true }
+                }
+
+                Section { text: "CAPTIONS"; Layout.topMargin: 10 }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 8
+                    Label2 { text: "Captions sit"; Layout.fillWidth: true }
+                    ComboBox {
+                        id: capPlace
+                        // px from the bottom of the 1920-high reel; the last entry is "exactly".
+                        readonly property var margins: [-1, 250, 470, 860, 1250, 1550]
+                        readonly property int margin: currentIndex < margins.length ? margins[currentIndex] : capExact.value
+                        Layout.preferredWidth: 260
+                        model: ["Where the layout puts them", "Near the bottom", "Lower third", "In the middle", "Upper third", "Near the top", "Exactly…"]
+                    }
+                }
+                RowLayout {
+                    visible: capPlace.currentIndex === capPlace.margins.length
+                    Layout.fillWidth: true
+                    spacing: 8
+                    Item { Layout.fillWidth: true }
+                    SpinBox { id: capExact; from: 0; to: 1800; stepSize: 10; editable: true }
+                    Label2 { text: "px up from the bottom (the reel is 1920 high)" }
+                }
+                ColourRow { id: colourRow; label: "Words still to come"; hint: "speaker's colour"; fallback: "#FFFFFF" }
+                ColourRow { id: sayingRow; label: "The word being said"; hint: "#FFE500"; fallback: "#FFE500" }
+                ColourRow { id: saidRow; label: "Words already said"; hint: "as those to come"; fallback: colourRow.shown }
+                // What it looks like, on a dark picture.
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 52
+                    radius: 8
+                    color: "#262a30"
+                    Row {
+                        anchors.centerIn: parent
+                        spacing: 12
+                        Repeater {
+                            model: [{ t: "ALREADY", c: saidRow.shown }, { t: "SAYING", c: sayingRow.shown }, { t: "TO COME", c: colourRow.shown }]
+                            delegate: Text {
+                                required property var modelData
+                                text: modelData.t; color: modelData.c
+                                font.pixelSize: 20; font.bold: true; style: Text.Outline; styleColor: "#000"; textFormat: Text.PlainText
+                            }
+                        }
+                    }
+                }
+                Text {
+                    Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+                    color: root.cFaint; font.pixelSize: 12
+                    text: "Colours as #RRGGBB; leave one empty for the default. With the speakers told apart, the words to come take each speaker's colour unless you set one here. Changes apply to the next cut; tick clips and cut again to redo them."
                 }
 
                 Section { text: "RUNNING"; Layout.topMargin: 10 }

@@ -2,7 +2,7 @@
   "name": "reelcut_core",
   "display_name": "Reelcut Core",
   "icon": "icon.png",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "type": "core",
   "interface": "universal",
   "category": "tools",

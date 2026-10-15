@@ -41,7 +41,7 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-static const char* kVersion = "0.1.6";
+static const char* kVersion = "0.1.7";
 // Reelcut's own sessions on this computer's shrooms-agent: "reelcut-claude", "reelcut-pi".
 static const char* kLocalSession = "reelcut";
 static const char* kImage = "ghcr.io/vpavlin/reelcut:latest";
@@ -269,6 +269,15 @@ static std::string cleanName(const std::string& s)
     return n.toStdString();
 }
 
+// A caption colour as cut takes it: "#RRGGBB" (upper case), or "" for none or anything else.
+static std::string hexColour(const std::string& s)
+{
+    QString c = QString::fromStdString(s).trimmed();
+    if (!c.startsWith('#')) c.prepend('#');
+    static const QRegularExpression re("^#[0-9A-Fa-f]{6}$");
+    return re.match(c).hasMatch() ? c.toUpper().toStdString() : "";
+}
+
 // ── state ───────────────────────────────────────────────────────────────────
 
 struct Reel {
@@ -293,11 +302,12 @@ struct Job {
     std::string clipsText, fixes;
     std::vector<Reel> reels;
     int words = 0;
-    // Who speaks (reelcut diarize): {found, talk:{A:s}, samples:{A:[lines]}, names:{A:…}, sides:{A:left|right}, error}
+    // Who speaks (reelcut diarize): {found, talk:{A:s}, samples:{A:[lines]}, names:{A:…}, sides:{A:left|middle|right}, error}
     json spk = json::object();
     int speakersWanted = 0;     // 0: counted from the voices
     std::string layout;         // cut --frame: "" (reelcut's own choice), fit, stack, speaker, crop
     int vw = 0, vh = 0;         // the video's size, for the layout
+    bool newerTried = false;    // cut met an image older than its flags: pulled once, not again
     // Before picking, the steps overlap: what is done so far.
     bool fetched = false, transcribed = false, probed = false;
     std::string diar;           // who speaks: "" (not decided) | wanted | running | after (transcribe) | done | failed | off
@@ -325,6 +335,9 @@ struct ReelcutCorePrivate {
     int minLen = 20, maxLen = 55;   // seconds per clip, for the prompt
     int autoCount = 5;          // ticked (and cut, with autoCut) after the agent answers
     double lead = 0.25, tail = 0.4, fade = 0.3, card = 2;   // cut's edges and cards
+    int captionMargin = -1;     // captions, px from the bottom of 1920; -1: where the layout puts them
+    std::string colour, sayingColour, saidColour;   // the captions' words to come, being said, said: "#RRGGBB" or ""
+    bool forcePull = false;     // look for a newer image before the next cut
     std::string brief, intro, outro;    // the last used, for a new job
     std::string runnerPref = "auto";
     bool autoCut = true;
@@ -424,7 +437,8 @@ struct ReelcutCorePrivate {
     {
         return {{"agent", agent}, {"candidates", count}, {"runner", runnerPref}, {"autoCut", autoCut}, {"diarize", diarize},
                 {"autoCount", autoCount}, {"min", minLen}, {"max", maxLen}, {"lead", lead}, {"tail", tail}, {"fade", fade},
-                {"card", card}, {"brief", brief}, {"intro", intro}, {"outro", outro}};
+                {"card", card}, {"brief", brief}, {"intro", intro}, {"outro", outro}, {"captionMargin", captionMargin},
+                {"colour", colour}, {"sayingColour", sayingColour}, {"saidColour", saidColour}};
     }
     static double jdbl(const json& o, const char* k, double def)
     {
@@ -442,6 +456,9 @@ struct ReelcutCorePrivate {
         tail = std::clamp(jdbl(s, "tail", tail), 0.0, 5.0);
         fade = std::clamp(jdbl(s, "fade", fade), 0.0, 3.0);
         card = std::clamp(jdbl(s, "card", card), 0.5, 10.0);
+        captionMargin = (int)std::clamp<int64_t>(jnum(s, "captionMargin", captionMargin), -1, 1800);
+        for (auto [k, v] : {std::pair<const char*, std::string*>{"colour", &colour}, {"sayingColour", &sayingColour}, {"saidColour", &saidColour}})
+            if (s.contains(k) && s[k].is_string()) *v = hexColour(s[k].get<std::string>());
         if (s.contains("brief") && s["brief"].is_string()) brief = s["brief"].get<std::string>().substr(0, 4000);
         if (s.contains("intro") && s["intro"].is_string()) intro = s["intro"].get<std::string>();
         if (s.contains("outro") && s["outro"].is_string()) outro = s["outro"].get<std::string>();
@@ -778,6 +795,7 @@ struct ReelcutCorePrivate {
             Job* j = find(id);
             // Tried either way, so an offline machine doesn't try before every job.
             lastPull = QDateTime::currentMSecsSinceEpoch();
+            forcePull = false;
             if (!ok && !had) { if (j) finishStep(*j, "Could not download the reelcut image. " + lastLog(*j)); return; }
             if (!ok && j) logLine(*j, "Could not look for a newer image; using the one already here.");
             imagePresent = true;
@@ -893,7 +911,7 @@ struct ReelcutCorePrivate {
     void runStep(Job& b)
     {
         if (runner.empty()) { finishStep(b, runnerError.empty() ? "No way to run reelcut here." : runnerError); return; }
-        if (containerRunner() && !imagePresent) { if (!busy("pull")) pullImage(b); return; }
+        if (containerRunner() && (!imagePresent || forcePull)) { if (!busy("pull")) pullImage(b); return; }
         const std::string name = "reelcut-" + b.id;
         if (b.step == "cut") {
             b.activity = "Cutting the reels";
@@ -921,9 +939,23 @@ struct ReelcutCorePrivate {
                 if (!ec) args << flag << work(b, dst);
             }
             if (!b.intro.empty() || !b.outro.empty()) args << "--card" << QString::number(card);
+            // The captions: only what was changed, so an older image still takes the rest.
+            if (captionMargin >= 0) args << "--caption-margin" << QString::number(captionMargin);
+            if (!colour.empty()) args << "--colour" << QString::fromStdString(colour);
+            if (!sayingColour.empty()) args << "--saying-colour" << QString::fromStdString(sayingColour);
+            if (!saidColour.empty()) args << "--said-colour" << QString::fromStdString(saidColour);
             b.progressN = b.chosen.empty() ? (int)parseClips(b.clipsText).size() : (int)b.chosen.size();
             launch(b, "heavy", runnerBin, stepArgs(b, args, name, nullptr), name, [this, id = b.id](bool ok, const std::string& out) {
                 Job* j = find(id); if (!j) return;
+                if (!ok && !j->newerTried && containerRunner() && logHas(*j, "unrecognized arguments")) {
+                    // An image from before these settings: a newer one, then the cut again.
+                    j->newerTried = true;
+                    forcePull = true;
+                    logLine(*j, "This reelcut image is older than the app's settings; looking for a newer one.");
+                    j->status = "queued";
+                    finishStep(*j, "");
+                    return;
+                }
                 if (!ok) { finishStep(*j, "Cutting failed. " + lastLog(*j)); return; }
                 (void)out;
                 j->step = "thumbs"; j->status = "queued";
@@ -1019,7 +1051,7 @@ struct ReelcutCorePrivate {
         loadFrame(j);
     }
 
-    // cut --speakers: "A=Corey Petty@left,B=Václav@right", the letters with a name or a side.
+    // cut --speakers: "A=Corey Petty@left,B=Václav@right", the letters with a name or a side (left, middle, right).
     static std::string speakersArg(const Job& j)
     {
         if (jnum(j.spk, "found", 0) < 2) return "";
@@ -1029,7 +1061,7 @@ struct ReelcutCorePrivate {
         for (char c = 'A'; c <= 'Z'; c++) {
             const char k[2] = {c, 0};
             std::string n = cleanName(jstr(names, k, "")), s = jstr(sides, k, "");
-            if (s != "left" && s != "right") s.clear();
+            if (s != "left" && s != "middle" && s != "right") s.clear();
             if (n.empty() && s.empty()) continue;
             if (!out.empty()) out += ",";
             out += std::string(k) + "=" + n + (s.empty() ? "" : "@" + s);
@@ -1502,6 +1534,11 @@ struct ReelcutCorePrivate {
     }
     // Why a step failed, for the person: yt-dlp's "ERROR: …" or reelcut's own "reelcut: …" line,
     // not the Python traceback that follows it; else the last line.
+    static bool logHas(const Job& b, const char* text)
+    {
+        for (auto& l : b.log) if (l.find(text) != std::string::npos) return true;
+        return false;
+    }
     static std::string lastLog(const Job& b)
     {
         for (auto it = b.log.rbegin(); it != b.log.rend(); ++it)
@@ -1886,7 +1923,7 @@ std::string ReelcutCoreImpl::setSpeakers(const std::string& jobId, const std::st
     if (s.contains("sides") && s["sides"].is_object()) {
         json sides = json::object();
         for (auto& [k, v] : s["sides"].items())
-            if (k.size() == 1 && k[0] >= 'A' && k[0] <= 'Z' && v.is_string() && (v == "left" || v == "right")) sides[k] = v;
+            if (k.size() == 1 && k[0] >= 'A' && k[0] <= 'Z' && v.is_string() && (v == "left" || v == "middle" || v == "right")) sides[k] = v;
         b->spk["sides"] = sides;
     }
     if (s.contains("layout") && s["layout"].is_string()) {

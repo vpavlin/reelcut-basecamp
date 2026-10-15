@@ -69,6 +69,8 @@ public:
 
     // optionsJson: {"brief": "what I'm looking for", "chosen": [2, 5, 7] (the clips to cut), "intro": card, "outro": card}.
     // The brief and the cards become the defaults for the next job.
+    // The job's reels into the Logos Storage node chosen in Settings (again for those that failed).
+    std::string storeReels(const std::string& jobId);
     std::string setJob(const std::string& jobId, const std::string& optionsJson);
 
     // The transcript lines of one clip, to see what it holds: {"ok": true, "n": 3, "text": "[0:03:42] B: …"}.

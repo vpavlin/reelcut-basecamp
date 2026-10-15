@@ -48,6 +48,11 @@ Reelcut on [apps.vpavlin.xyz](https://apps.vpavlin.xyz)) and install **Reelcut**
 - **Captions:** in ⚙, where they sit (where the layout puts them, near the bottom, lower third,
   middle, upper third, near the top, or an exact height) and their colours as `#RRGGBB`: the words
   still to come, the word being said and the words already said. Cut again to redo a job's reels.
+- **Logos Storage:** in ⚙ Settings, "Put the reels in Logos Storage": this computer's node, or a
+  node elsewhere (its address, through [storage_gateway](https://github.com/vpavlin/logos-storage-gateway),
+  the same API). Each cut reel goes there, then a small `reels.json` (each reel's hook, length and
+  CID) whose CID shares the whole set. Each reel card shows its CID (click to copy); "Copy the set's
+  CID" and "Try Storage again" are by the reels.
 - **Or a file:** "use a video file…" takes a video from disk instead of an address.
 - **Edit the clips:** the clip list (`N | START H:MM:SS | END H:MM:SS | speaker | hook | until LASTWORD`)
   can be edited by hand, with the transcript a click away.

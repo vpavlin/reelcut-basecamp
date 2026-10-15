@@ -1,4 +1,6 @@
 #include "reelcut_core_impl.h"
+#include "logos_sdk.h"
+#include <QMetaObject>
 
 #include <QDateTime>
 #include <QDir>
@@ -41,7 +43,7 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-static const char* kVersion = "0.1.7";
+static const char* kVersion = "0.1.8";
 // Reelcut's own sessions on this computer's shrooms-agent: "reelcut-claude", "reelcut-pi".
 static const char* kLocalSession = "reelcut";
 static const char* kImage = "ghcr.io/vpavlin/reelcut:latest";
@@ -316,6 +318,11 @@ struct Job {
     std::vector<int> chosen;    // the clips to cut, by number
     std::string intro, outro;   // cards (images in the library), "" for none
     std::string frame;          // one frame of the video, copied where the view may load it
+    // Logos Storage: per place ("local", or a node's url) the CIDs of what went there: reel file name
+    // (and "reels.json", the set) -> CID. What is uploading or failed now: file name -> "uploading" |
+    // "failed: …" (not kept: an upload Basecamp closed on is simply done again).
+    json stored = json::object();
+    std::map<std::string, std::string> storing;
 };
 
 struct Running {
@@ -357,7 +364,18 @@ struct ReelcutCorePrivate {
     std::map<std::string, QPointer<QProcess>> picks;  // agent picks run beside it
     bool emitPending = false;
 
-    explicit ReelcutCorePrivate(ReelcutCoreImpl* qq) : q(qq) {}
+    // Logos Storage: where the reels go. "" (nowhere), "local" (this computer's node, storage_module),
+    // "node" (a node elsewhere at storeNode, through storage_gateway: the same API).
+    std::string storeTo, storeNode;
+    QObject* loop = nullptr;                // this thread, for callbacks that come from another
+    bool stEvents[2] = {false, false};
+    std::string gwInitedFor;                // the url storage_gateway was last told
+    struct StUpload { std::string job, file; int64_t size = 0; };
+    std::map<std::string, StUpload> stSess;     // "<n>|<session>" -> what is uploading
+    bool stPollArmed = false;
+
+    explicit ReelcutCorePrivate(ReelcutCoreImpl* qq) : q(qq), loop(new QObject()) {}
+    ~ReelcutCorePrivate() { delete loop; }
 
     std::string jobsFile() const { return rootDir() + "/jobs.json"; }
 
@@ -405,6 +423,7 @@ struct ReelcutCorePrivate {
             if (b.diar == "running") b.diar = "wanted";
             b.brief = jstr(x, "brief", "");
             b.intro = jstr(x, "intro", ""); b.outro = jstr(x, "outro", "");
+            if (x.contains("stored") && x["stored"].is_object()) b.stored = x["stored"];
             if (x.contains("chosen") && x["chosen"].is_array())
                 for (auto& n : x["chosen"]) if (n.is_number_integer()) b.chosen.push_back(n.get<int>());
             if (b.id.empty() || b.dir.empty()) continue;
@@ -426,7 +445,8 @@ struct ReelcutCorePrivate {
                            {"words", b.words}, {"speakers", b.spk}, {"speakersWanted", b.speakersWanted},
                            {"layout", b.layout}, {"vw", b.vw}, {"vh", b.vh}, {"fetched", b.fetched},
                            {"transcribed", b.transcribed}, {"probed", b.probed}, {"diar", b.diar},
-                           {"brief", b.brief}, {"chosen", b.chosen}, {"intro", b.intro}, {"outro", b.outro}});
+                           {"brief", b.brief}, {"chosen", b.chosen}, {"intro", b.intro}, {"outro", b.outro},
+                           {"stored", b.stored}});
         std::error_code ec;
         fs::create_directories(rootDir(), ec);
         json st = settingsJson();
@@ -438,7 +458,8 @@ struct ReelcutCorePrivate {
         return {{"agent", agent}, {"candidates", count}, {"runner", runnerPref}, {"autoCut", autoCut}, {"diarize", diarize},
                 {"autoCount", autoCount}, {"min", minLen}, {"max", maxLen}, {"lead", lead}, {"tail", tail}, {"fade", fade},
                 {"card", card}, {"brief", brief}, {"intro", intro}, {"outro", outro}, {"captionMargin", captionMargin},
-                {"colour", colour}, {"sayingColour", sayingColour}, {"saidColour", saidColour}};
+                {"colour", colour}, {"sayingColour", sayingColour}, {"saidColour", saidColour},
+                {"storeTo", storeTo}, {"storeNode", storeNode}};
     }
     static double jdbl(const json& o, const char* k, double def)
     {
@@ -457,6 +478,17 @@ struct ReelcutCorePrivate {
         fade = std::clamp(jdbl(s, "fade", fade), 0.0, 3.0);
         card = std::clamp(jdbl(s, "card", card), 0.5, 10.0);
         captionMargin = (int)std::clamp<int64_t>(jnum(s, "captionMargin", captionMargin), -1, 1800);
+        if (s.contains("storeTo") && s["storeTo"].is_string()) {
+            const std::string t = s["storeTo"].get<std::string>();
+            if (t == "" || t == "local" || t == "node") storeTo = t;
+        }
+        if (s.contains("storeNode") && s["storeNode"].is_string()) {
+            std::string u = s["storeNode"].get<std::string>();
+            while (!u.empty() && (u.back() == ' ' || u.back() == '/')) u.pop_back();
+            while (!u.empty() && u.front() == ' ') u.erase(0, 1);
+            if (!u.empty() && u.find("://") == std::string::npos) u = "http://" + u;
+            if (u.empty() || u.rfind("http://", 0) == 0) storeNode = u;
+        }
         for (auto [k, v] : {std::pair<const char*, std::string*>{"colour", &colour}, {"sayingColour", &sayingColour}, {"saidColour", &saidColour}})
             if (s.contains(k) && s[k].is_string()) *v = hexColour(s[k].get<std::string>());
         if (s.contains("brief") && s["brief"].is_string()) brief = s["brief"].get<std::string>().substr(0, 4000);
@@ -540,8 +572,17 @@ struct ReelcutCorePrivate {
         for (auto it = jobs.rbegin(); it != jobs.rend(); ++it) {
             auto& b = *it;
             json reels = json::array();
-            for (auto& r : b.reels)
-                reels.push_back({{"file", r.file}, {"name", r.name}, {"thumb", r.thumb}, {"seconds", r.seconds}});
+            const json here = storePlace().empty() || !b.stored.contains(storePlace()) ? json::object() : b.stored[storePlace()];
+            for (auto& r : b.reels) {
+                const std::string fname = fs::path(r.file).filename().string();
+                auto st = b.storing.find(fname);
+                reels.push_back({{"file", r.file}, {"name", r.name}, {"thumb", r.thumb}, {"seconds", r.seconds},
+                                 {"cid", jstr(here, fname.c_str(), "")},
+                                 {"storing", st != b.storing.end() ? st->second : ""}});
+            }
+            auto setSt = b.storing.find("reels.json");
+            json storage = {{"set", jstr(here, "reels.json", "")},
+                            {"setStoring", setSt != b.storing.end() ? setSt->second : ""}};
             json log = json::array();
             for (auto& l : b.log) log.push_back(l);
             std::string page = b.dir + "/reels/index.html";
@@ -556,7 +597,8 @@ struct ReelcutCorePrivate {
                           {"page", fs::exists(page, ec) ? page : ""},
                           {"speakers", b.spk}, {"speakersWanted", b.speakersWanted}, {"layout", b.layout},
                           {"width", b.vw}, {"height", b.vh}, {"frame", b.frame},
-                          {"brief", b.brief}, {"chosen", b.chosen}, {"intro", b.intro}, {"outro", b.outro}});
+                          {"brief", b.brief}, {"chosen", b.chosen}, {"intro", b.intro}, {"outro", b.outro},
+                          {"storage", storage}});
         }
         return {
             {"ok", true},
@@ -915,6 +957,9 @@ struct ReelcutCorePrivate {
         const std::string name = "reelcut-" + b.id;
         if (b.step == "cut") {
             b.activity = "Cutting the reels";
+            // New reels: what Storage holds is of the old ones.
+            b.stored = json::object();
+            b.storing.clear();
             std::error_code ec;
             fs::create_directories(b.dir + "/reels", ec);
             for (auto& e : fs::directory_iterator(b.dir + "/reels", ec))
@@ -1152,7 +1197,155 @@ struct ReelcutCorePrivate {
             Job* j = find(id); if (!j) return;
             j->step = "done"; j->status = "done";
             finishStep(*j, "");
+            if (Job* k = find(id)) storeReels(*k);
         });
+    }
+
+    // ── Logos Storage: the reels (and reels.json, the set) into a Storage node, as Settings says.
+    // This computer's node is storage_module (the host's, on Basecamp 0.3); a node elsewhere is reached
+    // through storage_gateway, which has the same API, so every call is written once.
+    template <typename F> void withStorage(int n, F&& f)
+    {
+        if (n == 0) f(q->modules().storage_module);
+        else f(q->modules().storage_gateway);
+    }
+    // Where the CIDs are kept: "local", or the node's url (another node holds other files).
+    std::string storePlace() const { return storeTo == "local" ? "local" : storeTo == "node" ? storeNode : ""; }
+    int storeNodeIndex() const { return storeTo == "local" ? 0 : 1; }
+    void onLoop(std::function<void()> fn)
+    {
+        QMetaObject::invokeMethod(loop, guarded("storage", std::move(fn)), Qt::QueuedConnection);
+    }
+    static std::string sessKey(int n, const std::string& s) { return std::to_string(n) + "|" + s; }
+    // Ready to upload: events registered once per module; the gateway told its node (and started).
+    bool storageReady(int n, std::string& err)
+    {
+        try {
+            withStorage(n, [&](auto& sm) {
+                if (stEvents[n]) return;
+                sm.onStorageUploadDone([this, n](const std::string& p) { onLoop([this, n, p] { uploadDone(n, json::parse(p, nullptr, false)); }); });
+                stEvents[n] = true;
+            });
+        } catch (const std::exception& e) { err = std::string("Logos Storage is not available: ") + e.what(); return false; }
+        if (n == 1 && gwInitedFor != storeNode) {
+            bool ok = false;
+            try { ok = q->modules().storage_gateway.init(json({{"url", storeNode}}).dump()); } catch (...) { ok = false; }
+            if (!ok) { err = "That address does not look like a Storage node's (http://host:port)."; return false; }
+            gwInitedFor = storeNode;
+            q->modules().storage_gateway.startAsyncResult([](logos::AsyncResult<bool>) {}, 20000);
+        }
+        return true;
+    }
+    // Every reel not yet in the chosen node goes there; then the set (reels.json) once all are in.
+    void storeReels(Job& b)
+    {
+        const std::string place = storePlace();
+        if (place.empty() || b.reels.empty()) return;
+        const int n = storeNodeIndex();
+        std::string err;
+        if (!storageReady(n, err)) { b.storing["reels.json"] = "failed: " + err; changed(); return; }
+        if (!b.stored.contains(place) || !b.stored[place].is_object()) b.stored[place] = json::object();
+        bool all = true;
+        for (auto& r : b.reels) {
+            const std::string fname = fs::path(r.file).filename().string();
+            if (!jstr(b.stored[place], fname.c_str(), "").empty()) continue;
+            all = false;
+            auto st = b.storing.find(fname);
+            if (st != b.storing.end() && st->second == "uploading") continue;
+            upload(b, n, r.file, fname);
+        }
+        if (all && jstr(b.stored[place], "reels.json", "").empty() && b.storing["reels.json"] != "uploading") {
+            // The set: what a person needs to fetch and show the reels, by CID.
+            json set = {{"title", b.title}, {"source", b.url}, {"made", QDateTime::currentDateTimeUtc().toString(Qt::ISODate).toStdString()},
+                        {"reels", json::array()}};
+            for (auto& r : b.reels) {
+                const std::string fname = fs::path(r.file).filename().string();
+                set["reels"].push_back({{"file", fname}, {"hook", r.name}, {"seconds", std::round(r.seconds * 10) / 10},
+                                        {"cid", jstr(b.stored[place], fname.c_str(), "")}});
+            }
+            // Named by the job: the poll below finds uploads by name.
+            const std::string path = b.dir + "/reels/reels-" + b.id + ".json";
+            writeFile(path, set.dump(2) + "\n");
+            upload(b, n, path, "reels.json");
+        }
+        save();
+        changed();
+    }
+    void upload(Job& b, int n, const std::string& path, const std::string& fname)
+    {
+        b.storing[fname] = "uploading";
+        const std::string id = b.id, name = fs::path(path).filename().string();
+        std::error_code ec;
+        const int64_t size = (int64_t)fs::file_size(path, ec);
+        withStorage(n, [&](auto& sm) { sm.uploadUrlAsyncResult(path, 65536, true, [this, n, id, fname, name, size](logos::AsyncResult<StdLogosResult> ar) {
+            const bool ok = ar.ok() && ar.value.success;
+            const std::string sess = ok && ar.value.value.is_string() ? ar.value.value.get<std::string>() : "";
+            const std::string err = !ar.ok() ? "Logos Storage did not answer (" + ar.error.code + ")."
+                                             : (ar.value.error.empty() ? "Logos Storage refused the file." : ar.value.error);
+            onLoop([this, n, id, fname, name, size, ok, sess, err] {
+                Job* j = find(id); if (!j) return;
+                if (!ok) { j->storing[fname] = "failed: " + err; changed(); return; }
+                stSess[sessKey(n, sess)] = {id, fname, size};
+                (void)name;
+                schedulePoll();
+            });
+        }, 30000); });
+    }
+    void uploadDone(int n, const json& p)
+    {
+        auto it = stSess.find(sessKey(n, jstr(p, "sessionId", "")));
+        if (it == stSess.end()) return;
+        const std::string id = it->second.job, fname = it->second.file;
+        stSess.erase(it);
+        if (!jbool(p, "success", false)) { if (Job* j = find(id)) { j->storing[fname] = "failed: " + jstr(p, "error", "unknown error"); changed(); } return; }
+        stored(id, fname, jstr(p, "cid", ""));
+    }
+    void stored(const std::string& id, const std::string& fname, const std::string& cid)
+    {
+        Job* j = find(id);
+        if (!j || cid.empty()) return;
+        const std::string place = storePlace();
+        if (place.empty()) return;
+        if (!j->stored.contains(place) || !j->stored[place].is_object()) j->stored[place] = json::object();
+        j->stored[place][fname] = cid;
+        j->storing.erase(fname);
+        storeReels(*j);     // the next ones, or the set once all reels are in
+    }
+    // Events can be lost: while uploads run, look at the node's list for the files by name.
+    void schedulePoll()
+    {
+        if (stPollArmed) return;
+        stPollArmed = true;
+        QTimer::singleShot(3000, loop, guarded("storage poll", [this] {
+            stPollArmed = false;
+            if (stSess.empty() || storePlace().empty()) return;
+            const int n = storeNodeIndex();
+            withStorage(n, [&](auto& sm) { sm.manifestsAsyncResult([this, n](logos::AsyncResult<StdLogosResult> ar) {
+                json arr = ar.ok() && ar.value.success ? ar.value.value : json();
+                if (arr.is_string()) arr = json::parse(arr.get<std::string>(), nullptr, false);
+                onLoop([this, n, arr] {
+                    // name + size -> CID: a same-named file from before (a re-cut) differs in size.
+                    std::map<std::pair<std::string, int64_t>, std::string> have;
+                    if (arr.is_array())
+                        for (auto& m : arr)
+                            if (m.is_object()) have[{jstr(m, "filename", ""), (int64_t)jnum(m, "datasetSize", -1)}] = jstr(m, "cid", "");
+                    std::vector<std::tuple<std::string, std::string, std::string>> done;   // key, job, cid
+                    for (auto& [key, u] : stSess) {
+                        if (key.rfind(std::to_string(n) + "|", 0) != 0) continue;
+                        Job* j = find(u.job);
+                        const std::string name = !j ? "" : u.file == "reels.json" ? "reels-" + j->id + ".json" : u.file;
+                        auto h = have.find({name, u.size});
+                        if (h != have.end()) done.push_back({key, u.job, h->second});
+                    }
+                    for (auto& [key, id, cid] : done) {
+                        const std::string fname = stSess[key].file;
+                        stSess.erase(key);
+                        stored(id, fname, cid);
+                    }
+                    if (!stSess.empty()) schedulePoll();
+                });
+            }, 30000); });
+        }));
     }
 
     // ── picking: an agent reads the transcript and answers with clip lines
@@ -1933,6 +2126,19 @@ std::string ReelcutCoreImpl::setSpeakers(const std::string& jobId, const std::st
     if (proceed && b->step == "speakers" && b->status == "waiting") d->toPicking(*b);
     d->save();
     d->changed();
+    return d->state().dump();
+}
+
+std::string ReelcutCoreImpl::storeReels(const std::string& jobId)
+{
+    Job* b = d->find(jobId);
+    if (!b) return json({{"ok", false}, {"error", "No such job."}}).dump();
+    if (d->storePlace().empty()) return json({{"ok", false}, {"error", "Choose a Logos Storage node in Settings first."}}).dump();
+    if (b->reels.empty()) return json({{"ok", false}, {"error", "No reels to put there yet."}}).dump();
+    // Failed ones go again.
+    for (auto it = b->storing.begin(); it != b->storing.end();)
+        it = it->second.rfind("failed", 0) == 0 ? b->storing.erase(it) : std::next(it);
+    d->storeReels(*b);
     return d->state().dump();
 }
 

@@ -37,6 +37,19 @@ Item {
     // Each speaker's caption colour in the reels (reelcut's SPEAKER_COLOURS): A, B, C, …
     readonly property var speakerColours: ["#ffffff", "#8fd3ff", "#ffb86c", "#b9f18c", "#ffa0e0"]
     readonly property var sideValues: ["", "left", "middle", "right"]
+    // Logos Storage for the open job: on in Settings, how many reels are not there yet, what failed.
+    readonly property bool storeOn: !!root.st.settings && !!root.st.settings.storeTo
+    readonly property int storeMissing: root.job && root.job.reels ? root.job.reels.filter(function (r) { return !r.cid }).length : 0
+    readonly property bool storeFailed: !!root.job && !!root.job.reels && (root.job.reels.some(function (r) { return r.storing && r.storing !== "uploading" }) || (!!root.job.storage && /^failed/.test(root.job.storage.setStoring || "")))
+    readonly property string storeStatus: {
+        if (!root.storeOn || !root.job || !root.job.reels || !root.job.reels.length) return ""
+        var up = root.job.reels.filter(function (r) { return r.storing === "uploading" }).length
+        if (up) return "Putting " + up + (up === 1 ? " reel" : " reels") + " in Logos Storage…"
+        if (root.storeFailed) return (root.job.storage && /^failed: /.test(root.job.storage.setStoring || "") ? root.job.storage.setStoring.replace(/^failed: /, "") : "Some reels didn't make it to Logos Storage.")
+        if (root.job.storage && root.job.storage.setStoring === "uploading") return "Putting the set in Logos Storage…"
+        if (root.job.storage && root.job.storage.set) return "In Logos Storage"
+        return ""
+    }
     function speakerColour(letter) { return root.speakerColours[(String(letter).charCodeAt(0) - 65) % root.speakerColours.length] }
     readonly property int sp: 8
 
@@ -254,6 +267,7 @@ Item {
         })
     }
 
+    function copyText(t) { clip.text = t; clip.selectAll(); clip.copy(); clip.deselect(); clip.text = ""; root.toast("Copied", false) }
     // The prompt for any AI chat, to the clipboard.
     function copyPrompt() {
         callVia(coreName, "getPrompt", [root.job.id], function (raw) {
@@ -635,6 +649,22 @@ Item {
                         RowLayout {
                             Layout.fillWidth: true
                             Section { text: "REELS"; Layout.fillWidth: true }
+                            Text {
+                                visible: root.storeStatus !== ""
+                                text: root.storeStatus
+                                color: root.storeFailed ? root.cBad : root.cSub; font.pixelSize: 12; textFormat: Text.PlainText
+                                Layout.maximumWidth: 360; elide: Text.ElideRight
+                            }
+                            LogosButton {
+                                visible: !!root.job && !!root.job.storage && !!root.job.storage.set
+                                text: "Copy the set's CID"
+                                onClicked: root.copyText(root.job.storage.set)
+                            }
+                            LogosButton {
+                                visible: !!root.st.settings && !!root.st.settings.storeTo && !!root.job && root.job.status === "done" && (root.storeMissing > 0 || root.storeFailed)
+                                text: root.storeFailed ? "Try Storage again" : "Put in Storage"
+                                onClicked: root.act("storeReels", [root.job.id], "Putting the reels in Logos Storage")
+                            }
                             LogosButton { visible: !!root.job && !!root.job.page; text: "Watch in the browser"; onClicked: root.act("openPath", [root.job.page]) }
                         }
                         Flow {
@@ -645,7 +675,7 @@ Item {
                                 delegate: Rectangle {
                                     required property var modelData
                                     width: 180
-                                    height: 320 + 84
+                                    height: 320 + 84 + (root.storeOn ? 22 : 0)
                                     radius: 10
                                     color: root.cSurface
                                     border.width: 1; border.color: rMouse.containsMouse ? root.cAccent : root.cLine
@@ -685,6 +715,18 @@ Item {
                                         x: 10; y: 328; width: parent.width - 20
                                         text: modelData.name; color: root.cText; font.pixelSize: 13; font.bold: true
                                         wrapMode: Text.WordWrap; maximumLineCount: 2; elide: Text.ElideRight; textFormat: Text.PlainText
+                                    }
+                                    // In Logos Storage: its CID (click to copy), or how far it got.
+                                    Text {
+                                        visible: root.storeOn
+                                        x: 10; y: parent.height - 46; width: parent.width - 20
+                                        text: modelData.cid ? "CID " + modelData.cid
+                                            : modelData.storing === "uploading" ? "Putting in Storage…"
+                                            : modelData.storing ? modelData.storing.replace(/^failed: /, "Not in Storage: ") : ""
+                                        color: modelData.storing && modelData.storing !== "uploading" ? root.cBad : cidMouse.containsMouse ? root.cAccent : root.cFaint
+                                        font.pixelSize: 11; elide: Text.ElideMiddle; textFormat: Text.PlainText
+                                        MouseArea { id: cidMouse; anchors.fill: parent; enabled: !!modelData.cid; hoverEnabled: true; cursorShape: modelData.cid ? Qt.PointingHandCursor : Qt.ArrowCursor; onClicked: root.copyText(modelData.cid) }
+                                        ToolTip.visible: cidMouse.containsMouse && !!modelData.cid; ToolTip.delay: 400; ToolTip.text: "Copy the CID"
                                     }
                                     Text {
                                         x: 10; y: parent.height - 24
@@ -1311,6 +1353,8 @@ Item {
             var at = capPlace.margins.indexOf(m)
             capPlace.currentIndex = at >= 0 ? at : capPlace.margins.length
             capExact.value = m >= 0 ? m : 470
+            storeBox.currentIndex = Math.max(0, ["", "local", "node"].indexOf(s.storeTo || ""))
+            storeNodeField.text = s.storeNode || ""
             colourRow.field.text = s.colour || ""
             sayingRow.field.text = s.sayingColour || ""
             saidRow.field.text = s.saidColour || ""
@@ -1331,6 +1375,7 @@ Item {
                 agent: agent, candidates: countBox.value, min: minBox.value, max: Math.max(maxBox.value, minBox.value + 5),
                 autoCut: autoCutBox.checked, autoCount: autoCountBox.value, diarize: diarizeBox.checked,
                 lead: num(leadField, 0.25), tail: num(tailField, 0.4), fade: num(fadeField, 0.3), card: num(cardField, 2),
+                storeTo: ["", "local", "node"][storeBox.currentIndex], storeNode: storeNodeField.text.trim(),
                 captionMargin: capPlace.margin, colour: hex(colourRow.field.text), sayingColour: hex(sayingRow.field.text), saidColour: hex(saidRow.field.text),
                 runner: ["auto", "podman", "docker", "local"][runnerBox.currentIndex] })], "Saved")
             close()
@@ -1502,6 +1547,27 @@ Item {
                     Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText
                     color: root.cFaint; font.pixelSize: 12
                     text: "Colours as #RRGGBB; leave one empty for the default. With the speakers told apart, the words to come take each speaker's colour unless you set one here. Changes apply to the next cut; tick clips and cut again to redo them."
+                }
+
+                Section { text: "LOGOS STORAGE"; Layout.topMargin: 10 }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 8
+                    Label2 { text: "Put the reels in Logos Storage"; Layout.fillWidth: true }
+                    ComboBox { id: storeBox; Layout.preferredWidth: 260; model: ["No", "This computer's node", "A node elsewhere"] }
+                }
+                Field {
+                    id: storeNodeField
+                    visible: storeBox.currentIndex === 2
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 34
+                    placeholderText: "http://[fd00::1]:8480 (the node's REST API, over your VPN or mesh)"
+                }
+                Text {
+                    Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+                    color: root.cFaint; font.pixelSize: 12
+                    text: storeBox.currentIndex === 0 ? "Off: the reels stay in the job's folder."
+                        : "Each cut reel goes to the node, and with them a small reels.json (each reel's hook, length and CID): its CID shares the whole set. Anyone with a CID can fetch it from the node while it is reachable." + (storeBox.currentIndex === 2 ? " A node on an always-on server serves them all the time; its REST API has no password, so give an address on your VPN or mesh only." : "")
                 }
 
                 Section { text: "RUNNING"; Layout.topMargin: 10 }

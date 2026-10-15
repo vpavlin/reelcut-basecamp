@@ -352,9 +352,24 @@ Item {
                     Layout.fillWidth: true
                     Text { text: "Reelcut"; color: root.cText; font.pixelSize: 20; font.bold: true; textFormat: Text.PlainText; Layout.fillWidth: true }
                     Text { text: root.st.version ? "v" + root.st.version : ""; color: root.cFaint; font.pixelSize: 11; textFormat: Text.PlainText }
-                    Text {
-                        text: "⚙"; color: gearMouse.containsMouse ? root.cAccent : root.cSub; font.pixelSize: 17; textFormat: Text.PlainText
-                        MouseArea { id: gearMouse; anchors.fill: parent; anchors.margins: -6; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: settings.openIt() }
+                    // Settings: a labelled button, not a bare gear (easy to miss: vpavlin, 2026-10-15).
+                    Rectangle {
+                        implicitWidth: gearRow.implicitWidth + 20
+                        implicitHeight: 28
+                        radius: 14
+                        color: gearMouse.containsMouse ? Qt.lighter(root.cRaised, 1.25) : root.cRaised
+                        border.width: 1
+                        border.color: gearMouse.containsMouse ? root.cAccent : root.cLine
+                        Row {
+                            id: gearRow
+                            anchors.centerIn: parent
+                            spacing: 6
+                            Text { text: "⚙"; color: root.cAccent; font.pixelSize: 14; anchors.verticalCenter: parent.verticalCenter; textFormat: Text.PlainText }
+                            Text { text: "Settings"; color: root.cText; font.pixelSize: 12; anchors.verticalCenter: parent.verticalCenter; textFormat: Text.PlainText }
+                        }
+                        MouseArea { id: gearMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: settings.openIt() }
+                        Accessible.role: Accessible.Button
+                        Accessible.name: "Settings"
                     }
                 }
                 Label2 { text: "A long video in, short vertical reels with captions out."; wrapMode: Text.WordWrap; Layout.fillWidth: true }

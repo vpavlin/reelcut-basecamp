@@ -51630,18 +51630,18 @@
       },
       "locked": {
         "dir": "core",
-        "lastModified": 1792056783,
-        "narHash": "sha256-KmCS9NmOn3xKMdd85zn/C5uh/av0coXAc9sOLO4NWrM=",
+        "lastModified": 1792301599,
+        "narHash": "sha256-aH4ggqUxVIx9SIHawtrcrbY2VnFyVvqzsX4I1tqAkZM=",
         "owner": "vpavlin",
         "repo": "reelcut-basecamp",
-        "rev": "883e266eb40eb4b603b838758fc97b7ae2c9d24b",
+        "rev": "a89e5ef9ea527daa5deac50d19fef5e18fe1cc00",
         "type": "github"
       },
       "original": {
         "dir": "core",
         "owner": "vpavlin",
         "repo": "reelcut-basecamp",
-        "rev": "883e266eb40eb4b603b838758fc97b7ae2c9d24b",
+        "rev": "a89e5ef9ea527daa5deac50d19fef5e18fe1cc00",
         "type": "github"
       }
     },

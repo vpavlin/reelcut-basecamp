@@ -43,7 +43,7 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-static const char* kVersion = "0.1.8";
+static const char* kVersion = "0.1.9";
 // Reelcut's own sessions on this computer's shrooms-agent: "reelcut-claude", "reelcut-pi".
 static const char* kLocalSession = "reelcut";
 static const char* kImage = "ghcr.io/vpavlin/reelcut:latest";
@@ -137,6 +137,14 @@ static std::string trim(std::string s)
 // LD_PRELOAD makes coreutils refuse to start, and its library and Qt paths would be handed to
 // programs built against the system's (podman, python, ffmpeg, xdg-open).
 extern "C" char** environ;
+// Where container tools live besides PATH. An app opened from the Finder on macOS gets only
+// /usr/bin:/bin:/usr/sbin:/sbin, without Homebrew, Docker Desktop, podman's installer or OrbStack.
+static QStringList extraBinDirs()
+{
+    const QString home = QDir::homePath();
+    return {home + "/.local/bin", "/usr/local/bin", "/opt/homebrew/bin", "/opt/podman/bin", "/opt/local/bin",
+            "/Applications/Docker.app/Contents/Resources/bin", home + "/.orbstack/bin", home + "/.rd/bin"};
+}
 static std::vector<std::string> cleanEnv()
 {
     static const char* drop[] = {"LD_PRELOAD=", "LD_LIBRARY_PATH=", "QT_PLUGIN_PATH=", "QML2_IMPORT_PATH=",
@@ -148,6 +156,14 @@ static std::vector<std::string> cleanEnv()
             if (std::strncmp(*v, d, std::strlen(d)) == 0) keep = false;
         if (keep) out.emplace_back(*v);
     }
+    // The extra places on PATH too: docker runs its credential helper, podman its machine, by name.
+    std::string path;
+    for (auto& v : out) if (v.rfind("PATH=", 0) == 0) path = v.substr(5);
+    if (path.empty()) path = "/usr/bin:/bin:/usr/sbin:/sbin";
+    QStringList have = QString::fromStdString(path).split(':', Qt::SkipEmptyParts);
+    for (auto& d : extraBinDirs()) if (!have.contains(d) && QFileInfo(d).isDir()) have << d;
+    out.erase(std::remove_if(out.begin(), out.end(), [](const std::string& v) { return v.rfind("PATH=", 0) == 0; }), out.end());
+    out.emplace_back("PATH=" + have.join(':').toStdString());
     return out;
 }
 static QProcessEnvironment processEnv()
@@ -174,7 +190,7 @@ static void detached(const std::string& bin, const QStringList& args)
 static std::string findExe(const char* name)
 {
     QString p = QStandardPaths::findExecutable(name);
-    if (p.isEmpty()) p = QStandardPaths::findExecutable(name, {QDir::homePath() + "/.local/bin", "/usr/local/bin"});
+    if (p.isEmpty()) p = QStandardPaths::findExecutable(name, extraBinDirs());
     return p.toStdString();
 }
 
@@ -255,6 +271,69 @@ static json clipsJson(const std::vector<Clip>& v)
     return a;
 }
 
+// The transcript lines of one clip, from START to END as the transcript stamps them.
+static std::string clipLines(const std::string& transcript, const Clip& c)
+{
+    const double a = secs(c.start), e = secs(c.end);
+    static const QRegularExpression stamp("^\\[(\\d+:\\d\\d:\\d\\d)\\] ?(.*)$");
+    std::istringstream in(transcript);
+    std::string line, text;
+    while (std::getline(in, line)) {
+        auto m = stamp.match(QString::fromStdString(line));
+        if (!m.hasMatch()) continue;
+        double t = secs(m.captured(1).toStdString());
+        if (t < a - 0.5) continue;
+        if (t > e + 0.5) break;
+        text += line + "\n";
+    }
+    return text;
+}
+
+// YouTube texts in an answer: per reel a block "=== REEL N ===", then "TITLE: …", "DESCRIPTION:" and its
+// lines, "TAGS: a, b, c". Anything before the first block (a greeting) is ignored. Clip number -> text.
+static json parseYoutube(const std::string& text)
+{
+    json out = json::object();
+    static const QRegularExpression head("^\\W*=+\\s*REEL\\s*#?\\s*(\\d+)\\s*=+\\W*$", QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression field("^\\W{0,3}(TITLE|DESCRIPTION|TAGS)\\W{0,3}:\\s*(.*)$", QRegularExpression::CaseInsensitiveOption);
+    std::istringstream in(text);
+    std::string line, cur, where;
+    json block;
+    auto flush = [&] {
+        if (cur.empty()) return;
+        std::string t = trim(jstr(block, "title", "")), d = trim(jstr(block, "description", ""));
+        if (!t.empty() || !d.empty()) {
+            json tags = json::array();
+            for (auto& x : QString::fromStdString(jstr(block, "tagsText", "")).split(',')) {
+                QString v = x.trimmed().remove('#');
+                if (!v.isEmpty()) tags.push_back(v.toStdString());
+            }
+            out[cur] = {{"title", t}, {"description", d}, {"tags", tags}};
+        }
+        block = json::object(); where.clear();
+    };
+    while (std::getline(in, line)) {
+        QString l = QString::fromStdString(line);
+        if (l.endsWith('\r')) l.chop(1);
+        auto h = head.match(l.trimmed());
+        if (h.hasMatch()) { flush(); cur = h.captured(1).toStdString(); continue; }
+        if (cur.empty()) continue;
+        auto f = field.match(l.trimmed());
+        if (f.hasMatch()) {
+            where = f.captured(1).toLower().toStdString();
+            std::string v = f.captured(2).toStdString();
+            if (where == "title") block["title"] = v;
+            else if (where == "tags") block["tagsText"] = v;
+            else block["description"] = v.empty() ? std::string() : v + "\n";
+            continue;
+        }
+        if (where == "description") block["description"] = jstr(block, "description", "") + l.toStdString() + "\n";
+        else if (where == "tags" && !l.trimmed().isEmpty()) block["tagsText"] = jstr(block, "tagsText", "") + ", " + l.toStdString();
+    }
+    flush();
+    return out;
+}
+
 // For sh -c: a path in single quotes.
 static QString shq(const std::string& s)
 {
@@ -285,6 +364,7 @@ static std::string hexColour(const std::string& s)
 struct Reel {
     std::string file, name, thumb;
     double seconds = 0;
+    int n = 0;                  // its clip's number
 };
 
 // A job's step is where it is in the pipeline; its status says whether that step runs, waits or stopped.
@@ -323,6 +403,11 @@ struct Job {
     // "failed: …" (not kept: an upload Basecamp closed on is simply done again).
     json stored = json::object();
     std::map<std::string, std::string> storing;
+    // YouTube texts for the reels (issue #4): clip number -> {title, description, tags: [...]}.
+    // Written by an agent, or pasted from any AI chat; ytState "asking" while an agent writes.
+    json yt = json::object();
+    std::string ytState, ytError, ytReply, ytWho, ytTask;
+    quint64 ytGen = 0;
 };
 
 struct Running {
@@ -424,6 +509,8 @@ struct ReelcutCorePrivate {
             b.brief = jstr(x, "brief", "");
             b.intro = jstr(x, "intro", ""); b.outro = jstr(x, "outro", "");
             if (x.contains("stored") && x["stored"].is_object()) b.stored = x["stored"];
+            if (x.contains("youtube") && x["youtube"].is_object()) b.yt = x["youtube"];
+            b.ytError = jstr(x, "youtubeError", ""); b.ytReply = jstr(x, "youtubeReply", "");
             if (x.contains("chosen") && x["chosen"].is_array())
                 for (auto& n : x["chosen"]) if (n.is_number_integer()) b.chosen.push_back(n.get<int>());
             if (b.id.empty() || b.dir.empty()) continue;
@@ -446,7 +533,8 @@ struct ReelcutCorePrivate {
                            {"layout", b.layout}, {"vw", b.vw}, {"vh", b.vh}, {"fetched", b.fetched},
                            {"transcribed", b.transcribed}, {"probed", b.probed}, {"diar", b.diar},
                            {"brief", b.brief}, {"chosen", b.chosen}, {"intro", b.intro}, {"outro", b.outro},
-                           {"stored", b.stored}});
+                           {"stored", b.stored}, {"youtube", b.yt}, {"youtubeError", b.ytError},
+                           {"youtubeReply", b.ytReply}});
         std::error_code ec;
         fs::create_directories(rootDir(), ec);
         json st = settingsJson();
@@ -576,7 +664,9 @@ struct ReelcutCorePrivate {
             for (auto& r : b.reels) {
                 const std::string fname = fs::path(r.file).filename().string();
                 auto st = b.storing.find(fname);
-                reels.push_back({{"file", r.file}, {"name", r.name}, {"thumb", r.thumb}, {"seconds", r.seconds},
+                const std::string key = std::to_string(r.n);
+                reels.push_back({{"file", r.file}, {"name", r.name}, {"thumb", r.thumb}, {"seconds", r.seconds}, {"n", r.n},
+                                 {"youtube", b.yt.contains(key) ? b.yt[key] : json(nullptr)},
                                  {"cid", jstr(here, fname.c_str(), "")},
                                  {"storing", st != b.storing.end() ? st->second : ""}});
             }
@@ -598,7 +688,9 @@ struct ReelcutCorePrivate {
                           {"speakers", b.spk}, {"speakersWanted", b.speakersWanted}, {"layout", b.layout},
                           {"width", b.vw}, {"height", b.vh}, {"frame", b.frame},
                           {"brief", b.brief}, {"chosen", b.chosen}, {"intro", b.intro}, {"outro", b.outro},
-                          {"storage", storage}});
+                          {"storage", storage},
+                          {"youtube", {{"state", b.ytState}, {"error", b.ytError}, {"who", b.ytWho},
+                                       {"reply", b.ytError.empty() ? "" : b.ytReply.substr(0, 4000)}}}});
         }
         return {
             {"ok", true},
@@ -1377,6 +1469,44 @@ struct ReelcutCorePrivate {
         if (!p.waitForFinished((timeoutS + 2) * 1000)) { p.kill(); return json(); }
         return json::parse(p.readAllStandardOutput().toStdString(), nullptr, false);
     }
+    // A caged Claude Code can mark its task done with the shrooms tool, and that tool waits for an
+    // approval (shrooms-agent allows only list_agents and task_status unasked). When that is what our
+    // own session waits for, for this task: approve it, and its summary is the answer. Else "".
+    std::string approveTaskUpdate(const std::string& session, const std::string& task)
+    {
+        std::string curl = findExe("curl");
+        if (curl.empty()) return "";
+        int64_t last = 0;
+        json ss = agentCall("GET", "/v1/sessions", "", 10);
+        if (ss.is_object() && ss.contains("sessions") && ss["sessions"].is_array())
+            for (auto& x : ss["sessions"]) if (jstr(x, "name", "") == session) last = jnum(x, "last_seq", 0);
+        // The event stream stays open: read what is there for a moment.
+        QProcess p;
+        p.setProcessEnvironment(processEnv());
+        p.start(QString::fromStdString(curl),
+                {"-s", "-N", "--max-time", "3", "--unix-socket", QString::fromStdString(agentSocket()),
+                 QString::fromStdString("http://agent/v1/sessions/" + session + "/events?since=" + std::to_string(std::max<int64_t>(0, last - 40)))});
+        if (!p.waitForFinished(6000)) p.kill();
+        std::string rid, summary, state;
+        std::istringstream in(p.readAllStandardOutput().toStdString());
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.rfind("data:", 0) != 0) continue;
+            json e = json::parse(line.substr(5), nullptr, false);
+            if (!e.is_object() || !e.contains("data") || !e["data"].is_object()) continue;
+            const json& dt = e["data"];
+            if (jstr(dt, "type", "") != "control_request" || !dt.contains("request") || !dt["request"].is_object()) continue;
+            const json& rq = dt["request"];
+            if (jstr(rq, "subtype", "") != "can_use_tool" || jstr(rq, "tool_name", "") != "mcp__shrooms__task_update") continue;
+            if (!rq.contains("input") || !rq["input"].is_object() || jstr(rq["input"], "task", "") != task) continue;
+            rid = jstr(dt, "request_id", "");
+            summary = jstr(rq["input"], "summary", "");
+            state = jstr(rq["input"], "state", "");
+        }
+        if (rid.empty() || state != "done" || trim(summary).empty()) return "";
+        agentCall("POST", "/v1/sessions/" + session + "/prompts/" + rid, json({{"allow", true}}).dump(), 10);
+        return summary;
+    }
     // Whether "auto" can ask a local agent: a shrooms-agent on its socket, with pi and cages.
     json localAgent;
     void detectLocalAgent()
@@ -1562,6 +1692,13 @@ struct ReelcutCorePrivate {
                     for (auto& x : ss["sessions"])
                         if (jstr(x, "name", "") == session && jstr(x, "state", "") == "idle") st = "completed";
             }
+            // Its answer waits in a task_update for an approval: take it (approving closes the task).
+            std::string viaUpdate;
+            if (st == "input_required" && !(viaUpdate = approveTaskUpdate(task.substr(0, task.find(':')), task)).empty()) {
+                agentCall("POST", "/a2a", json({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "AckTask"}, {"params", {{"id", task}}}}).dump(), 10);
+                finishPick(*j, label, viaUpdate, "");
+                return;
+            }
             if (st == "completed") {
                 // Close a task its worker left open, or the session never takes the next one.
                 if (taskState(t) == "working")
@@ -1662,6 +1799,186 @@ struct ReelcutCorePrivate {
         save(); changed();
     }
 
+    // ── YouTube texts (issue #4): a title, a description and tags per reel, keyword-minded
+    std::string youtubePrompt(const Job& b)
+    {
+        const std::string transcript = readFile(b.dir + "/transcript-ts.txt");
+        auto clips = parseClips(b.clipsText);
+        std::string out =
+            "Write YouTube Shorts texts for the reels below, cut from one long video. For each reel:\n"
+            "- TITLE: at most 70 characters, specific and searchable: the keywords a viewer would type, "
+            "the speaker's name when they are known, no clickbait, no ALL CAPS, at most one emoji.\n"
+            "- DESCRIPTION: 2 to 4 short paragraphs. The first line hooks and holds the main keywords "
+            "(YouTube shows only it). Then what is said, in plain words, and a line pointing to the full "
+            "video" + std::string(b.url.empty() ? "" : " (" + b.url + ")") + ". End with 2 or 3 hashtags, "
+            "#Shorts among them.\n"
+            "- TAGS: 8 to 15 comma-separated search phrases, most specific first.\n"
+            "Write in the language the reel is spoken in. Use only what the transcript says: no invented facts, "
+            "numbers or claims.\n\n"
+            "Reply with ONLY these blocks, one per reel, nothing before or after (a program reads them):\n"
+            "=== REEL N ===\nTITLE: …\nDESCRIPTION:\n…\nTAGS: …\n\n";
+        out += "THE VIDEO: " + (b.title.empty() ? std::string("(no title)") : b.title) +
+               (b.channel.empty() ? "" : " - " + b.channel) + "\n";
+        if (!trim(b.brief).empty()) out += "WHAT THE MAKER IS AFTER: " + trim(b.brief) + "\n";
+        // Who is who; the note's last sentence is for picking clips, not for these texts.
+        out += QString::fromStdString(speakerNote(b)).replace(" Write their names in the speaker column.", "").toStdString() + "\n";
+        for (auto& r : b.reels) {
+            const Clip* c = nullptr;
+            for (auto& x : clips) if (x.n == r.n) c = &x;
+            if (!c) continue;
+            out += "=== REEL " + std::to_string(r.n) + " === (" + std::to_string((int)std::lround(r.seconds)) + " s)\n";
+            out += "Hook: " + c->hook + "\n";
+            if (!trim(c->summary).empty()) out += "About: " + trim(c->summary) + "\n";
+            out += "What is said:\n" + clipLines(transcript, *c) + "\n";
+        }
+        return out;
+    }
+
+    // Ask an agent for a text and hear back once: this computer's caged agent ("auto", "local:…") or a
+    // mesh session (MACHINE/SESSION, through the CLI). done(reply, error) runs on the event loop, unless
+    // stillWanted() says the asker moved on.
+    using Reply = std::function<void(const std::string&, const std::string&)>;
+    void askAgent(const std::string& who, const std::string& title, const std::string& ask,
+                  std::function<bool()> stillWanted, std::function<void(const std::string&)> onTask, Reply done)
+    {
+        const bool local = who == "auto" || who.rfind("local:", 0) == 0;
+        if (local) {
+            detectLocalAgent();
+            const std::string harness = jbool(localAgent, "ok", false) ? localHarness(who) : "";
+            if (harness.empty()) { done("", "No agent on this computer: " + jstr(localAgent, "why", "shrooms-agent is not here")); return; }
+            std::string err = ensureLocalSession(harness);
+            if (!err.empty()) { done("", err); return; }
+            json h = agentCall("GET", "/v1/harnesses", "", 5);
+            if (h.is_object() && h.contains("cage") && !jbool(h["cage"], "ready", true)) {
+                done("", "The agent's cage is still being prepared; try again in a few minutes.");
+                return;
+            }
+            json msg = {{"messageId", "reelcut-yt-" + std::to_string(QDateTime::currentMSecsSinceEpoch())},
+                        {"role", "ROLE_USER"}, {"parts", json::array({{{"text", ask}}})},
+                        {"metadata", {{"shrooms/title", title}}}};
+            json rq = {{"jsonrpc", "2.0"}, {"id", 1}, {"method", "SendMessage"},
+                       {"params", {{"message", msg}, {"configuration", {{"blocking", false}}}}}};
+            json r = agentCall("POST", "/a2a/" + localSessionName(harness), rq.dump(), 30);
+            json t = r.is_object() && r.contains("result") && r["result"].is_object() && r["result"].contains("task") ? r["result"]["task"] : json();
+            std::string task = jstr(t, "id", "");
+            if (task.empty()) { done("", "Could not ask " + harnessLabel(harness) + "."); return; }
+            onTask(task);
+            pollAsk(task, QDateTime::currentMSecsSinceEpoch(), stillWanted, done);
+            return;
+        }
+        std::string shrooms = findExe("shrooms-agent");
+        if (shrooms.empty()) { done("", "shrooms-agent is not installed here."); return; }
+        if (ask.size() > kMaxPrompt) { done("", "Too long to send to an agent in one message: copy the prompt into an AI chat instead."); return; }
+        auto* a = new QProcess();
+        a->setProcessEnvironment(processEnv());
+        QObject::connect(a, qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
+                         guarded("ask", [this, a, who, shrooms, stillWanted, onTask, done](int code, QProcess::ExitStatus st) {
+            a->deleteLater();
+            if (!stillWanted()) return;
+            std::string out = a->readAllStandardOutput().toStdString();
+            std::string err = trim(a->readAllStandardError().toStdString());
+            if (st != QProcess::NormalExit || code != 0) { done("", err.empty() ? trim(out) : err); return; }
+            meshAsk(who, shrooms, out, stillWanted, onTask, done);
+        }));
+        a->start(QString::fromStdString(shrooms),
+                 {"a2a", "send", "--wait", "--title", QString::fromStdString(title), QString::fromStdString(who), QString::fromStdString(ask)});
+    }
+    void pollAsk(const std::string& task, qint64 since, std::function<bool()> stillWanted, Reply done)
+    {
+        QTimer::singleShot(8000, guarded("ask poll", [this, task, since, stillWanted, done] {
+            if (!stillWanted()) return;
+            json r = agentCall("POST", "/a2a", json({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "GetTask"}, {"params", {{"id", task}}}}).dump(), 15);
+            json t = r.is_object() && r.contains("result") && r["result"].is_object() && r["result"].contains("task") ? r["result"]["task"] : json();
+            std::string st = taskState(t);
+            const std::string session = task.substr(0, task.find(':'));
+            // A caged worker can't mark its task done: an idle session with an answer has answered.
+            if (st == "working" && !trim(taskText(t)).empty()) {
+                json ss = agentCall("GET", "/v1/sessions", "", 10);
+                if (ss.is_object() && ss.contains("sessions") && ss["sessions"].is_array())
+                    for (auto& x : ss["sessions"]) if (jstr(x, "name", "") == session && jstr(x, "state", "") == "idle") st = "completed";
+            }
+            std::string viaUpdate;
+            if (st == "input_required" && !(viaUpdate = approveTaskUpdate(session, task)).empty()) {
+                agentCall("POST", "/a2a", json({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "AckTask"}, {"params", {{"id", task}}}}).dump(), 10);
+                done(viaUpdate, "");
+                return;
+            }
+            if (st == "completed") {
+                if (taskState(t) == "working")
+                    agentCall("POST", "/v1/tasks/" + task, json({{"state", "done"}, {"summary", "Reelcut took the texts."}, {"session", session}}).dump(), 10);
+                agentCall("POST", "/a2a", json({{"jsonrpc", "2.0"}, {"id", 1}, {"method", "AckTask"}, {"params", {{"id", task}}}}).dump(), 10);
+                done(taskText(t), "");
+            } else if (st == "failed" || st == "canceled" || st == "rejected" || st == "input_required") {
+                done("", "its task " + st + (trim(taskText(t)).empty() ? "" : ": " + trim(taskText(t))));
+            } else if (QDateTime::currentMSecsSinceEpoch() - since > 30LL * 60 * 1000) {
+                done("", "no answer within half an hour.");
+            } else {
+                pollAsk(task, since, stillWanted, done);
+            }
+        }));
+    }
+    void meshAsk(const std::string& who, const std::string& shrooms, const std::string& out,
+                 std::function<bool()> stillWanted, std::function<void(const std::string&)> onTask, Reply done)
+    {
+        static const QRegularExpression head("^task (\\S+): ([\\w-]+)");
+        auto m = head.match(QString::fromStdString(out));
+        std::string task = m.hasMatch() ? m.captured(1).toStdString() : "";
+        std::string st = m.hasMatch() ? m.captured(2).toStdString() : "completed";
+        if (!task.empty()) onTask(task);
+        if (st == "completed" || task.empty()) {
+            if (!task.empty()) detached(shrooms, {"a2a", "ack", QString::fromStdString(task)});
+            done(out, "");
+            return;
+        }
+        if (st == "failed" || st == "canceled" || st == "rejected" || st == "input-required") { done("", who + "'s task " + st + "."); return; }
+        QTimer::singleShot(20000, guarded("ask mesh poll", [this, who, shrooms, task, stillWanted, onTask, done] {
+            if (!stillWanted()) return;
+            auto* g = new QProcess();
+            g->setProcessEnvironment(processEnv());
+            QObject::connect(g, qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
+                             guarded("ask mesh get", [this, g, who, shrooms, stillWanted, onTask, done](int code, QProcess::ExitStatus st) {
+                g->deleteLater();
+                if (!stillWanted()) return;
+                if (st != QProcess::NormalExit || code != 0) { done("", trim(g->readAllStandardError().toStdString())); return; }
+                meshAsk(who, shrooms, g->readAllStandardOutput().toStdString(), stillWanted, onTask, done);
+            }));
+            g->start(QString::fromStdString(shrooms), {"a2a", "get", QString::fromStdString(task)});
+        }));
+    }
+
+    // Texts from an answer (an agent's or a pasted one) into the job. Reels it doesn't cover keep theirs.
+    std::string takeYoutube(Job& b, const std::string& reply)
+    {
+        json got = parseYoutube(reply);
+        if (got.empty()) return "No reel blocks in the answer (=== REEL N === with TITLE, DESCRIPTION, TAGS).";
+        for (auto& [k, v] : got.items()) b.yt[k] = v;
+        return "";
+    }
+    std::string writeYoutube(Job& b, const std::string& who)
+    {
+        if (b.reels.empty()) return "Cut the reels first.";
+        if (b.ytState == "asking") return "Already asking " + b.ytWho + ".";
+        const std::string label = who == "auto" || who.rfind("local:", 0) == 0 ? "the agent on this computer" : who;
+        b.ytState = "asking"; b.ytError.clear(); b.ytReply.clear(); b.ytWho = label; b.ytTask.clear();
+        const quint64 gen = ++b.ytGen;
+        changed();
+        const std::string id = b.id;
+        std::string ask = "From the Reelcut app on Basecamp (" + QSysInfo::machineHostName().toStdString() + "). " + youtubePrompt(b);
+        askAgent(who, "YouTube texts: " + (b.title.empty() ? b.id : b.title), ask,
+            [this, id, gen] { Job* j = find(id); return j && j->ytGen == gen && j->ytState == "asking"; },
+            [this, id, gen](const std::string& task) { Job* j = find(id); if (j && j->ytGen == gen) j->ytTask = task; },
+            [this, id, gen, label](const std::string& reply, const std::string& err) {
+                Job* j = find(id);
+                if (!j || j->ytGen != gen) return;
+                j->ytState.clear(); j->ytTask.clear();
+                j->ytReply = reply;
+                j->ytError = !err.empty() ? "Asking " + label + " failed: " + err : takeYoutube(*j, reply);
+                if (!j->ytError.empty() && err.empty()) j->ytError = label + " answered, but: " + j->ytError;
+                save(); changed();
+            });
+        return "";
+    }
+
     // ── results
     void readMeta(Job& b)
     {
@@ -1700,6 +2017,7 @@ struct ReelcutCorePrivate {
             int n = dash != std::string::npos ? std::atoi(stem.substr(0, dash).c_str()) : 0;
             r.name = dash != std::string::npos ? stem.substr(dash + 1) : stem;
             std::replace(r.name.begin(), r.name.end(), '-', ' ');
+            r.n = n;
             for (auto& c : clips) if (c.n == n) { r.name = c.hook; r.seconds = c.seconds; break; }
             // The real length: cut runs on to the end of the sentence (or LASTWORD).
             double real = QString::fromStdString(trim(readFile((f.parent_path() / (stem + ".dur")).string()))).toDouble();
@@ -2171,6 +2489,45 @@ std::string ReelcutCoreImpl::setJob(const std::string& jobId, const std::string&
     return d->state().dump();
 }
 
+std::string ReelcutCoreImpl::writeYoutube(const std::string& jobId, const std::string& agent)
+{
+    Job* b = d->find(jobId);
+    if (!b) return json({{"ok", false}, {"error", "No such job."}}).dump();
+    const std::string who = agent.empty() ? d->agent : agent;
+    if (who.empty()) return json({{"ok", false}, {"error", "No agent chosen: copy the prompt into an AI chat instead."}}).dump();
+    std::string err = d->writeYoutube(*b, who);
+    if (!err.empty()) return json({{"ok", false}, {"error", err}}).dump();
+    return d->state().dump();
+}
+
+std::string ReelcutCoreImpl::youtubePrompt(const std::string& jobId)
+{
+    Job* b = d->find(jobId);
+    if (!b) return json({{"ok", false}, {"error", "No such job."}}).dump();
+    if (b->reels.empty()) return json({{"ok", false}, {"error", "Cut the reels first."}}).dump();
+    return json({{"ok", true}, {"text", d->youtubePrompt(*b)}}).dump();
+}
+
+std::string ReelcutCoreImpl::setYoutube(const std::string& jobId, const std::string& text)
+{
+    Job* b = d->find(jobId);
+    if (!b) return json({{"ok", false}, {"error", "No such job."}}).dump();
+    std::string err = d->takeYoutube(*b, text);
+    if (!err.empty()) return json({{"ok", false}, {"error", err}}).dump();
+    b->ytError.clear(); b->ytReply.clear();
+    if (b->ytState == "asking") { b->ytState.clear(); ++b->ytGen; }   // a pasted answer wins over a pending one
+    d->save(); d->changed();
+    return d->state().dump();
+}
+
+std::string ReelcutCoreImpl::stopYoutube(const std::string& jobId)
+{
+    Job* b = d->find(jobId);
+    if (!b) return json({{"ok", false}, {"error", "No such job."}}).dump();
+    if (b->ytState == "asking") { b->ytState.clear(); ++b->ytGen; d->changed(); }
+    return d->state().dump();
+}
+
 std::string ReelcutCoreImpl::clipText(const std::string& jobId, int64_t n)
 {
     Job* b = d->find(jobId);
@@ -2180,19 +2537,7 @@ std::string ReelcutCoreImpl::clipText(const std::string& jobId, int64_t n)
     for (auto& x : clips) if (x.n == n) c = &x;
     if (!c) return json({{"ok", false}, {"error", "No such clip."}}).dump();
     // The sentences from START to END, as the transcript stamps them.
-    const double a = secs(c->start), e = secs(c->end);
-    static const QRegularExpression stamp("^\\[(\\d+:\\d\\d:\\d\\d)\\] ?(.*)$");
-    std::istringstream in(readFile(b->dir + "/transcript-ts.txt"));
-    std::string line, text;
-    while (std::getline(in, line)) {
-        auto m = stamp.match(QString::fromStdString(line));
-        if (!m.hasMatch()) continue;
-        double t = secs(m.captured(1).toStdString());
-        if (t < a - 0.5) continue;
-        if (t > e + 0.5) break;
-        text += line + "\n";
-    }
-    return json({{"ok", true}, {"n", n}, {"text", trim(text)}}).dump();
+    return json({{"ok", true}, {"n", n}, {"text", trim(clipLines(readFile(b->dir + "/transcript-ts.txt"), *c))}}).dump();
 }
 
 std::string ReelcutCoreImpl::addCard(const std::string& imagePath)

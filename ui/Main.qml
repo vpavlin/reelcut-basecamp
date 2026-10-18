@@ -277,6 +277,17 @@ Item {
             toast("Copied the prompt. Paste it into an AI chat, then paste the answer here.", false)
         })
     }
+    // The YouTube texts' prompt for any AI chat, to the clipboard.
+    function copyYoutubePrompt() {
+        callVia(coreName, "youtubePrompt", [root.job.id], function (raw) {
+            var o = parse(raw)
+            if (!o || o.ok === false) { toast(o && o.error ? o.error : "Could not build the prompt.", true); return }
+            clip.text = o.text; clip.selectAll(); clip.copy(); clip.deselect(); clip.text = ""
+            toast("Copied the prompt. Paste it into an AI chat, then paste the answer here.", false)
+        })
+    }
+    readonly property bool anyYoutube: !!root.job && !!root.job.reels && root.job.reels.some(function (r) { return !!r.youtube })
+    readonly property bool ytAsking: !!root.job && !!root.job.youtube && root.job.youtube.state === "asking"
     function importUrl(u) {
         var brief = briefNew.text.trim()
         act("importFile", [String(u)], "", function (o) { if (o.jobs && o.jobs.length) { root.selectedId = o.jobs[0].id; root.setBrief(o.jobs[0].id, brief) } })
@@ -675,7 +686,7 @@ Item {
                                 delegate: Rectangle {
                                     required property var modelData
                                     width: 180
-                                    height: 320 + 84 + (root.storeOn ? 22 : 0)
+                                    height: 320 + 84 + (root.storeOn ? 22 : 0) + (root.anyYoutube ? 22 : 0)
                                     radius: 10
                                     color: root.cSurface
                                     border.width: 1; border.color: rMouse.containsMouse ? root.cAccent : root.cLine
@@ -716,6 +727,29 @@ Item {
                                         text: modelData.name; color: root.cText; font.pixelSize: 13; font.bold: true
                                         wrapMode: Text.WordWrap; maximumLineCount: 2; elide: Text.ElideRight; textFormat: Text.PlainText
                                     }
+                                    // Its YouTube texts, one click each to the clipboard.
+                                    Row {
+                                        visible: root.anyYoutube
+                                        x: 10; y: parent.height - 46 - (root.storeOn ? 22 : 0)
+                                        spacing: 10
+                                        Text { text: "YouTube:"; color: root.cFaint; font.pixelSize: 11; textFormat: Text.PlainText; visible: !!modelData.youtube }
+                                        Text { text: "not written"; color: root.cFaint; font.pixelSize: 11; textFormat: Text.PlainText; visible: !modelData.youtube }
+                                        Repeater {
+                                            model: modelData.youtube ? [
+                                                { label: "Title", text: modelData.youtube.title || "" },
+                                                { label: "Text", text: modelData.youtube.description || "" },
+                                                { label: "Tags", text: (modelData.youtube.tags || []).join(", ") }
+                                            ] : []
+                                            delegate: Text {
+                                                required property var modelData
+                                                text: modelData.label
+                                                color: ytMouse.containsMouse ? root.cAccent : root.cSub; font.pixelSize: 11; textFormat: Text.PlainText
+                                                MouseArea { id: ytMouse; anchors.fill: parent; anchors.margins: -3; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; enabled: !!parent.modelData.text; onClicked: root.copyText(parent.modelData.text) }
+                                                ToolTip.visible: ytMouse.containsMouse && !!modelData.text; ToolTip.delay: 300
+                                                ToolTip.text: "Copy: " + (modelData.text.length > 300 ? modelData.text.substring(0, 300) + "…" : modelData.text)
+                                            }
+                                        }
+                                    }
                                     // In Logos Storage: its CID (click to copy), or how far it got.
                                     Text {
                                         visible: root.storeOn
@@ -735,6 +769,90 @@ Item {
                                         MouseArea { id: vpMouse; anchors.fill: parent; anchors.margins: -4; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.act("openPath", [modelData.file]) }
                                     }
                                 }
+                            }
+                        }
+                    }
+
+                    // YouTube texts for the reels (title, description, tags each): an agent writes them, or any AI chat.
+                    Rectangle {
+                        visible: !!root.job && root.job.reels.length > 0 && root.job.status === "done"
+                        Layout.fillWidth: true
+                        implicitHeight: ytCol.implicitHeight + 32
+                        radius: 10
+                        color: root.cSurface
+                        border.width: 1; border.color: root.cLine
+                        ColumnLayout {
+                            id: ytCol
+                            anchors.fill: parent; anchors.margins: 16
+                            spacing: 10
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 10
+                                Text { text: "YouTube titles and descriptions"; color: root.cText; font.pixelSize: 15; font.bold: true; textFormat: Text.PlainText; Layout.fillWidth: true }
+                                Text {
+                                    visible: root.ytAsking
+                                    text: "Asking " + (root.job && root.job.youtube ? root.job.youtube.who : "") + "…"
+                                    color: root.cAccent; font.pixelSize: 12; textFormat: Text.PlainText
+                                }
+                                LogosButton { visible: root.ytAsking; text: "Stop"; onClicked: root.act("stopYoutube", [root.job.id]) }
+                                ComboBox {
+                                    id: ytAgentBox
+                                    readonly property var opts: root.pickOpts
+                                    visible: opts.length > 0 && !root.ytAsking
+                                    Layout.preferredWidth: 260
+                                    model: opts.map(function (o) { return o.label })
+                                    currentIndex: {
+                                        var want = root.job && root.job.agent ? root.job.agent : (root.st.settings ? root.st.settings.agent : "")
+                                        for (var i = 0; i < opts.length; i++) if (opts[i].value === want) return i
+                                        return opts.length ? 0 : -1
+                                    }
+                                }
+                                LogosButton {
+                                    visible: ytAgentBox.visible
+                                    text: root.anyYoutube ? "Write them again" : "Write them"
+                                    enabled: ytAgentBox.currentIndex >= 0
+                                    onClicked: root.act("writeYoutube", [root.job.id, ytAgentBox.opts[ytAgentBox.currentIndex].value])
+                                }
+                            }
+                            Text {
+                                Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+                                color: root.cSub; font.pixelSize: 13
+                                text: "A keyword-minded title, a description and tags for each reel, from what is said in it. "
+                                    + (root.anyYoutube ? "Copy them from each reel: Title, Text, Tags." : (ytAgentBox.visible ? "Ask an agent, or copy the prompt into any AI chat and paste its answer below." : "Copy the prompt into any AI chat, such as Claude or ChatGPT, and paste its answer below."))
+                            }
+                            Text {
+                                visible: !!root.job && !!root.job.youtube && !!root.job.youtube.error
+                                Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+                                color: root.cBad; font.pixelSize: 12
+                                text: root.job && root.job.youtube ? root.job.youtube.error : ""
+                            }
+                            RowLayout {
+                                spacing: 10
+                                LogosButton { text: "Copy the prompt"; onClicked: root.copyYoutubePrompt() }
+                                Text { text: "then paste the answer:"; color: root.cFaint; font.pixelSize: 12; textFormat: Text.PlainText }
+                            }
+                            Rectangle {
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: 90
+                                radius: 8; color: root.cBg
+                                border.width: 1; border.color: ytAnswer.activeFocus ? root.cAccent : root.cLine
+                                ScrollView {
+                                    anchors.fill: parent; anchors.margins: 6
+                                    TextArea {
+                                        id: ytAnswer
+                                        placeholderText: "Paste the answer here (=== REEL 1 === …)"
+                                        placeholderTextColor: root.cFaint
+                                        color: root.cText; font.pixelSize: 12; font.family: "monospace"
+                                        wrapMode: TextEdit.Wrap; selectByMouse: true
+                                        background: null
+                                    }
+                                }
+                            }
+                            LogosButton {
+                                Layout.alignment: Qt.AlignRight
+                                text: "Use this answer"
+                                enabled: ytAnswer.text.trim() !== ""
+                                onClicked: root.act("setYoutube", [root.job.id, ytAnswer.text], "Saved the YouTube texts", function () { ytAnswer.text = "" })
                             }
                         }
                     }

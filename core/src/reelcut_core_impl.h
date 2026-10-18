@@ -73,6 +73,20 @@ public:
     std::string storeReels(const std::string& jobId);
     std::string setJob(const std::string& jobId, const std::string& optionsJson);
 
+    // YouTube texts for the cut reels (a title, a description and tags each), written by an agent:
+    // "" = the agent from the settings, else "auto" / "local:claude" / "local:pi" / MACHINE/SESSION.
+    // The answer lands in snapshot(): jobs[].reels[].youtube, and jobs[].youtube {state, error, who}.
+    std::string writeYoutube(const std::string& jobId, const std::string& agent);
+
+    // The same request as a prompt for any AI chat: {"ok": true, "text": "…"}.
+    std::string youtubePrompt(const std::string& jobId);
+
+    // A chat's answer to youtubePrompt (blocks "=== REEL N ===" with TITLE, DESCRIPTION, TAGS) into the reels.
+    std::string setYoutube(const std::string& jobId, const std::string& text);
+
+    // Stop waiting for the agent's YouTube texts.
+    std::string stopYoutube(const std::string& jobId);
+
     // The transcript lines of one clip, to see what it holds: {"ok": true, "n": 3, "text": "[0:03:42] B: …"}.
     std::string clipText(const std::string& jobId, int64_t n);
 

@@ -17,5 +17,13 @@ logos_module(
     SOURCES
         src/reelcut_core_impl.h
         src/reelcut_core_impl.cpp
+        src/forum_post.h
+        src/forum_post.cpp
     INCLUDE_DIRS src
 )
+
+# libsodium, for the forums' signatures (forum_post.cpp): from metadata.json nix.packages.
+find_path(SODIUM_INCLUDE_DIR sodium.h REQUIRED)
+find_library(SODIUM_LIBRARY NAMES sodium libsodium REQUIRED)
+target_include_directories(${MODULE_NAME}_module_plugin PRIVATE ${SODIUM_INCLUDE_DIR})
+target_link_libraries(${MODULE_NAME}_module_plugin PRIVATE ${SODIUM_LIBRARY})

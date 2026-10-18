@@ -7,6 +7,9 @@
     # Logos Storage, for the reels: this computer's node (the host's), or a node elsewhere through
     # storage_gateway (the same API). Pinned: master once pulled in an API break.
     storage_module.url = "github:logos-co/logos-storage-module/v3.0.1";
+    # Logos Delivery, for posting the reels to Forumer / Logos Forum (both build against v0.3.0).
+    delivery_module.url = "github:logos-co/logos-delivery-module/v0.3.0";
+    delivery_module.inputs.logos-module-builder.follows = "logos-module-builder";
     storage_gateway.url = "github:vpavlin/logos-storage-gateway/585aba6d22916895856f6830822e04e981b5f51e?dir=module";
   };
 

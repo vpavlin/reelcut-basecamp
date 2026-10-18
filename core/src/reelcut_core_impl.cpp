@@ -1,5 +1,6 @@
 #include "reelcut_core_impl.h"
 #include "logos_sdk.h"
+#include "forum_post.h"
 #include <QMetaObject>
 
 #include <QDateTime>
@@ -43,7 +44,7 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-static const char* kVersion = "0.1.9";
+static const char* kVersion = "0.2.0";
 // Reelcut's own sessions on this computer's shrooms-agent: "reelcut-claude", "reelcut-pi".
 static const char* kLocalSession = "reelcut";
 static const char* kImage = "ghcr.io/vpavlin/reelcut:latest";
@@ -204,6 +205,14 @@ static double secs(std::string s)
     bool ok = false;
     double v = QString::fromStdString(s).toDouble(&ok);
     return ok ? v : -1;
+}
+
+static std::string hexBytes(const std::vector<uint8_t>& b)
+{
+    static const char* k = "0123456789abcdef";
+    std::string s;
+    for (uint8_t x : b) { s.push_back(k[x >> 4]); s.push_back(k[x & 15]); }
+    return s;
 }
 
 struct Clip {
@@ -408,6 +417,11 @@ struct Job {
     json yt = json::object();
     std::string ytState, ytError, ytReply, ytWho, ytTask;
     quint64 ytGen = 0;
+    // A forum to post the reels to (Forumer or Logos Forum): {app, forum, thread, threadTitle, auto}.
+    // forumPosted: per thread id, reel file name -> the post's id there; "started" -> threads Reelcut started.
+    json forum = json::object(), forumPosted = json::object();
+    std::string forumState, forumError;     // forumState "posting" while replies go out
+    quint64 forumGen = 0;
 };
 
 struct Running {
@@ -452,6 +466,13 @@ struct ReelcutCorePrivate {
     // Logos Storage: where the reels go. "" (nowhere), "local" (this computer's node, storage_module),
     // "node" (a node elsewhere at storeNode, through storage_gateway: the same API).
     std::string storeTo, storeNode;
+    std::string forumAlias = "Reelcut";
+    // Logos Delivery, for the forums: started (or joined, when a forum app runs it) on first use.
+    std::string dlState, dlError;           // "" | starting | ready | failed
+    std::vector<std::function<void(const std::string&)>> dlWaiters;
+    std::set<std::string> dlTopics;         // subscribed
+    reelcut::forum::Key fkey;
+    json forumThreads = json::object();     // "app|forum" -> {state, threads:[{id,title,author,ts}], error}
     QObject* loop = nullptr;                // this thread, for callbacks that come from another
     bool stEvents[2] = {false, false};
     std::string gwInitedFor;                // the url storage_gateway was last told
@@ -511,6 +532,9 @@ struct ReelcutCorePrivate {
             if (x.contains("stored") && x["stored"].is_object()) b.stored = x["stored"];
             if (x.contains("youtube") && x["youtube"].is_object()) b.yt = x["youtube"];
             b.ytError = jstr(x, "youtubeError", ""); b.ytReply = jstr(x, "youtubeReply", "");
+            if (x.contains("forum") && x["forum"].is_object()) b.forum = x["forum"];
+            if (x.contains("forumPosted") && x["forumPosted"].is_object()) b.forumPosted = x["forumPosted"];
+            b.forumError = jstr(x, "forumError", "");
             if (x.contains("chosen") && x["chosen"].is_array())
                 for (auto& n : x["chosen"]) if (n.is_number_integer()) b.chosen.push_back(n.get<int>());
             if (b.id.empty() || b.dir.empty()) continue;
@@ -534,7 +558,8 @@ struct ReelcutCorePrivate {
                            {"transcribed", b.transcribed}, {"probed", b.probed}, {"diar", b.diar},
                            {"brief", b.brief}, {"chosen", b.chosen}, {"intro", b.intro}, {"outro", b.outro},
                            {"stored", b.stored}, {"youtube", b.yt}, {"youtubeError", b.ytError},
-                           {"youtubeReply", b.ytReply}});
+                           {"youtubeReply", b.ytReply}, {"forum", b.forum}, {"forumPosted", b.forumPosted},
+                           {"forumError", b.forumError}});
         std::error_code ec;
         fs::create_directories(rootDir(), ec);
         json st = settingsJson();
@@ -547,7 +572,7 @@ struct ReelcutCorePrivate {
                 {"autoCount", autoCount}, {"min", minLen}, {"max", maxLen}, {"lead", lead}, {"tail", tail}, {"fade", fade},
                 {"card", card}, {"brief", brief}, {"intro", intro}, {"outro", outro}, {"captionMargin", captionMargin},
                 {"colour", colour}, {"sayingColour", sayingColour}, {"saidColour", saidColour},
-                {"storeTo", storeTo}, {"storeNode", storeNode}};
+                {"storeTo", storeTo}, {"storeNode", storeNode}, {"forumAlias", forumAlias}};
     }
     static double jdbl(const json& o, const char* k, double def)
     {
@@ -580,6 +605,8 @@ struct ReelcutCorePrivate {
         for (auto [k, v] : {std::pair<const char*, std::string*>{"colour", &colour}, {"sayingColour", &sayingColour}, {"saidColour", &saidColour}})
             if (s.contains(k) && s[k].is_string()) *v = hexColour(s[k].get<std::string>());
         if (s.contains("brief") && s["brief"].is_string()) brief = s["brief"].get<std::string>().substr(0, 4000);
+        // The name Reelcut posts under in the forums (with its key's fingerprint); "" = the key only.
+        if (s.contains("forumAlias") && s["forumAlias"].is_string()) forumAlias = trim(s["forumAlias"].get<std::string>()).substr(0, 32);
         if (s.contains("intro") && s["intro"].is_string()) intro = s["intro"].get<std::string>();
         if (s.contains("outro") && s["outro"].is_string()) outro = s["outro"].get<std::string>();
     }
@@ -667,6 +694,7 @@ struct ReelcutCorePrivate {
                 const std::string key = std::to_string(r.n);
                 reels.push_back({{"file", r.file}, {"name", r.name}, {"thumb", r.thumb}, {"seconds", r.seconds}, {"n", r.n},
                                  {"youtube", b.yt.contains(key) ? b.yt[key] : json(nullptr)},
+                                 {"forumPost", jstr(postedIn(b), fs::path(r.file).filename().string().c_str(), "")},
                                  {"cid", jstr(here, fname.c_str(), "")},
                                  {"storing", st != b.storing.end() ? st->second : ""}});
             }
@@ -689,6 +717,7 @@ struct ReelcutCorePrivate {
                           {"width", b.vw}, {"height", b.vh}, {"frame", b.frame},
                           {"brief", b.brief}, {"chosen", b.chosen}, {"intro", b.intro}, {"outro", b.outro},
                           {"storage", storage},
+                          {"forum", {{"target", b.forum}, {"state", b.forumState}, {"error", b.forumError}}},
                           {"youtube", {{"state", b.ytState}, {"error", b.ytError}, {"who", b.ytWho},
                                        {"reply", b.ytError.empty() ? "" : b.ytReply.substr(0, 4000)}}}});
         }
@@ -705,6 +734,9 @@ struct ReelcutCorePrivate {
             {"thumbsOk", !viewDir.empty()},
             {"cards", cardsJson()},
             {"jobs", js},
+            {"forumThreads", forumThreads},
+            {"delivery", {{"state", dlState}, {"error", dlError}}},
+            {"forumKey", fkey.ok() ? hexBytes(fkey.pk).substr(0, 16) : ""},
         };
     }
 
@@ -1402,6 +1434,10 @@ struct ReelcutCorePrivate {
         j->stored[place][fname] = cid;
         j->storing.erase(fname);
         storeReels(*j);     // the next ones, or the set once all reels are in
+        // All in: the reels can go to the forum, with their CIDs.
+        if (fname == "reels.json" && jbool(j->forum, "auto", false) && !jstr(j->forum, "thread", "").empty()
+            && j->forumState != "posting")
+            postToForum(*j);
     }
     // Events can be lost: while uploads run, look at the node's list for the files by name.
     void schedulePoll()
@@ -1979,6 +2015,300 @@ struct ReelcutCorePrivate {
         return "";
     }
 
+    // ── Forums: the reels as replies in a Forumer or Logos Forum thread (forum_post.h), over Logos Delivery
+    static bool forumerApp(const json& t) { return jstr(t, "app", "") == "forumer"; }
+    // What went to the job's current thread: reel file name -> post id.
+    static json postedIn(const Job& b)
+    {
+        const std::string th = jstr(b.forum, "thread", "");
+        return !th.empty() && b.forumPosted.contains(th) && b.forumPosted[th].is_object() ? b.forumPosted[th] : json::object();
+    }
+    static std::string forumName(const json& t)
+    {
+        std::string n = jstr(t, "forum", "");
+        return !n.empty() ? n : forumerApp(t) ? "public" : "Logos Forum";
+    }
+    static std::string forumTopic(const json& t)
+    {
+        return forumerApp(t) ? reelcut::forum::forumerTopic(forumName(t)) : reelcut::forum::logosForumTopic(forumName(t));
+    }
+    bool forumKey(std::string& err)
+    {
+        if (fkey.ok()) return true;
+        std::error_code ec;
+        fs::create_directories(rootDir(), ec);
+        fkey = reelcut::forum::loadOrCreateKey(rootDir() + "/.forum-key", &err);
+        if (!fkey.ok() && err.empty()) err = "No forum key.";
+        return fkey.ok();
+    }
+    static std::string resultText(const logos::AsyncResult<StdLogosResult>& ar)
+    {
+        if (!ar.ok()) return "no answer (" + ar.error.code + ")";
+        if (!ar.value.success) return ar.value.error.empty() ? "refused" : ar.value.error;
+        return ar.value.value.is_string() ? ar.value.value.get<std::string>() : ar.value.value.dump();
+    }
+
+    // Logos Delivery: the node is shared by every app in Basecamp. Reelcut creates it (logos.dev, the
+    // network both forums use by default) unless one runs already, then waits until it has peers.
+    void ensureDelivery(std::function<void(const std::string&)> cb)
+    {
+        if (dlState == "ready") { cb(""); return; }
+        dlWaiters.push_back(std::move(cb));
+        if (dlState == "starting") return;
+        dlState = "starting"; dlError.clear();
+        changed();
+        try {
+            const std::string cfg = json({{"mode", "Core"}, {"preset", "logos.dev"}}).dump();
+            q->modules().delivery_module.createNodeAsyncResult(cfg, [this](logos::AsyncResult<StdLogosResult> ar) {
+                const bool created = ar.ok() && ar.value.success;
+                onLoop([this, created] {
+                    if (!created) { waitConnected(QDateTime::currentMSecsSinceEpoch()); return; }   // already running
+                    q->modules().delivery_module.startAsyncResult([this](logos::AsyncResult<StdLogosResult>) {
+                        onLoop([this] { waitConnected(QDateTime::currentMSecsSinceEpoch()); });
+                    }, 60000);
+                });
+            }, 60000);
+        } catch (const std::exception& e) {
+            deliveryDone(std::string("Logos Delivery is not available: ") + e.what());
+        }
+    }
+    void waitConnected(qint64 since)
+    {
+        q->modules().delivery_module.getConnectionStatusAsyncResult([this, since](logos::AsyncResult<StdLogosResult> ar) {
+            const std::string st = resultText(ar);
+            onLoop([this, since, st] {
+                const QString s = QString::fromStdString(st);
+                if (s.contains("connected", Qt::CaseInsensitive) && !s.contains("disconnected", Qt::CaseInsensitive)) { deliveryDone(""); return; }
+                if (QDateTime::currentMSecsSinceEpoch() - since > 120000) { deliveryDone("Logos Delivery found no peers within two minutes (" + st + ")."); return; }
+                QTimer::singleShot(3000, loop, guarded("delivery wait", [this, since] { waitConnected(since); }));
+            });
+        }, 15000);
+    }
+    void deliveryDone(const std::string& err)
+    {
+        dlState = err.empty() ? "ready" : "failed";
+        dlError = err;
+        auto waiters = std::move(dlWaiters);
+        dlWaiters.clear();
+        for (auto& w : waiters) w(err);
+        if (dlState == "failed") dlState.clear();   // the next use tries again
+        changed();
+    }
+    void subscribeTopic(const std::string& topic)
+    {
+        if (topic.empty() || dlTopics.count(topic)) return;
+        dlTopics.insert(topic);
+        q->modules().delivery_module.subscribeAsyncResult(topic, [](logos::AsyncResult<StdLogosResult>) {}, 30000);
+    }
+
+    // The threads of a forum, newest first, from the network's store nodes (as the forums' own
+    // history does): for the picker. Only as far back as the store nodes keep messages.
+    void loadThreads(const std::string& app, const std::string& name)
+    {
+        const json t = {{"app", app}, {"forum", name}};
+        const std::string key = app + "|" + forumName(t);
+        if (jstr(forumThreads.value(key, json::object()), "state", "") == "loading") return;
+        forumThreads[key] = {{"state", "loading"}, {"threads", json::array()}, {"error", ""}};
+        changed();
+        ensureDelivery([this, t, key](const std::string& err) {
+            if (!err.empty()) { forumThreads[key] = {{"state", "failed"}, {"threads", json::array()}, {"error", err}}; changed(); return; }
+            auto acc = std::make_shared<std::map<std::string, reelcut::forum::Thread>>();
+            queryThreads(t, key, acc, 0, "", 0, std::make_shared<std::string>());
+        });
+    }
+    void queryThreads(const json& t, const std::string& key, std::shared_ptr<std::map<std::string, reelcut::forum::Thread>> acc,
+                      size_t peer, const std::string& cursor, int page, std::shared_ptr<std::string> lastErr)
+    {
+        const auto peers = reelcut::forum::storeNodes();
+        if (peer >= peers.size()) { threadsDone(key, *acc, *lastErr); return; }
+        const std::string ct = forumTopic(t);
+        json rq = {{"requestId", QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString()}, {"includeData", true},
+                   {"paginationForward", true}, {"paginationLimit", 100},
+                   {"pubsubTopic", reelcut::forum::pubsubTopic(ct, 3)}, {"contentTopics", json::array({ct})}};
+        if (!cursor.empty()) rq["paginationCursor"] = cursor;
+        q->modules().delivery_module.storeQueryAsyncResult(rq.dump(), peers[peer], 8000,
+            [this, t, key, acc, peer, page, lastErr](logos::AsyncResult<StdLogosResult> ar) {
+            json resp;
+            std::string err;
+            if (!ar.ok() || !ar.value.success) err = resultText(ar);
+            else {
+                resp = ar.value.value;
+                if (resp.is_string()) resp = json::parse(resp.get<std::string>(), nullptr, false);
+            }
+            onLoop([this, t, key, acc, peer, page, lastErr, resp, err] {
+                std::string next;
+                if (!err.empty() || !resp.is_object() || !resp.contains("messages") || !resp["messages"].is_array()) {
+                    *lastErr = err.empty() ? "a store node's answer was unreadable" : err;
+                } else {
+                    const bool app = forumerApp(t);
+                    const std::string name = forumName(t);
+                    for (auto& m : resp["messages"]) {
+                        if (!m.is_object() || !m.contains("message") || !m["message"].is_object()) continue;
+                        const std::string p64 = jstr(m["message"], "payload", "");
+                        const QByteArray raw = QByteArray::fromBase64(QByteArray::fromStdString(p64));
+                        const std::string payload(raw.constData(), size_t(raw.size()));
+                        auto th = app ? reelcut::forum::forumerThreadOf(payload) : reelcut::forum::logosForumThreadOf(payload, name);
+                        if (th) (*acc)[th->id] = *th;
+                    }
+                    next = jstr(resp, "paginationCursor", "");
+                }
+                if (!next.empty() && page < 10) queryThreads(t, key, acc, peer, next, page + 1, lastErr);
+                else queryThreads(t, key, acc, peer + 1, "", 0, lastErr);
+            });
+        }, 20000);
+    }
+    void threadsDone(const std::string& key, const std::map<std::string, reelcut::forum::Thread>& acc, const std::string& lastErr)
+    {
+        std::vector<reelcut::forum::Thread> v;
+        for (auto& [id, th] : acc) v.push_back(th);
+        std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.ts > b.ts; });
+        json arr = json::array();
+        for (size_t i = 0; i < v.size() && i < 200; ++i)
+            arr.push_back({{"id", v[i].id}, {"title", v[i].title}, {"author", v[i].author}, {"ts", v[i].ts}});
+        forumThreads[key] = {{"state", "ready"}, {"threads", arr},
+                             {"error", arr.empty() ? (lastErr.empty() ? "No threads found on the store nodes." : lastErr) : ""}};
+        changed();
+    }
+
+    // Signing a Forumer post mines its proof-of-work (well under a second): off the event loop anyway.
+    void signThen(std::function<reelcut::forum::Signed()> make, std::function<void(reelcut::forum::Signed)> done)
+    {
+        std::thread([this, make = std::move(make), done = std::move(done)]() mutable {
+            reelcut::forum::Signed s = make();
+            onLoop([s, done = std::move(done)] { done(s); });
+        }).detach();
+    }
+    void sendSigned(const reelcut::forum::Signed& s, std::function<void(const std::string&)> done)
+    {
+        if (!s.ok()) { done(s.error); return; }
+        subscribeTopic(s.topic);
+        q->modules().delivery_module.sendAsyncResult(s.topic, std::vector<uint8_t>(s.wire.begin(), s.wire.end()),
+            [this, done](logos::AsyncResult<StdLogosResult> ar) {
+                const bool ok = ar.ok() && ar.value.success;
+                const std::string err = ok ? "" : "Logos Delivery did not send it: " + resultText(ar);
+                onLoop([done, err] { done(err); });
+            }, 30000);
+    }
+
+    // What one reel's reply says: the YouTube texts when written, else its hook and summary; and where
+    // to get the video (Logos Storage CID; the set's CID shares them all).
+    std::string forumBody(const Job& b, const Reel& r)
+    {
+        const std::string key = std::to_string(r.n), fname = fs::path(r.file).filename().string();
+        const json yt = b.yt.contains(key) ? b.yt[key] : json::object();
+        std::string title = trim(jstr(yt, "title", "")), text = trim(jstr(yt, "description", ""));
+        if (title.empty()) title = r.name;
+        if (text.empty())
+            for (auto& c : parseClips(b.clipsText)) if (c.n == r.n) text = trim(c.summary);
+        const std::string place = storePlace();
+        const json here = place.empty() || !b.stored.contains(place) ? json::object() : b.stored[place];
+        const std::string cid = jstr(here, fname.c_str(), ""), set = jstr(here, "reels.json", "");
+        std::string body = "**" + title + "**";
+        if (!text.empty()) body += "\n\n" + text;
+        body += "\n\n";
+        if (!cid.empty()) body += "Watch it from Logos Storage: `" + cid + "`";
+        else body += "(" + std::to_string((int)std::lround(r.seconds)) + " s reel)";
+        if (!set.empty()) body += "\nAll the reels of this video: `" + set + "`";
+        if (!b.url.empty()) body += "\nFull video: " + b.url;
+        return body.substr(0, 9500);
+    }
+
+    std::string postToForum(Job& b)
+    {
+        const std::string thread = jstr(b.forum, "thread", "");
+        if (thread.empty()) return "Choose a thread first, or start one.";
+        if (b.reels.empty()) return "Cut the reels first.";
+        if (b.forumState == "posting") return "";
+        std::string err;
+        if (!forumKey(err)) return err;
+        b.forumState = "posting"; b.forumError.clear();
+        const quint64 gen = ++b.forumGen;
+        changed();
+        const std::string id = b.id;
+        ensureDelivery([this, id, gen](const std::string& e) {
+            Job* j = find(id);
+            if (!j || j->forumGen != gen) return;
+            if (!e.empty()) { forumFailed(*j, e); return; }
+            postNext(id, gen);
+        });
+        return "";
+    }
+    void forumFailed(Job& j, const std::string& e)
+    {
+        j.forumState.clear(); j.forumError = e;
+        save(); changed();
+    }
+    // One reel at a time, a few seconds apart (Logos Forum paces a sender at 20 a minute).
+    void postNext(const std::string& id, quint64 gen)
+    {
+        Job* j = find(id);
+        if (!j || j->forumGen != gen || j->forumState != "posting") return;
+        const Reel* r = nullptr;
+        const json done = postedIn(*j);
+        for (auto& x : j->reels)
+            if (jstr(done, fs::path(x.file).filename().string().c_str(), "").empty()) { r = &x; break; }
+        if (!r) { j->forumState.clear(); save(); changed(); return; }
+        const json t = j->forum;
+        const std::string fname = fs::path(r->file).filename().string(), body = forumBody(*j, *r), alias = forumAlias;
+        const std::string thread = jstr(t, "thread", "");
+        const int64_t ts = QDateTime::currentMSecsSinceEpoch();
+        auto key = fkey;
+        signThen([t, key, thread, body, alias, ts] {
+            return forumerApp(t) ? reelcut::forum::forumerReply(key, forumName(t), thread, body, alias, ts)
+                                 : reelcut::forum::logosForumReply(key, forumName(t), thread, body, alias, ts);
+        }, [this, id, gen, fname, thread](reelcut::forum::Signed s) {
+            sendSigned(s, [this, id, gen, fname, thread, pid = s.id](const std::string& err) {
+                Job* k = find(id);
+                if (!k || k->forumGen != gen) return;
+                if (!err.empty()) { forumFailed(*k, err); return; }
+                if (!k->forumPosted.contains(thread) || !k->forumPosted[thread].is_object()) k->forumPosted[thread] = json::object();
+                k->forumPosted[thread][fname] = pid;
+                save(); changed();
+                QTimer::singleShot(3500, loop, guarded("forum next", [this, id, gen] { postNext(id, gen); }));
+            });
+        });
+    }
+    // A new thread (the full video's), then the reels go under it.
+    std::string startThread(Job& b, const std::string& title, const std::string& body, const std::string& domains, bool thenPost)
+    {
+        if (trim(title).empty()) return "A thread needs a title.";
+        if (b.forumState == "posting") return "Already posting.";
+        std::string err;
+        if (!forumKey(err)) return err;
+        b.forumState = "posting"; b.forumError.clear();
+        const quint64 gen = ++b.forumGen;
+        changed();
+        const std::string id = b.id, alias = forumAlias;
+        std::vector<std::string> doms;
+        for (auto& d : QString::fromStdString(domains).split(',', Qt::SkipEmptyParts)) doms.push_back(d.trimmed().toStdString());
+        const json t = b.forum;
+        ensureDelivery([this, id, gen, t, title, body, doms, alias, thenPost](const std::string& e) {
+            Job* j = find(id);
+            if (!j || j->forumGen != gen) return;
+            if (!e.empty()) { forumFailed(*j, e); return; }
+            auto key = fkey;
+            const int64_t ts = QDateTime::currentMSecsSinceEpoch();
+            signThen([t, key, title, body, doms, alias, ts] {
+                return forumerApp(t) ? reelcut::forum::forumerThread(key, forumName(t), trim(title), body, doms, alias, ts)
+                                     : reelcut::forum::logosForumThread(key, forumName(t), trim(title), body, alias, ts);
+            }, [this, id, gen, title, thenPost](reelcut::forum::Signed s) {
+                sendSigned(s, [this, id, gen, title, thenPost, tid = s.id](const std::string& err) {
+                    Job* k = find(id);
+                    if (!k || k->forumGen != gen) return;
+                    if (!err.empty()) { forumFailed(*k, err); return; }
+                    k->forum["thread"] = tid;
+                    k->forum["threadTitle"] = trim(title);
+                    if (!k->forumPosted.contains("started") || !k->forumPosted["started"].is_array()) k->forumPosted["started"] = json::array();
+                    k->forumPosted["started"].push_back(tid);
+                    k->forumState.clear();
+                    save(); changed();
+                    if (thenPost) QTimer::singleShot(3500, loop, guarded("forum after thread", [this, id] { if (Job* m = find(id)) postToForum(*m); }));
+                });
+            });
+        });
+        return "";
+    }
+
     // ── results
     void readMeta(Job& b)
     {
@@ -2525,6 +2855,86 @@ std::string ReelcutCoreImpl::stopYoutube(const std::string& jobId)
     Job* b = d->find(jobId);
     if (!b) return json({{"ok", false}, {"error", "No such job."}}).dump();
     if (b->ytState == "asking") { b->ytState.clear(); ++b->ytGen; d->changed(); }
+    return d->state().dump();
+}
+
+std::string ReelcutCoreImpl::setForum(const std::string& jobId, const std::string& targetJson)
+{
+    Job* b = d->find(jobId);
+    if (!b) return json({{"ok", false}, {"error", "No such job."}}).dump();
+    json in = json::parse(targetJson, nullptr, false);
+    if (!in.is_object()) return json({{"ok", false}, {"error", "Not a forum target."}}).dump();
+    json t = b->forum.is_object() ? b->forum : json::object();
+    if (in.contains("app") && in["app"].is_string()) {
+        const std::string app = in["app"].get<std::string>();
+        if (app != "forumer" && app != "logos_forum" && !app.empty()) return json({{"ok", false}, {"error", "Forumer or Logos Forum."}}).dump();
+        if (app != jstr(t, "app", "")) { t.erase("thread"); t.erase("threadTitle"); t.erase("forum"); }
+        t["app"] = app;
+    }
+    if (in.contains("forum") && in["forum"].is_string()) {
+        const std::string f = trim(in["forum"].get<std::string>());
+        if (f != jstr(t, "forum", "")) { t.erase("thread"); t.erase("threadTitle"); }
+        t["forum"] = f;
+    }
+    if (in.contains("thread") && in["thread"].is_string()) {
+        const std::string raw = trim(in["thread"].get<std::string>());
+        std::string id;
+        if (raw.empty()) id = "";
+        else if (ReelcutCorePrivate::forumerApp(t)) {
+            auto x = reelcut::forum::forumerThreadFromLink(raw);
+            if (!x) return json({{"ok", false}, {"error", "Paste a Forumer thread link (Share on the thread), or its id."}}).dump();
+            id = *x;
+        } else {
+            QString h = QString::fromStdString(raw).toLower();
+            if (!QRegularExpression("^[0-9a-f]{64}$").match(h).hasMatch())
+                return json({{"ok", false}, {"error", "A Logos Forum thread id is 64 hex characters: pick the thread from the list."}}).dump();
+            id = h.toStdString();
+        }
+        t["thread"] = id;
+        t["threadTitle"] = in.contains("threadTitle") && in["threadTitle"].is_string() ? in["threadTitle"].get<std::string>() : std::string();
+    }
+    if (in.contains("auto") && in["auto"].is_boolean()) t["auto"] = in["auto"].get<bool>();
+    if (!ReelcutCorePrivate::forumTopic(t).empty() || jstr(t, "app", "").empty()) {
+        b->forum = t;
+        b->forumError.clear();
+        d->save(); d->changed();
+        return d->state().dump();
+    }
+    return json({{"ok", false}, {"error", "Not a forum name this app can use (Forumer: lowercase letters, digits and -)."}}).dump();
+}
+
+std::string ReelcutCoreImpl::loadForumThreads(const std::string& app, const std::string& forumName)
+{
+    if (app != "forumer" && app != "logos_forum") return json({{"ok", false}, {"error", "Forumer or Logos Forum."}}).dump();
+    d->loadThreads(app, forumName);
+    return d->state().dump();
+}
+
+std::string ReelcutCoreImpl::startForumThread(const std::string& jobId, const std::string& title, const std::string& body,
+                                              const std::string& domains, bool thenPost)
+{
+    Job* b = d->find(jobId);
+    if (!b) return json({{"ok", false}, {"error", "No such job."}}).dump();
+    if (jstr(b->forum, "app", "").empty()) return json({{"ok", false}, {"error", "Choose the forum first."}}).dump();
+    std::string err = d->startThread(*b, title, body, domains, thenPost);
+    if (!err.empty()) return json({{"ok", false}, {"error", err}}).dump();
+    return d->state().dump();
+}
+
+std::string ReelcutCoreImpl::postToForum(const std::string& jobId)
+{
+    Job* b = d->find(jobId);
+    if (!b) return json({{"ok", false}, {"error", "No such job."}}).dump();
+    std::string err = d->postToForum(*b);
+    if (!err.empty()) return json({{"ok", false}, {"error", err}}).dump();
+    return d->state().dump();
+}
+
+std::string ReelcutCoreImpl::stopForum(const std::string& jobId)
+{
+    Job* b = d->find(jobId);
+    if (!b) return json({{"ok", false}, {"error", "No such job."}}).dump();
+    if (b->forumState == "posting") { b->forumState.clear(); ++b->forumGen; d->save(); d->changed(); }
     return d->state().dump();
 }
 

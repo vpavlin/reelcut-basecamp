@@ -87,6 +87,25 @@ public:
     // Stop waiting for the agent's YouTube texts.
     std::string stopYoutube(const std::string& jobId);
 
+    // Where the job's reels are posted: targetJson {"app": "forumer"|"logos_forum", "forum": name ("public" /
+    // "Logos Forum" by default), "thread": a Forumer thread link or id / a Logos Forum thread id, "threadTitle",
+    // "auto": post once the reels are in Logos Storage}. Any field left out stays as it was.
+    std::string setForum(const std::string& jobId, const std::string& targetJson);
+
+    // Read a forum's threads from the network's store nodes, for the picker: snapshot().forumThreads["app|forum"].
+    std::string loadForumThreads(const std::string& app, const std::string& forumName);
+
+    // Start a thread in the job's forum (domains: Forumer's topic tags, comma-separated); thenPost: the reels
+    // go under it right after.
+    std::string startForumThread(const std::string& jobId, const std::string& title, const std::string& body,
+                                 const std::string& domains, bool thenPost);
+
+    // Post the job's reels (those not posted yet) as replies in its thread, signed as Reelcut.
+    std::string postToForum(const std::string& jobId);
+
+    // Stop posting the job's reels.
+    std::string stopForum(const std::string& jobId);
+
     // The transcript lines of one clip, to see what it holds: {"ok": true, "n": 3, "text": "[0:03:42] B: …"}.
     std::string clipText(const std::string& jobId, int64_t n);
 

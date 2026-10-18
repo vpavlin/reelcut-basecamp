@@ -286,6 +286,13 @@ Item {
             toast("Copied the prompt. Paste it into an AI chat, then paste the answer here.", false)
         })
     }
+    // The open job's forum target, and the threads read for its forum (if any).
+    readonly property var forumT: root.job && root.job.forum && root.job.forum.target ? root.job.forum.target : ({})
+    readonly property string forumApp: root.forumT.app || ""
+    readonly property string forumName: root.forumT.forum || (root.forumApp === "forumer" ? "public" : root.forumApp ? "Logos Forum" : "")
+    readonly property var forumList: root.forumApp && root.st.forumThreads ? (root.st.forumThreads[root.forumApp + "|" + root.forumName] || null) : null
+    readonly property int forumPosted: root.job && root.job.reels ? root.job.reels.filter(function (r) { return !!r.forumPost }).length : 0
+    function setForum(obj) { act("setForum", [root.job.id, JSON.stringify(obj)]) }
     readonly property bool anyYoutube: !!root.job && !!root.job.reels && root.job.reels.some(function (r) { return !!r.youtube })
     readonly property bool ytAsking: !!root.job && !!root.job.youtube && root.job.youtube.state === "asking"
     function importUrl(u) {
@@ -853,6 +860,178 @@ Item {
                                 text: "Use this answer"
                                 enabled: ytAnswer.text.trim() !== ""
                                 onClicked: root.act("setYoutube", [root.job.id, ytAnswer.text], "Saved the YouTube texts", function () { ytAnswer.text = "" })
+                            }
+                        }
+                    }
+
+                    // The reels as replies in a forum thread: Forumer or Logos Forum.
+                    Rectangle {
+                        visible: !!root.job && root.job.reels.length > 0 && root.job.status === "done"
+                        Layout.fillWidth: true
+                        implicitHeight: forumCol.implicitHeight + 32
+                        radius: 10
+                        color: root.cSurface
+                        border.width: 1; border.color: root.cLine
+                        ColumnLayout {
+                            id: forumCol
+                            anchors.fill: parent; anchors.margins: 16
+                            spacing: 10
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 10
+                                Text { text: "Post the reels to a forum"; color: root.cText; font.pixelSize: 15; font.bold: true; textFormat: Text.PlainText; Layout.fillWidth: true }
+                                ComboBox {
+                                    id: forumAppBox
+                                    Layout.preferredWidth: 160
+                                    model: ["Choose…", "Forumer", "Logos Forum"]
+                                    currentIndex: root.forumApp === "forumer" ? 1 : root.forumApp === "logos_forum" ? 2 : 0
+                                    onActivated: (i) => { if (i > 0) root.setForum({ app: i === 1 ? "forumer" : "logos_forum" }) }
+                                }
+                                Field {
+                                    id: forumNameField
+                                    visible: !!root.forumApp
+                                    Layout.preferredWidth: 160; Layout.preferredHeight: 34
+                                    readonly property string seed: root.job ? root.job.id + "|" + root.forumName : ""
+                                    onSeedChanged: text = root.forumName
+                                    placeholderText: root.forumApp === "forumer" ? "public" : "Logos Forum"
+                                    onEditingFinished: if (text.trim() !== root.forumName) root.setForum({ forum: text.trim() })
+                                    ToolTip.visible: hovered; ToolTip.delay: 500
+                                    ToolTip.text: root.forumApp === "forumer" ? "The forum: \"public\" is Forumer's open forum." : "The forum's name: \"Logos Forum\" is the app's own."
+                                }
+                            }
+                            Text {
+                                visible: !root.forumApp
+                                Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+                                color: root.cSub; font.pixelSize: 13
+                                text: "Each reel as a reply in a thread (say, the post with the full video): its YouTube title and description, and where to get it from Logos Storage. Reelcut signs the posts with its own key."
+                            }
+                            // the thread
+                            ColumnLayout {
+                                visible: !!root.forumApp
+                                Layout.fillWidth: true
+                                spacing: 8
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 10
+                                    Text {
+                                        Layout.fillWidth: true; elide: Text.ElideRight; textFormat: Text.PlainText; font.pixelSize: 13
+                                        color: root.forumT.thread ? root.cText : root.cFaint
+                                        text: root.forumT.thread ? "Thread: " + (root.forumT.threadTitle || root.forumT.thread) : "No thread yet: pick one, paste a link, or start one."
+                                    }
+                                    LogosButton { visible: !!root.forumT.thread; text: "Change"; onClicked: root.setForum({ thread: "" }) }
+                                }
+                                ColumnLayout {
+                                    visible: !root.forumT.thread
+                                    Layout.fillWidth: true
+                                    spacing: 8
+                                    RowLayout {
+                                        visible: root.forumApp === "forumer"
+                                        Layout.fillWidth: true
+                                        spacing: 8
+                                        Field { id: threadLinkField; Layout.fillWidth: true; Layout.preferredHeight: 34; placeholderText: "Paste a Forumer thread link (Share on the thread)" }
+                                        LogosButton { text: "Use it"; enabled: threadLinkField.text.trim() !== ""; onClicked: { root.setForum({ thread: threadLinkField.text.trim() }); threadLinkField.text = "" } }
+                                    }
+                                    RowLayout {
+                                        spacing: 10
+                                        LogosButton {
+                                            text: root.forumList && root.forumList.state === "loading" ? "Reading the threads…" : "Pick a recent thread"
+                                            enabled: !(root.forumList && root.forumList.state === "loading")
+                                            onClicked: root.act("loadForumThreads", [root.forumApp, root.forumName])
+                                        }
+                                        LogosButton { text: "Start a new thread"; onClicked: newThreadBox.visible = !newThreadBox.visible }
+                                        Text {
+                                            visible: !!root.st.delivery && root.st.delivery.state === "starting"
+                                            text: "Connecting to Logos Delivery…"; color: root.cAccent; font.pixelSize: 12; textFormat: Text.PlainText
+                                        }
+                                    }
+                                    Text {
+                                        visible: !!root.forumList && !!root.forumList.error
+                                        Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+                                        color: root.cFaint; font.pixelSize: 12
+                                        text: root.forumList ? root.forumList.error + " The list holds what the network's store nodes still keep" + (root.forumApp === "forumer" ? "; an older thread: paste its link." : ".") : ""
+                                    }
+                                    // the threads read back, newest first
+                                    Repeater {
+                                        model: root.forumList && root.forumList.threads ? root.forumList.threads.slice(0, 30) : []
+                                        delegate: Rectangle {
+                                            required property var modelData
+                                            Layout.fillWidth: true
+                                            implicitHeight: 34
+                                            radius: 6
+                                            color: thMouse.containsMouse ? root.cRaised : "transparent"
+                                            RowLayout {
+                                                anchors.fill: parent; anchors.leftMargin: 8; anchors.rightMargin: 8
+                                                spacing: 10
+                                                Text { text: modelData.title; color: root.cText; font.pixelSize: 13; elide: Text.ElideRight; Layout.fillWidth: true; textFormat: Text.PlainText }
+                                                Text { text: modelData.author + " · " + new Date(modelData.ts).toLocaleDateString(Qt.locale(), Locale.ShortFormat); color: root.cFaint; font.pixelSize: 11; textFormat: Text.PlainText }
+                                            }
+                                            MouseArea { id: thMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.setForum({ thread: modelData.id, threadTitle: modelData.title }) }
+                                        }
+                                    }
+                                    // a new thread: the full video's
+                                    ColumnLayout {
+                                        id: newThreadBox
+                                        visible: false
+                                        Layout.fillWidth: true
+                                        spacing: 6
+                                        Field { id: ntTitle; Layout.fillWidth: true; Layout.preferredHeight: 34; placeholderText: "Title"; text: root.job ? root.job.title || "" : "" }
+                                        Rectangle {
+                                            Layout.fillWidth: true; Layout.preferredHeight: 80
+                                            radius: 8; color: root.cBg; border.width: 1; border.color: ntBody.activeFocus ? root.cAccent : root.cLine
+                                            ScrollView {
+                                                anchors.fill: parent; anchors.margins: 6
+                                                TextArea {
+                                                    id: ntBody
+                                                    color: root.cText; font.pixelSize: 12; wrapMode: TextEdit.Wrap; selectByMouse: true; background: null
+                                                    placeholderText: "What the thread is about"; placeholderTextColor: root.cFaint
+                                                    text: root.job && root.job.url ? "Full video: " + root.job.url : ""
+                                                }
+                                            }
+                                        }
+                                        Field { id: ntTags; visible: root.forumApp === "forumer"; Layout.fillWidth: true; Layout.preferredHeight: 34; placeholderText: "Topic tags, comma-separated (Forumer needs one), e.g. dev club, video" }
+                                        LogosButton {
+                                            Layout.alignment: Qt.AlignRight
+                                            text: "Start it and post the reels"
+                                            enabled: ntTitle.text.trim() !== "" && (root.forumApp !== "forumer" || ntTags.text.trim() !== "")
+                                            onClicked: { root.act("startForumThread", [root.job.id, ntTitle.text.trim(), ntBody.text, ntTags.text, true]); newThreadBox.visible = false }
+                                        }
+                                    }
+                                }
+                            }
+                            // posting
+                            RowLayout {
+                                visible: !!root.forumT.thread
+                                Layout.fillWidth: true
+                                spacing: 10
+                                CheckBox {
+                                    id: forumAuto
+                                    checked: !!root.forumT.auto
+                                    onToggled: root.setForum({ auto: checked })
+                                }
+                                Text {
+                                    Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText; color: root.cSub; font.pixelSize: 12
+                                    text: "Post the reels by themselves once they are in Logos Storage (with their CIDs)"
+                                }
+                                Text {
+                                    text: root.job && root.job.forum && root.job.forum.state === "posting" ? "Posting… " + root.forumPosted + " of " + root.job.reels.length
+                                        : root.forumPosted ? root.forumPosted + " of " + root.job.reels.length + " posted" : ""
+                                    color: root.cAccent; font.pixelSize: 12; textFormat: Text.PlainText
+                                }
+                                LogosButton {
+                                    visible: !!root.job && !!root.job.forum && root.job.forum.state === "posting"
+                                    text: "Stop"; onClicked: root.act("stopForum", [root.job.id])
+                                }
+                                LogosButton {
+                                    visible: !!root.job && (!root.job.forum || root.job.forum.state !== "posting") && root.forumPosted < root.job.reels.length
+                                    text: root.forumPosted ? "Post the rest" : "Post the reels"
+                                    onClicked: root.act("postToForum", [root.job.id])
+                                }
+                            }
+                            Text {
+                                visible: !!root.job && !!root.job.forum && !!root.job.forum.error
+                                Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+                                color: root.cBad; font.pixelSize: 12
+                                text: root.job && root.job.forum ? root.job.forum.error : ""
                             }
                         }
                     }
@@ -1473,6 +1652,7 @@ Item {
             capExact.value = m >= 0 ? m : 470
             storeBox.currentIndex = Math.max(0, ["", "local", "node"].indexOf(s.storeTo || ""))
             storeNodeField.text = s.storeNode || ""
+            forumAliasField.text = s.forumAlias === undefined ? "Reelcut" : s.forumAlias
             colourRow.field.text = s.colour || ""
             sayingRow.field.text = s.sayingColour || ""
             saidRow.field.text = s.saidColour || ""
@@ -1494,6 +1674,7 @@ Item {
                 autoCut: autoCutBox.checked, autoCount: autoCountBox.value, diarize: diarizeBox.checked,
                 lead: num(leadField, 0.25), tail: num(tailField, 0.4), fade: num(fadeField, 0.3), card: num(cardField, 2),
                 storeTo: ["", "local", "node"][storeBox.currentIndex], storeNode: storeNodeField.text.trim(),
+                forumAlias: forumAliasField.text.trim(),
                 captionMargin: capPlace.margin, colour: hex(colourRow.field.text), sayingColour: hex(sayingRow.field.text), saidColour: hex(saidRow.field.text),
                 runner: ["auto", "podman", "docker", "local"][runnerBox.currentIndex] })], "Saved")
             close()
@@ -1686,6 +1867,20 @@ Item {
                     color: root.cFaint; font.pixelSize: 12
                     text: storeBox.currentIndex === 0 ? "Off: the reels stay in the job's folder."
                         : "Each cut reel goes to the node, and with them a small reels.json (each reel's hook, length and CID): its CID shares the whole set. Anyone with a CID can fetch it from the node while it is reachable." + (storeBox.currentIndex === 2 ? " A node on an always-on server serves them all the time; its REST API has no password, so give an address on your VPN or mesh only." : "")
+                }
+
+                Section { text: "FORUMS"; Layout.topMargin: 10 }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 8
+                    Label2 { text: "Name on Reelcut's posts"; Layout.fillWidth: true }
+                    Field { id: forumAliasField; Layout.preferredWidth: 260; Layout.preferredHeight: 34; maximumLength: 32; placeholderText: "Reelcut" }
+                }
+                Text {
+                    Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+                    color: root.cFaint; font.pixelSize: 12
+                    text: "Reelcut posts to Forumer and Logos Forum with a key of its own" + (root.st.forumKey ? " (" + root.st.forumKey + "…)" : "")
+                        + ": the forums show this name next to the key's fingerprint. Empty: the fingerprint only."
                 }
 
                 Section { text: "RUNNING"; Layout.topMargin: 10 }

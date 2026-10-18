@@ -2,20 +2,25 @@
   "name": "reelcut_core",
   "display_name": "Reelcut Core",
   "icon": "icon.png",
-  "version": "0.1.9",
+  "version": "0.2.0",
   "type": "core",
   "interface": "universal",
   "category": "tools",
-  "description": "Turns a long video into captioned vertical reels with reelcut: fetch, transcribe locally, pick clips, cut",
+  "description": "Turns a long video into captioned vertical reels with reelcut: fetch, transcribe locally, pick clips, cut, and post the reels to a Forumer or Logos Forum thread",
   "main": "reelcut_core_plugin",
   "dependencies": [
     "storage_module",
-    "storage_gateway"
+    "storage_gateway",
+    "delivery_module"
   ],
   "nix": {
     "packages": {
-      "build": [],
-      "runtime": []
+      "build": [
+        "libsodium"
+      ],
+      "runtime": [
+        "libsodium"
+      ]
     },
     "external_libraries": [],
     "cmake": {

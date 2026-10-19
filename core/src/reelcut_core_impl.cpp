@@ -420,7 +420,7 @@ struct Job {
     // A forum to post the reels to (Forumer or Logos Forum): {app, forum, thread, threadTitle, auto}.
     // forumPosted: per thread id, reel file name -> the post's id there; "started" -> threads Reelcut started.
     json forum = json::object(), forumPosted = json::object();
-    std::string forumState, forumError;     // forumState "posting" while replies go out
+    std::string forumState, forumError;     // forumState "waiting" while the reels go into Storage first, "posting" while replies go out
     quint64 forumGen = 0;
 };
 
@@ -1367,7 +1367,7 @@ struct ReelcutCorePrivate {
         if (place.empty() || b.reels.empty()) return;
         const int n = storeNodeIndex();
         std::string err;
-        if (!storageReady(n, err)) { b.storing["reels.json"] = "failed: " + err; changed(); return; }
+        if (!storageReady(n, err)) { b.storing["reels.json"] = "failed: " + err; storeFailed(b, err); changed(); return; }
         if (!b.stored.contains(place) || !b.stored[place].is_object()) b.stored[place] = json::object();
         bool all = true;
         for (auto& r : b.reels) {
@@ -1408,7 +1408,7 @@ struct ReelcutCorePrivate {
                                              : (ar.value.error.empty() ? "Logos Storage refused the file." : ar.value.error);
             onLoop([this, n, id, fname, name, size, ok, sess, err] {
                 Job* j = find(id); if (!j) return;
-                if (!ok) { j->storing[fname] = "failed: " + err; changed(); return; }
+                if (!ok) { j->storing[fname] = "failed: " + err; storeFailed(*j, err); changed(); return; }
                 stSess[sessKey(n, sess)] = {id, fname, size};
                 (void)name;
                 schedulePoll();
@@ -1421,7 +1421,10 @@ struct ReelcutCorePrivate {
         if (it == stSess.end()) return;
         const std::string id = it->second.job, fname = it->second.file;
         stSess.erase(it);
-        if (!jbool(p, "success", false)) { if (Job* j = find(id)) { j->storing[fname] = "failed: " + jstr(p, "error", "unknown error"); changed(); } return; }
+        if (!jbool(p, "success", false)) {
+            if (Job* j = find(id)) { j->storing[fname] = "failed: " + jstr(p, "error", "unknown error"); storeFailed(*j, jstr(p, "error", "unknown error")); changed(); }
+            return;
+        }
         stored(id, fname, jstr(p, "cid", ""));
     }
     void stored(const std::string& id, const std::string& fname, const std::string& cid)
@@ -1435,9 +1438,11 @@ struct ReelcutCorePrivate {
         j->storing.erase(fname);
         storeReels(*j);     // the next ones, or the set once all reels are in
         // All in: the reels can go to the forum, with their CIDs.
-        if (fname == "reels.json" && jbool(j->forum, "auto", false) && !jstr(j->forum, "thread", "").empty()
-            && j->forumState != "posting")
+        if (fname == "reels.json" && !jstr(j->forum, "thread", "").empty()
+            && (j->forumState == "waiting" || (jbool(j->forum, "auto", false) && j->forumState != "posting"))) {
+            j->forumState.clear();
             postToForum(*j);
+        }
     }
     // Events can be lost: while uploads run, look at the node's list for the files by name.
     void schedulePoll()
@@ -2192,6 +2197,18 @@ struct ReelcutCorePrivate {
 
     // What one reel's reply says: the YouTube texts when written, else its hook and summary; and where
     // to get the video (Logos Storage CID; the set's CID shares them all).
+    // The full video at the reel's moment: YouTube takes t=, anything else gets the time written out.
+    static std::string momentLink(const std::string& url, double at)
+    {
+        if (at < 0) return "Full video: " + url;
+        const int s = (int)at;
+        const bool yt = url.find("youtube.com/") != std::string::npos || url.find("youtu.be/") != std::string::npos;
+        if (yt) return "Watch it in the full video: " + url + (url.find('?') == std::string::npos ? "?" : "&") + "t=" + std::to_string(s) + "s";
+        char hms[32];
+        if (s >= 3600) std::snprintf(hms, sizeof hms, "%d:%02d:%02d", s / 3600, s / 60 % 60, s % 60);
+        else std::snprintf(hms, sizeof hms, "%d:%02d", s / 60, s % 60);
+        return "Full video: " + url + " (the reel starts at " + hms + ")";
+    }
     std::string forumBody(const Job& b, const Reel& r)
     {
         const std::string key = std::to_string(r.n), fname = fs::path(r.file).filename().string();
@@ -2206,19 +2223,46 @@ struct ReelcutCorePrivate {
         std::string body = "**" + title + "**";
         if (!text.empty()) body += "\n\n" + text;
         body += "\n\n";
-        if (!cid.empty()) body += "Watch it from Logos Storage: `" + cid + "`";
-        else body += "(" + std::to_string((int)std::lround(r.seconds)) + " s reel)";
+        if (!cid.empty()) body += "The reel in Logos Storage: `" + cid + "`";
         if (!set.empty()) body += "\nAll the reels of this video: `" + set + "`";
-        if (!b.url.empty()) body += "\nFull video: " + b.url;
+        if (!b.url.empty()) {
+            double at = -1;
+            for (auto& c : parseClips(b.clipsText)) if (c.n == r.n) at = secs(c.start);
+            body += "\n" + momentLink(b.url, at);
+        }
         return body.substr(0, 9500);
     }
 
+    bool allStored(const Job& b) const
+    {
+        const std::string place = storePlace();
+        if (place.empty() || !b.stored.contains(place) || !b.stored[place].is_object()) return false;
+        const json& here = b.stored[place];
+        for (auto& r : b.reels)
+            if (jstr(here, fs::path(r.file).filename().string().c_str(), "").empty()) return false;
+        return !jstr(here, "reels.json", "").empty();
+    }
+    // Storing failed while posts waited for it: nothing is posted, and the person is told why.
+    void storeFailed(Job& b, const std::string& err)
+    {
+        if (b.forumState == "waiting") forumFailed(b, "Nothing was posted: storing the reels failed (" + err + ").");
+    }
     std::string postToForum(Job& b)
     {
         const std::string thread = jstr(b.forum, "thread", "");
         if (thread.empty()) return "Choose a thread first, or start one.";
         if (b.reels.empty()) return "Cut the reels first.";
-        if (b.forumState == "posting") return "";
+        if (b.forumState == "posting" || b.forumState == "waiting") return "";
+        // A post is the reel: without its CID there is nothing to watch, so the reels go into Logos
+        // Storage first and the posts follow once all of them (and the set) are in.
+        if (storePlace().empty())
+            return "Choose where the reels are stored first (Settings, Logos Storage): each post carries its reel's CID.";
+        if (!allStored(b)) {
+            b.forumState = "waiting"; b.forumError.clear();
+            storeReels(b);
+            if (b.forumState == "waiting") { save(); changed(); }
+            return "";
+        }
         std::string err;
         if (!forumKey(err)) return err;
         b.forumState = "posting"; b.forumError.clear();
@@ -2302,7 +2346,9 @@ struct ReelcutCorePrivate {
                     k->forumPosted["started"].push_back(tid);
                     k->forumState.clear();
                     save(); changed();
-                    if (thenPost) QTimer::singleShot(3500, loop, guarded("forum after thread", [this, id] { if (Job* m = find(id)) postToForum(*m); }));
+                    if (thenPost) QTimer::singleShot(3500, loop, guarded("forum after thread", [this, id] {
+                        if (Job* m = find(id)) { const std::string e = postToForum(*m); if (!e.empty()) forumFailed(*m, e); }
+                    }));
                 });
             });
         });
@@ -2934,7 +2980,7 @@ std::string ReelcutCoreImpl::stopForum(const std::string& jobId)
 {
     Job* b = d->find(jobId);
     if (!b) return json({{"ok", false}, {"error", "No such job."}}).dump();
-    if (b->forumState == "posting") { b->forumState.clear(); ++b->forumGen; d->save(); d->changed(); }
+    if (b->forumState == "posting" || b->forumState == "waiting") { b->forumState.clear(); ++b->forumGen; d->save(); d->changed(); }
     return d->state().dump();
 }
 

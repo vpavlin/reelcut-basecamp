@@ -1013,16 +1013,17 @@ Item {
                                     text: "Post the reels by themselves once they are in Logos Storage (with their CIDs)"
                                 }
                                 Text {
-                                    text: root.job && root.job.forum && root.job.forum.state === "posting" ? "Posting… " + root.forumPosted + " of " + root.job.reels.length
+                                    text: root.job && root.job.forum && root.job.forum.state === "waiting" ? "Storing the reels first, then posting…"
+                                        : root.job && root.job.forum && root.job.forum.state === "posting" ? "Posting… " + root.forumPosted + " of " + root.job.reels.length
                                         : root.forumPosted ? root.forumPosted + " of " + root.job.reels.length + " posted" : ""
                                     color: root.cAccent; font.pixelSize: 12; textFormat: Text.PlainText
                                 }
                                 LogosButton {
-                                    visible: !!root.job && !!root.job.forum && root.job.forum.state === "posting"
+                                    visible: !!root.job && !!root.job.forum && (root.job.forum.state === "posting" || root.job.forum.state === "waiting")
                                     text: "Stop"; onClicked: root.act("stopForum", [root.job.id])
                                 }
                                 LogosButton {
-                                    visible: !!root.job && (!root.job.forum || root.job.forum.state !== "posting") && root.forumPosted < root.job.reels.length
+                                    visible: !!root.job && (!root.job.forum || (root.job.forum.state !== "posting" && root.job.forum.state !== "waiting")) && root.forumPosted < root.job.reels.length
                                     text: root.forumPosted ? "Post the rest" : "Post the reels"
                                     onClicked: root.act("postToForum", [root.job.id])
                                 }

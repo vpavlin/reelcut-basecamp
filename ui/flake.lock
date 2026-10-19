@@ -565877,18 +565877,18 @@
       },
       "locked": {
         "dir": "core",
-        "lastModified": 1792326555,
-        "narHash": "sha256-jAmdqYv9IV0Re63grfxyu3L0QbXowCLyqOO3H5YOltQ=",
+        "lastModified": 1792405168,
+        "narHash": "sha256-W7Df1hclfYAC4nHqNDhT6K4O7Q75xIwFCMgvwWI6RxQ=",
         "owner": "vpavlin",
         "repo": "reelcut-basecamp",
-        "rev": "1e588f31aba9125419696a90b06ddf92d2ca4ee6",
+        "rev": "b7282e7b21703140f8525c8b1c83a2bb9ce066b8",
         "type": "github"
       },
       "original": {
         "dir": "core",
         "owner": "vpavlin",
         "repo": "reelcut-basecamp",
-        "rev": "1e588f31aba9125419696a90b06ddf92d2ca4ee6",
+        "rev": "b7282e7b21703140f8525c8b1c83a2bb9ce066b8",
         "type": "github"
       }
     },

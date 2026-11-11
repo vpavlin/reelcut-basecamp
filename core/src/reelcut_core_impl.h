@@ -67,11 +67,22 @@ public:
     // Cut the reels (the chosen ones, all when none is chosen). fixesText: one "Heard=Meant" per line or comma, for misheard names.
     std::string cutReels(const std::string& jobId, const std::string& fixesText);
 
-    // optionsJson: {"brief": "what I'm looking for", "chosen": [2, 5, 7] (the clips to cut), "intro": card, "outro": card}.
+    // optionsJson: {"brief": "what I'm looking for", "chosen": [2, 5, 7] (the clips to cut), "intro": card, "outro": card,
+    // "ratio": "9:16"|"4:5"|"1:1" (the reels' shape, this job)}.
     // The brief and the cards become the defaults for the next job.
     // The job's reels into the Logos Storage node chosen in Settings (again for those that failed).
     std::string storeReels(const std::string& jobId);
     std::string setJob(const std::string& jobId, const std::string& optionsJson);
+
+    // The scenes of every clip, to frame them by hand: per scene a
+    // frame the view may load, the faces in it and boxes to start from per ratio. Arrives in
+    // snapshot(): jobs[].scenes {state: running|done|failed, error, clips: {"3": {start, end, scenes: […]}}}.
+    std::string findScenes(const std::string& jobId);
+
+    // A clip framed by hand: framingJson {"scenes": [{"start": seconds into the video, "layout": "crop"|"split"|"fit",
+    // "boxes": [[x, y, w, h] as fractions of the video]}]} (crop takes one box, split two: top, bottom).
+    // An empty framingJson puts the clip back on the automatic layout. The reels' shape is setJob's "ratio".
+    std::string setFraming(const std::string& jobId, int64_t clip, const std::string& framingJson);
 
     // YouTube texts for the cut reels (a title, a description and tags each), written by an agent:
     // "" = the agent from the settings, else "auto" / "local:claude" / "local:pi" / MACHINE/SESSION.

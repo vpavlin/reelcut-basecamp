@@ -14,7 +14,7 @@ Reelcut on [apps.vpavlin.xyz](https://apps.vpavlin.xyz)) and install **Reelcut**
 
 - **Paste and go:** the video is downloaded and transcribed **on your computer** (Parakeet, on the
   CPU, nothing leaves it). Then the best moments are picked from the transcript and the reels are
-  cut, 1080×1920 with captions and a hook title.
+  cut, 1080×1920 (or 4:5, 1:1) with captions and a hook title.
 - **Who speaks:** for an interview, a podcast or a call, the voices are told apart on your
   computer too (about 7 minutes per hour of video; beside the transcription on a machine with 8 or
   more cores, after it on a smaller one). Transcribing starts as soon as the audio is down, while
@@ -27,6 +27,19 @@ Reelcut on [apps.vpavlin.xyz](https://apps.vpavlin.xyz)) and install **Reelcut**
   their own picture (the listener slightly dimmed); with three or more on screen, the two who talk
   most in each clip. Per job, choose the whole picture, follow
   whoever speaks, or a crop of the middle instead.
+- **Reframe by hand:** when the point of a clip isn't a face (a call with webcams in a column and
+  the slides beside them), "Reframe" on a clip, or on its reel card, opens a frame of each of the
+  clip's scenes. Reelcut splits the clip where the picture changes: a layout switch, a screen share
+  starting or ending, a hard cut. Per scene, choose:
+  - **Crop:** one box in the reel's shape;
+  - **Split:** two boxes, one above the other, say a speaker on top and the slide below;
+  - **Fit:** the whole picture over a blurred copy of itself.
+
+  Drag a box to move it, a corner to resize it; it keeps the reel's shape and snaps to the faces
+  Reelcut found and to the edges. The preview beside it shows the reel. "Use for the next scenes"
+  copies one scene's framing onward. The framing is kept with the job, so "Cut again" reuses it;
+  "Back to the automatic layout" forgets it. A clip never reframed is cut as the Layout says.
+- **Shape:** vertical 9:16 by default, or 4:5 or 1:1 for feeds (per job, next to Layout).
 - **Picking the moments:**
   - **An agent on this computer, automatic:** with [shrooms-agent](https://github.com/vpavlin/shrooms)
     installed (no mesh needed) and podman, Reelcut starts a session of its own in a container (a

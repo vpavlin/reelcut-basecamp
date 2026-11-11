@@ -217,6 +217,25 @@ Item {
         for (var i = 0; i < root.layouts.length; i++) if (root.layouts[i].value === (v || "")) return i
         return 0
     }
+    // The reels' shape (cut --ratio): per job.
+    readonly property var ratios: [
+        { value: "9:16", label: "Vertical 9:16", w: 1080, h: 1920 },
+        { value: "4:5", label: "Portrait 4:5", w: 1080, h: 1350 },
+        { value: "1:1", label: "Square 1:1", w: 1080, h: 1080 }
+    ]
+    function ratioIndex(v) {
+        for (var i = 0; i < root.ratios.length; i++) if (root.ratios[i].value === v) return i
+        return 0
+    }
+    readonly property var jobRatio: root.ratios[root.ratioIndex(root.job ? root.job.ratio || "9:16" : "9:16")]
+    function framedByHand(n) { return !!root.job && !!root.job.framing && !!root.job.framing[String(n)] }
+    // Open the Reframe panel for clip n; the scenes are found first when they aren't yet.
+    function reframe(n) {
+        if (!root.job) return
+        var sc = root.job.scenes || {}
+        if (sc.state !== "running" && !(sc.clips && sc.clips[String(n)])) root.act("findScenes", [root.job.id])
+        reframePanel.openFor(n)
+    }
     readonly property var pickOptsAll: root.pickOpts.concat([{ value: "", label: "Nobody: I paste from an AI chat" }])
     function pickerLabel(v) {
         if (v === "auto") return "an agent on this computer"
@@ -348,6 +367,157 @@ Item {
         background: Rectangle { radius: 8; color: root.cBg; border.width: 1; border.color: parent.activeFocus ? root.cAccent : root.cLine }
     }
     component Label2: Text { color: root.cSub; font.pixelSize: 12; textFormat: Text.PlainText }
+    // A box on a frame of the video (Reframe): drag it to move, a corner to resize; its shape stays
+    // the reel's (aspectN: width/height in fractions of the picture). It snaps to a face's centre
+    // and to the picture's edges. Positions are fractions of the picture, as reelcut takes them.
+    component FrameBox: Rectangle {
+        id: fb
+        property var box: [0, 0, 1, 1]
+        property real aspectN: 1
+        property real pw: 1
+        property real ph: 1
+        property var faces: []
+        property string label: ""
+        property color tint: root.cAccent
+        property string src: ""
+        signal moved(var nb)
+        x: box[0] * pw; y: box[1] * ph; width: box[2] * pw; height: box[3] * ph
+        color: "transparent"
+        border.width: 2; border.color: tint
+        // Its part of the picture at full brightness, over the dimmed rest.
+        Item {
+            anchors.fill: parent
+            clip: true
+            z: -1
+            Image {
+            source: fb.src
+            asynchronous: true
+            fillMode: Image.Stretch
+            x: -fb.x; y: -fb.y; width: fb.pw; height: fb.ph
+            }
+        }
+        function clamp(v, a, b) { return Math.max(a, Math.min(b, v)) }
+        function snapX(x, w) {
+            var c = x + w / 2
+            for (var i = 0; i < fb.faces.length; i++) {
+                var f = fb.faces[i], fc = f[0] + f[2] / 2
+                if (Math.abs(fc - c) < 0.015) return clamp(fc - w / 2, 0, 1 - w)
+            }
+            if (Math.abs(x) < 0.012) return 0
+            if (Math.abs(x + w - 1) < 0.012) return 1 - w
+            return x
+        }
+        function snapY(y, h) {
+            for (var i = 0; i < fb.faces.length; i++) {
+                var f = fb.faces[i], eyes = f[1] + f[3] * 0.4
+                if (Math.abs(y + h * 0.35 - eyes) < 0.015) return clamp(eyes - h * 0.35, 0, 1 - h)
+            }
+            if (Math.abs(y) < 0.012) return 0
+            if (Math.abs(y + h - 1) < 0.012) return 1 - h
+            return y
+        }
+        Rectangle {
+            visible: fb.label !== ""
+            x: 2; y: 2; width: lbl.implicitWidth + 10; height: 18; radius: 3; color: fb.tint
+            Text { id: lbl; anchors.centerIn: parent; text: fb.label; color: "#000"; font.pixelSize: 11; font.bold: true; textFormat: Text.PlainText }
+        }
+        // One area for both: pressed near a corner it resizes (the opposite corner stays), elsewhere it moves.
+        MouseArea {
+            id: fbArea
+            anchors.fill: parent; anchors.margins: -9
+            hoverEnabled: true
+            property real sx: 0
+            property real sy: 0
+            property var sb: null
+            property int corner: -1     // 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right; -1 moving
+            function cornerAt(x, y) {
+                var bx = x - 9, by = y - 9, r = 12
+                var l = Math.abs(bx) < r, rt = Math.abs(bx - fb.width) < r, t = Math.abs(by) < r, b = Math.abs(by - fb.height) < r
+                return t && l ? 0 : t && rt ? 1 : b && l ? 2 : b && rt ? 3 : -1
+            }
+            cursorShape: {
+                var c = pressed ? corner : cornerAt(mouseX, mouseY)
+                return c === 0 || c === 3 ? Qt.SizeFDiagCursor : c === 1 || c === 2 ? Qt.SizeBDiagCursor : pressed ? Qt.ClosedHandCursor : Qt.OpenHandCursor
+            }
+            onPressed: function (m) {
+                var p = mapToItem(fb.parent, m.x, m.y)
+                sx = p.x; sy = p.y; sb = fb.box.slice(); corner = cornerAt(m.x, m.y)
+            }
+            onReleased: function (m) { sb = null; corner = -1 }
+            onPositionChanged: function (m) {
+                if (!sb || !pressed) return
+                var p = mapToItem(fb.parent, m.x, m.y)
+                if (corner < 0) {
+                    var w = sb[2], h = sb[3]
+                    var nx = fb.clamp(sb[0] + (p.x - sx) / fb.pw, 0, 1 - w)
+                    var ny = fb.clamp(sb[1] + (p.y - sy) / fb.ph, 0, 1 - h)
+                    fb.moved([fb.snapX(nx, w), fb.snapY(ny, h), w, h])
+                    return
+                }
+                var left = corner === 0 || corner === 2, top = corner < 2
+                var mx = p.x / fb.pw, my = p.y / fb.ph
+                var ax = left ? sb[0] + sb[2] : sb[0], ay = top ? sb[1] + sb[3] : sb[1]
+                var hh = Math.max(Math.abs(my - ay), Math.abs(mx - ax) / fb.aspectN, 0.06)
+                var maxW = left ? ax : 1 - ax, maxH = top ? ay : 1 - ay
+                hh = Math.min(hh, maxH, maxW / fb.aspectN)
+                var ww = hh * fb.aspectN
+                fb.moved([left ? ax - ww : ax, top ? ay - hh : ay, ww, hh])
+            }
+        }
+        Repeater {
+            model: 4
+            delegate: Rectangle {
+                required property int index
+                width: 14; height: 14; radius: 3; color: fb.tint
+                x: index % 2 === 0 ? -7 : fb.width - 7
+                y: index < 2 ? -7 : fb.height - 7
+            }
+        }
+    }
+    // A box's part of a frame, filling the item (the box has the item's shape).
+    component ReelPart: Item {
+        id: part
+        property var box: [0, 0, 1, 1]
+        property string src: ""
+        clip: true
+        Image {
+            source: part.src
+            asynchronous: true
+            fillMode: Image.Stretch
+            width: part.width / Math.max(0.01, part.box[2])
+            height: part.height / Math.max(0.01, part.box[3])
+            x: -part.box[0] * width
+            y: -part.box[1] * height
+        }
+    }
+    // What a scene will look like in the reel: the box's part of the frame, or two stacked, or the
+    // whole frame fitted over a dimmed copy (reelcut blurs it).
+    component ReelPreview: Rectangle {
+        id: pv
+        property string src: ""
+        property var edit: null
+        property real ratio: 9 / 16
+        color: "#000"
+        clip: true
+        ReelPart {
+            visible: !!pv.edit && pv.edit.layout === "crop" && pv.edit.boxes.length > 0
+            anchors.fill: parent
+            src: pv.src
+            box: visible ? pv.edit.boxes[0] : [0, 0, 1, 1]
+        }
+        Column {
+            visible: !!pv.edit && pv.edit.layout === "split" && pv.edit.boxes.length > 1
+            anchors.fill: parent
+            ReelPart { width: pv.width; height: pv.height / 2; src: pv.src; box: parent.visible ? pv.edit.boxes[0] : [0, 0, 1, 1] }
+            ReelPart { width: pv.width; height: pv.height / 2; src: pv.src; box: parent.visible ? pv.edit.boxes[1] : [0, 0, 1, 1] }
+        }
+        Item {
+            visible: !!pv.edit && pv.edit.layout === "fit"
+            anchors.fill: parent
+            Image { anchors.fill: parent; source: pv.src; fillMode: Image.PreserveAspectCrop; opacity: 0.3; asynchronous: true }
+            Image { anchors.fill: parent; source: pv.src; fillMode: Image.PreserveAspectFit; asynchronous: true }
+        }
+    }
     component Section: Text { color: root.cFaint; font.pixelSize: 11; font.letterSpacing: 1.2; textFormat: Text.PlainText }
     component Bar: Rectangle {
         id: bar
@@ -705,7 +875,7 @@ Item {
                                         Image {
                                             anchors.fill: parent
                                             source: modelData.thumb ? root.fileUrl(modelData.thumb) : ""
-                                            fillMode: Image.PreserveAspectCrop
+                                            fillMode: Image.PreserveAspectFit
                                             asynchronous: true
                                             cache: false
                                         }
@@ -728,6 +898,20 @@ Item {
                                     MouseArea {
                                         id: rMouse; anchors.fill: thumbBox; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
                                         onClicked: root.act("openPath", [root.job.page ? root.job.page : modelData.file])
+                                    }
+                                    // Frame it by hand, then cut again.
+                                    Rectangle {
+                                        visible: modelData.n > 0
+                                        anchors.left: parent.left; anchors.top: parent.top; anchors.margins: 8
+                                        width: rfT.implicitWidth + 14; height: 22; radius: 11
+                                        color: Qt.rgba(0, 0, 0, rfMouse.containsMouse ? 0.85 : 0.6)
+                                        border.width: root.framedByHand(modelData.n) ? 1 : 0; border.color: root.cAccent
+                                        Text {
+                                            id: rfT; anchors.centerIn: parent
+                                            text: root.framedByHand(modelData.n) ? "Framed by hand" : "Reframe"
+                                            color: rfMouse.containsMouse ? root.cAccent : "#fff"; font.pixelSize: 11; textFormat: Text.PlainText
+                                        }
+                                        MouseArea { id: rfMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.reframe(modelData.n) }
                                     }
                                     Text {
                                         x: 10; y: 328; width: parent.width - 20
@@ -1382,8 +1566,10 @@ Item {
                                         text: cand.modelData.summary || ""
                                         color: root.cSub; font.pixelSize: 12; wrapMode: Text.WordWrap; textFormat: Text.PlainText
                                     }
+                                    RowLayout {
+                                    Layout.leftMargin: 66
+                                    spacing: 16
                                     Text {
-                                        Layout.leftMargin: 66
                                         text: cand.open ? "Hide the words" : "Show the words"
                                         color: wordsMouse.containsMouse ? root.cAccent : root.cFaint; font.pixelSize: 11; textFormat: Text.PlainText
                                         MouseArea {
@@ -1397,6 +1583,13 @@ Item {
                                                 })
                                             }
                                         }
+                                    }
+                                    Text {
+                                        text: root.framedByHand(cand.modelData.n) ? "Framed by hand · change" : "Reframe"
+                                        color: rcMouse.containsMouse ? root.cAccent : root.framedByHand(cand.modelData.n) ? root.cAccent : root.cFaint
+                                        font.pixelSize: 11; textFormat: Text.PlainText
+                                        MouseArea { id: rcMouse; anchors.fill: parent; anchors.margins: -4; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.reframe(cand.modelData.n) }
+                                    }
                                     }
                                     Text {
                                         visible: cand.open
@@ -1544,6 +1737,20 @@ Item {
                                     onActivated: root.act("setSpeakers", [root.job.id, JSON.stringify({ layout: root.layoutValue(currentIndex) }), false])
                                 }
                             }
+                            ColumnLayout {
+                                spacing: 4
+                                Label2 { text: "Shape" }
+                                ComboBox {
+                                    id: cutRatio
+                                    Layout.preferredWidth: 150
+                                    Layout.preferredHeight: 34
+                                    model: root.ratios.map(function (r) { return r.label })
+                                    readonly property string seed: root.job ? root.job.ratio || "9:16" : "9:16"
+                                    onSeedChanged: currentIndex = root.ratioIndex(seed)
+                                    Component.onCompleted: currentIndex = root.ratioIndex(seed)
+                                    onActivated: root.act("setJob", [root.job.id, JSON.stringify({ ratio: root.ratios[currentIndex].value })])
+                                }
+                            }
                             LogosButton {
                                 id: cutBtn
                                 Layout.alignment: Qt.AlignBottom
@@ -1631,6 +1838,326 @@ Item {
                 Item { Layout.fillWidth: true }
                 LogosButton { text: "Cancel"; onClicked: confirmDelete.close() }
                 LogosButton { text: "Delete"; onClicked: { confirmDelete.close(); root.act("removeJob", [root.job.id, true], "Deleted") } }
+            }
+        }
+    }
+
+
+    // ── Reframe (issue #9): each scene of a clip as a crop, two boxes stacked, or the whole picture
+    // fitted. The scenes, a frame of each and the faces in it come from the core (findScenes); the
+    // boxes go back as fractions of the video (setFraming) and reelcut cuts from them.
+    Popup {
+        id: reframePanel
+        anchors.centerIn: parent
+        width: Math.min(root.width - 32, 1200)
+        height: Math.min(root.height - 32, 820)
+        modal: true
+        padding: 18
+        closePolicy: Popup.CloseOnEscape
+        background: Rectangle { radius: 12; color: root.cSurface; border.width: 1; border.color: root.cLine }
+        property int clipN: 0
+        property int idx: 0
+        property var edits: []
+        property bool dirty: false
+        property string seededKey: ""
+        readonly property var info: root.job && root.job.scenes && root.job.scenes.clips ? root.job.scenes.clips[String(clipN)] || null : null
+        readonly property var scenes: info && info.scenes ? info.scenes : []
+        readonly property var scene: idx < scenes.length ? scenes[idx] : null
+        readonly property var edit: idx < edits.length ? edits[idx] : null
+        readonly property string findState: root.job && root.job.scenes ? root.job.scenes.state || "" : ""
+        readonly property var clipRow: {
+            var cs = root.job ? root.job.clips || [] : []
+            for (var i = 0; i < cs.length; i++) if (cs[i].n === clipN) return cs[i]
+            return null
+        }
+        readonly property real vw: root.job && root.job.width ? root.job.width : 16
+        readonly property real vh: root.job && root.job.height ? root.job.height : 9
+        readonly property string ratioNow: root.jobRatio.value
+        onRatioNowChanged: refitAll()
+        onScenesChanged: seed()
+
+        function openFor(n) { clipN = n; idx = 0; seededKey = ""; edits = []; dirty = false; open(); seed() }
+        // A box's shape in fractions of the picture: the reel's (crop) or half of it (split).
+        function aspectN(layout) {
+            var r = root.jobRatio
+            var px = layout === "split" ? r.w / (Math.floor(r.h / 4) * 2) : r.w / r.h
+            return px * vh / vw
+        }
+        function fitBox(b, a) {
+            var cx = b[0] + b[2] / 2, cy = b[1] + b[3] / 2, h = b[3], w = h * a
+            if (w > 1) { w = 1; h = w / a }
+            if (h > 1) { h = 1; w = h * a }
+            return [Math.max(0, Math.min(1 - w, cx - w / 2)), Math.max(0, Math.min(1 - h, cy - h / 2)), w, h]
+        }
+        function fitted(e) {
+            var a = aspectN(e.layout)
+            return { start: e.start, layout: e.layout, boxes: (e.boxes || []).map(function (b) { return fitBox(b, a) }) }
+        }
+        function suggestion(sc, layout) {
+            var sg = sc.suggest && sc.suggest[root.jobRatio.value] ? sc.suggest[root.jobRatio.value] : null
+            var boxes = layout === "fit" ? [] : sg && sg[layout] ? sg[layout].map(function (b) { return b.slice() }) : layout === "split" ? [[0, 0, 0.5, 1], [0.5, 0, 0.5, 1]] : [[0.3, 0, 0.4, 1]]
+            return fitted({ start: sc.start, layout: layout, boxes: boxes })
+        }
+        // Start from what was saved for the clip (each scene takes the framing that was in force at its
+        // start), or from reelcut's suggestions: a crop around the largest face, or fitted with none.
+        function seed() {
+            var key = clipN + "|" + scenes.map(function (x) { return x.start }).join(",")
+            if (!scenes.length || key === seededKey) return
+            seededKey = key
+            var saved = root.job && root.job.framing && root.job.framing[String(clipN)] ? root.job.framing[String(clipN)].scenes || [] : []
+            var out = []
+            for (var i = 0; i < scenes.length; i++) {
+                var sc = scenes[i], e = null
+                for (var j = 0; j < saved.length; j++) if (saved[j].start <= sc.start + 0.05) e = saved[j]
+                if (!e && saved.length) e = saved[0]
+                out.push(e ? fitted({ start: sc.start, layout: e.layout, boxes: (e.boxes || []).map(function (b) { return b.slice() }) })
+                           : suggestion(sc, sc.faces && sc.faces.length ? "crop" : "fit"))
+            }
+            edits = out
+            if (idx >= out.length) idx = 0
+            dirty = false
+        }
+        function refitAll() { if (edits.length) { edits = edits.map(fitted); dirty = true } }
+        function put(i, e) { var a = edits.slice(); a[i] = e; edits = a; dirty = true }
+        function setLayout(l) {
+            if (!edit || edit.layout === l || !scene) return
+            var e = suggestion(scene, l)
+            // Crop to split: the crop's box goes on top.
+            if (l === "split" && edit.layout === "crop" && edit.boxes.length) e.boxes[0] = fitBox(edit.boxes[0], aspectN("split"))
+            if (l === "crop" && edit.layout === "split" && edit.boxes.length) e.boxes[0] = fitBox(edit.boxes[0], aspectN("crop"))
+            put(idx, e)
+        }
+        function moveBox(k, nb) {
+            if (!edit) return
+            var e = { start: edit.start, layout: edit.layout, boxes: edit.boxes.slice() }
+            e.boxes[k] = nb
+            put(idx, e)
+        }
+        function toFollowing() {
+            var a = edits.slice()
+            for (var i = idx + 1; i < a.length; i++)
+                a[i] = { start: a[i].start, layout: edit.layout, boxes: edit.boxes.map(function (b) { return b.slice() }) }
+            edits = a; dirty = true
+            root.toast("Scenes " + (idx + 2) + "–" + a.length + " framed as this one", false)
+        }
+        function save() {
+            var body = JSON.stringify({ scenes: edits.map(function (e) { return { start: e.start, layout: e.layout, boxes: e.boxes } }) })
+            root.act("setFraming", [root.job.id, clipN, body], "Framed by hand. Cut again to see it.", function () { reframePanel.close() })
+        }
+        function automatic() {
+            root.act("setFraming", [root.job.id, clipN, ""], "Back on the automatic layout", function () { reframePanel.close() })
+        }
+        function rel(t) { var d = Math.round(Math.max(0, t - (info ? info.start : 0))); return d > 0 ? root.fmtDur(d) : "0:00" }
+
+        contentItem: ColumnLayout {
+            spacing: 12
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 12
+                Text {
+                    Layout.fillWidth: true
+                    text: "Reframe clip " + reframePanel.clipN + (reframePanel.clipRow ? ":  " + reframePanel.clipRow.hook : "")
+                    color: root.cText; font.pixelSize: 17; font.bold: true; elide: Text.ElideRight; textFormat: Text.PlainText
+                }
+                Label2 { text: "Shape" }
+                ComboBox {
+                    Layout.preferredWidth: 150; Layout.preferredHeight: 32
+                    model: root.ratios.map(function (r) { return r.label })
+                    currentIndex: root.ratioIndex(reframePanel.ratioNow)
+                    onActivated: function (i) { root.act("setJob", [root.job.id, JSON.stringify({ ratio: root.ratios[i].value })]) }
+                }
+            }
+            // Before the scenes are there.
+            ColumnLayout {
+                visible: !reframePanel.info
+                Layout.fillWidth: true; Layout.fillHeight: true
+                spacing: 10
+                Item { Layout.fillHeight: true }
+                BusyIndicator { visible: reframePanel.findState === "running"; running: visible; Layout.alignment: Qt.AlignHCenter }
+                Text {
+                    Layout.alignment: Qt.AlignHCenter; Layout.maximumWidth: 520
+                    horizontalAlignment: Text.AlignHCenter; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+                    color: reframePanel.findState === "failed" ? root.cBad : root.cSub; font.pixelSize: 13
+                    text: reframePanel.findState === "running" ? "Finding the scenes of the clips: where the picture changes, a frame of each, the faces in it."
+                        : reframePanel.findState === "failed" ? (root.job.scenes.error || "Could not find the scenes.")
+                        : "This clip's scenes aren't there yet (the clip changed?)."
+                }
+                LogosButton {
+                    visible: reframePanel.findState !== "running"
+                    Layout.alignment: Qt.AlignHCenter
+                    text: "Find the scenes"
+                    onClicked: root.act("findScenes", [root.job.id])
+                }
+                Item { Layout.fillHeight: true }
+            }
+            // The scenes, one thumbnail each.
+            RowLayout {
+                visible: !!reframePanel.info
+                Layout.fillWidth: true
+                spacing: 10
+                Text {
+                    text: "‹"; font.pixelSize: 22; textFormat: Text.PlainText
+                    color: reframePanel.idx > 0 ? (prevMouse.containsMouse ? root.cAccent : root.cText) : root.cFaint
+                    MouseArea { id: prevMouse; anchors.fill: parent; anchors.margins: -6; hoverEnabled: true; enabled: reframePanel.idx > 0; cursorShape: Qt.PointingHandCursor; onClicked: reframePanel.idx-- }
+                }
+                Flickable {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 74
+                    contentWidth: sceneRow.implicitWidth
+                    clip: true
+                    Row {
+                        id: sceneRow
+                        spacing: 8
+                        Repeater {
+                            model: reframePanel.scenes
+                            delegate: Rectangle {
+                                required property var modelData
+                                required property int index
+                                width: 112; height: 74; radius: 6
+                                color: root.cBg
+                                border.width: index === reframePanel.idx ? 2 : 1
+                                border.color: index === reframePanel.idx ? root.cAccent : root.cLine
+                                Image {
+                                    x: 3; y: 3; width: parent.width - 6; height: 52
+                                    source: modelData.frame ? root.fileUrl(modelData.frame) : ""
+                                    fillMode: Image.PreserveAspectFit; asynchronous: true
+                                }
+                                Text {
+                                    x: 6; y: 56
+                                    text: (index + 1) + " · " + reframePanel.rel(modelData.start) + "  " + (reframePanel.edits[index] ? reframePanel.edits[index].layout : "")
+                                    color: root.cSub; font.pixelSize: 10; textFormat: Text.PlainText
+                                }
+                                MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: reframePanel.idx = parent.index }
+                            }
+                        }
+                    }
+                }
+                Text {
+                    text: "›"; font.pixelSize: 22; textFormat: Text.PlainText
+                    color: reframePanel.idx < reframePanel.scenes.length - 1 ? (nextMouse.containsMouse ? root.cAccent : root.cText) : root.cFaint
+                    MouseArea { id: nextMouse; anchors.fill: parent; anchors.margins: -6; hoverEnabled: true; enabled: reframePanel.idx < reframePanel.scenes.length - 1; cursorShape: Qt.PointingHandCursor; onClicked: reframePanel.idx++ }
+                }
+            }
+            RowLayout {
+                visible: !!reframePanel.info
+                Layout.fillWidth: true
+                spacing: 10
+                Text {
+                    text: reframePanel.scene ? "Scene " + (reframePanel.idx + 1) + " of " + reframePanel.scenes.length + "   " + reframePanel.rel(reframePanel.scene.start) + " – " + reframePanel.rel(reframePanel.scene.end) : ""
+                    color: root.cText; font.pixelSize: 13; textFormat: Text.PlainText
+                }
+                Item { Layout.fillWidth: true }
+                // crop | split | fit
+                Repeater {
+                    model: [{ v: "crop", l: "Crop", t: "One box, the reel's shape" },
+                            { v: "split", l: "Split", t: "Two boxes, one above the other: a speaker and the slide" },
+                            { v: "fit", l: "Fit", t: "The whole picture, over a blurred copy of itself" }]
+                    delegate: Rectangle {
+                        required property var modelData
+                        readonly property bool on: !!reframePanel.edit && reframePanel.edit.layout === modelData.v
+                        width: segT.implicitWidth + 26; height: 30; radius: 6
+                        color: on ? root.cAccent : segMouse.containsMouse ? root.cRaised : "transparent"
+                        border.width: 1; border.color: on ? root.cAccent : root.cLine
+                        Text { id: segT; anchors.centerIn: parent; text: modelData.l; color: parent.on ? "#000" : root.cText; font.pixelSize: 13; textFormat: Text.PlainText }
+                        MouseArea { id: segMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: reframePanel.setLayout(parent.modelData.v) }
+                        ToolTip.visible: segMouse.containsMouse; ToolTip.delay: 500; ToolTip.text: modelData.t
+                    }
+                }
+            }
+            // The frame with the boxes, and the reel beside it.
+            RowLayout {
+                visible: !!reframePanel.info
+                Layout.fillWidth: true; Layout.fillHeight: true
+                spacing: 16
+                Item {
+                    id: stage
+                    Layout.fillWidth: true; Layout.fillHeight: true
+                    Image {
+                        id: frameImg
+                        anchors.fill: parent
+                        source: reframePanel.scene && reframePanel.scene.frame ? root.fileUrl(reframePanel.scene.frame) : ""
+                        fillMode: Image.PreserveAspectFit
+                        asynchronous: true
+                    }
+                    Item {
+                        id: pic
+                        x: (frameImg.width - frameImg.paintedWidth) / 2
+                        y: (frameImg.height - frameImg.paintedHeight) / 2
+                        width: frameImg.paintedWidth; height: frameImg.paintedHeight
+                        // the parts the reel leaves out, dimmed
+                        Rectangle { anchors.fill: parent; color: "#000"; opacity: reframePanel.edit && reframePanel.edit.layout !== "fit" ? 0.35 : 0 }
+                        Repeater {
+                            model: reframePanel.scene ? reframePanel.scene.faces || [] : []
+                            delegate: Rectangle {
+                                required property var modelData
+                                x: modelData[0] * pic.width; y: modelData[1] * pic.height
+                                width: modelData[2] * pic.width; height: modelData[3] * pic.height
+                                color: "transparent"; radius: 4
+                                border.width: 1; border.color: "#7fd1ff"; opacity: 0.8
+                            }
+                        }
+                        FrameBox {
+                            id: boxA
+                            visible: !!reframePanel.edit && reframePanel.edit.layout !== "fit" && reframePanel.edit.boxes.length > 0
+                            box: visible ? reframePanel.edit.boxes[0] : [0, 0, 0.1, 0.1]
+                            aspectN: reframePanel.aspectN(reframePanel.edit ? reframePanel.edit.layout : "crop")
+                            pw: pic.width; ph: pic.height
+                            faces: reframePanel.scene ? reframePanel.scene.faces || [] : []
+                            label: reframePanel.edit && reframePanel.edit.layout === "split" ? "Top" : ""
+                            src: frameImg.source
+                            onMoved: function (nb) { reframePanel.moveBox(0, nb) }
+                        }
+                        FrameBox {
+                            id: boxB
+                            visible: !!reframePanel.edit && reframePanel.edit.layout === "split" && reframePanel.edit.boxes.length > 1
+                            box: visible ? reframePanel.edit.boxes[1] : [0, 0, 0.1, 0.1]
+                            aspectN: reframePanel.aspectN("split")
+                            pw: pic.width; ph: pic.height
+                            faces: reframePanel.scene ? reframePanel.scene.faces || [] : []
+                            label: "Bottom"
+                            tint: "#7fd1ff"
+                            src: frameImg.source
+                            onMoved: function (nb) { reframePanel.moveBox(1, nb) }
+                        }
+                    }
+                }
+                ColumnLayout {
+                    Layout.fillHeight: true
+                    spacing: 6
+                    Label2 { text: "In the reel" }
+                    ReelPreview {
+                        readonly property real r: root.jobRatio.w / root.jobRatio.h
+                        Layout.preferredHeight: Math.min(parent.height - 30, 420)
+                        Layout.preferredWidth: Layout.preferredHeight * r
+                        src: frameImg.source
+                        edit: reframePanel.edit
+                    }
+                    Item { Layout.fillHeight: true }
+                }
+            }
+            Text {
+                visible: !!reframePanel.info
+                Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+                color: root.cFaint; font.pixelSize: 12
+                text: "Drag a box to move it, a corner to resize it; it keeps the reel's shape and snaps to the faces (blue) and the edges. Captions go over the reel as before."
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 10
+                LogosButton {
+                    visible: !!reframePanel.info && reframePanel.idx < reframePanel.scenes.length - 1
+                    text: "Use for the next scenes"
+                    onClicked: reframePanel.toFollowing()
+                }
+                Text {
+                    visible: root.framedByHand(reframePanel.clipN)
+                    text: "Back to the automatic layout"
+                    color: autoMouse.containsMouse ? root.cAccent : root.cSub; font.pixelSize: 12; textFormat: Text.PlainText
+                    MouseArea { id: autoMouse; anchors.fill: parent; anchors.margins: -4; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: reframePanel.automatic() }
+                }
+                Item { Layout.fillWidth: true }
+                LogosButton { text: "Cancel"; onClicked: reframePanel.close() }
+                LogosButton { text: "Save"; enabled: reframePanel.edits.length > 0; onClicked: reframePanel.save() }
             }
         }
     }

@@ -17,6 +17,7 @@ Item {
     property bool editable: true
     signal moved(var nd)
     signal picked()
+    signal zoomed(real f)   // the wheel: < 1 zooms in (less of the picture), > 1 out
     x: dst[0] * cw; y: dst[1] * ch; width: dst[2] * cw; height: dst[3] * ch
     z: selected ? 2 : 1
 
@@ -84,6 +85,7 @@ Item {
             pb.picked()
         }
         onReleased: { sb = null; corner = -1 }
+        onWheel: function (w) { pb.picked(); if (w.angleDelta.y !== 0) pb.zoomed(w.angleDelta.y > 0 ? 0.92 : 1.08) }
         onPositionChanged: function (m) {
             if (!sb || !pressed) return
             var p = mapToItem(pb.parent, m.x, m.y)

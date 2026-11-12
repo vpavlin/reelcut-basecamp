@@ -410,11 +410,9 @@ Item {
         return out
     }
     // Clips framed by hand since their reel was cut: the Reels screen offers to cut them again.
-    property var recut: []
-    function markRecut(n) {
-        if (!root.reels.some(function (r) { return r.n === n })) return
-        if (root.recut.indexOf(n) < 0) root.recut = root.recut.concat([n])
-    }
+    readonly property var recut: root.job && root.job.recut ? root.job.recut : []
+    // Only these clips again (the other reels stay), with the names to fix as saved.
+    function cutClips(ns) { if (root.job && ns.length) act("cutClips", [root.job.id, root.job.fixes || "", JSON.stringify(ns)], "", function () { root.show(4) }) }
 
     // ── one blink a second while something runs: the only thing that moves
     property bool pulse: true
@@ -772,6 +770,8 @@ Item {
             var want = s.agent === undefined ? "auto" : s.agent
             setAgent.currentIndex = Math.max(0, vals.indexOf(want))
             runnerBox.currentIndex = Math.max(0, ["auto", "podman", "docker", "local"].indexOf(s.runner || "auto"))
+            coresBox.value = s.cores || 0
+            lowPrioBox.checked = s.lowPriority === true
             open()
             root.callVia(root.coreName, "listAgents", [], function (raw) { var o = root.parse(raw); if (o && o.jobs) root.apply(o) })
         }
@@ -788,7 +788,8 @@ Item {
                 storeTo: ["", "local", "node"][storeBox.currentIndex], storeNode: storeNodeField.text.trim(),
                 forumAlias: forumAliasField.text.trim(),
                 captionMargin: capPlace.margin, colour: hex(colourRow.field.text), sayingColour: hex(sayingRow.field.text), saidColour: hex(saidRow.field.text),
-                runner: ["auto", "podman", "docker", "local"][runnerBox.currentIndex] })], "Saved")
+                runner: ["auto", "podman", "docker", "local"][runnerBox.currentIndex],
+                cores: coresBox.value, lowPriority: lowPrioBox.checked })], "Saved")
             close()
         }
         anchors.centerIn: parent
@@ -993,6 +994,23 @@ Item {
                     color: root.cFaint; font.pixelSize: 12
                     text: "Reelcut posts to Forumer and Logos Forum with a key of its own" + (root.st.forumKey ? " (" + root.st.forumKey + "…)" : "")
                         + ": the forums show this name next to the key's fingerprint. Empty: the fingerprint only."
+                }
+
+                Section { text: "SPEED"; Layout.topMargin: 10 }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 8
+                    Label2 { text: "Cores Reelcut may use"; Layout.fillWidth: true }
+                    SpinBox { id: coresBox; from: 0; to: root.st.settings && root.st.settings.allCores ? root.st.settings.allCores : 64; editable: true
+                              textFromValue: function (v) { return v === 0 ? "all" : String(v) }
+                              valueFromText: function (t) { return t === "all" ? 0 : parseInt(t) || 0 } }
+                    Label2 { text: "of " + (root.st.settings && root.st.settings.allCores ? root.st.settings.allCores : "?") }
+                }
+                Check { id: lowPrioBox; text: "Low priority: let other apps go first"; Layout.fillWidth: true }
+                Text {
+                    Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText
+                    color: root.cFaint; font.pixelSize: 12
+                    text: "All cores at normal priority is the fastest: done sooner, the computer busy meanwhile. Fewer cores keep the rest free, and the job takes longer. Low priority slows Reelcut only while other apps want the CPU. Applies to the next step."
                 }
 
                 Section { text: "RUNNING"; Layout.topMargin: 10 }

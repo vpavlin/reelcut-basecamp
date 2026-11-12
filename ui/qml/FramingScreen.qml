@@ -170,6 +170,23 @@ Item {
         ps[k] = { src: fitSrc(ps[k].src, nd), dst: nd }
         put({ start: edit.start, bg: edit.bg, panels: ps })
     }
+    // Less (f < 1) or more (f > 1) of the picture in a box, around its middle: zooming out makes faces smaller.
+    function zoom(k, f) {
+        if (!edit || k >= edit.panels.length) return
+        var p = edit.panels[k], cx = p.src[0] + p.src[2] / 2, cy = p.src[1] + p.src[3] / 2
+        var h = clamp(p.src[3] * f, 0.03, 1), w = p.src[2] * f
+        var ps = edit.panels.slice()
+        ps[k] = { src: fitSrc([cx - w / 2, cy - h / 2, w, h], p.dst), dst: p.dst }
+        put({ start: edit.start, bg: edit.bg, panels: ps })
+    }
+    function placeDst(k, nd) { if (edit && k < edit.panels.length) moveDst(k, nd) }
+    function toFront(k) {
+        if (!edit || k >= edit.panels.length - 1) return
+        var ps = edit.panels.slice(), p = ps.splice(k, 1)[0]
+        ps.push(p)
+        put({ start: edit.start, bg: edit.bg, panels: ps })
+        sel = ps.length - 1
+    }
     function addPanel() {
         if (!edit || edit.panels.length >= 12) return
         var d = [0.25, 0.35, 0.5, 0.3]
@@ -193,16 +210,21 @@ Item {
         app.toast("Scenes " + (idx + 2) + "–" + a.length + " framed as this one", false)
     }
     function likeBefore() { if (idx > 0) put(copyOf(edits[idx - 1], edit.start)) }
-    function save(quiet) {
+    function save(quiet, then) {
         if (!job || !edits.length) return
         var n = clipN
         var body = JSON.stringify({ scenes: edits.map(function (e) { return { start: e.start, layout: "panels", bg: e.bg || "blur", panels: e.panels } }) })
         dirty = false
-        app.act("setFraming", [job.id, n, body], quiet ? "Saved the framing of clip " + n : "Saved. It's used the next time this clip is cut.", function () { app.markRecut(n) })
+        app.act("setFraming", [job.id, n, body], then ? "" : quiet ? "Saved the framing of clip " + n : "Saved. It's used the next time this clip is cut.", then)
+    }
+    function saveAndCut() {
+        var n = clipN
+        if (dirty || !app.framedByHand(n)) save(true, function () { app.cutClips([n]) })
+        else app.cutClips([n])
     }
     function automatic() {
         var n = clipN
-        app.act("setFraming", [job.id, n, ""], "Clip " + n + " is framed automatically again", function () { scr.seededKey = ""; scr.seed(); app.markRecut(n) })
+        app.act("setFraming", [job.id, n, ""], "Clip " + n + " is framed automatically again", function () { scr.seededKey = ""; scr.seed() })
     }
     function nextClip() {
         for (var i = 0; i < order.length - 1; i++) if (order[i].n === clipN) { openClip(order[i + 1].n); return }
@@ -269,15 +291,26 @@ Item {
                     color: scr.app.cText; font.pixelSize: 16; font.bold: true; elide: Text.ElideRight; textFormat: Text.PlainText
                 }
                 Text { visible: scr.dirty; text: "not saved"; color: scr.app.cWord; font.pixelSize: 12; textFormat: Text.PlainText }
-                Link { app: scr.app; visible: scr.app.framedByHand(scr.clipN); text: "Back to automatic"; onClicked: scr.automatic() }
+            }
+            Flow {
+                Layout.fillWidth: true
+                spacing: 8
+                Link { app: scr.app; height: 30; verticalAlignment: Text.AlignVCenter; visible: scr.app.framedByHand(scr.clipN); text: "Back to automatic"; onClicked: scr.automatic() }
                 ComboBox {
-                    Layout.preferredWidth: 140; Layout.preferredHeight: 30
+                    width: 140; height: 30
                     model: scr.app.ratios.map(function (r) { return r.label })
                     currentIndex: scr.app.ratioIndex(scr.app.jobRatio.value)
                     onActivated: function (i) { scr.app.act("setJob", [scr.job.id, JSON.stringify({ ratio: scr.app.ratios[i].value })]) }
                     ToolTip.visible: hovered; ToolTip.delay: 500; ToolTip.text: "The reels' shape, for the whole video"
                 }
                 SmallButton { app: scr.app; primary: true; text: "Save"; enabled: scr.edits.length > 0 && scr.dirty; onClicked: scr.save(false) }
+                SmallButton {
+                    app: scr.app
+                    text: "Save and cut this clip"
+                    tip: "Cut only this clip again; the other reels stay as they are"
+                    enabled: scr.edits.length > 0 && !scr.app.jobRunning
+                    onClicked: scr.saveAndCut()
+                }
                 SmallButton {
                     app: scr.app
                     text: "Save, next clip"
@@ -316,7 +349,7 @@ Item {
                 visible: !!scr.info
                 Layout.fillWidth: true
                 spacing: 8
-                Text { text: "Start from"; height: 30; verticalAlignment: Text.AlignVCenter; color: scr.app.cSub; font.pixelSize: 12; textFormat: Text.PlainText }
+                Text { text: "Quick layouts"; height: 30; verticalAlignment: Text.AlignVCenter; color: scr.app.cSub; font.pixelSize: 12; textFormat: Text.PlainText }
                 Repeater {
                     model: [
                         { k: "whole", l: "Whole picture", t: "The whole picture across the reel" },
@@ -339,7 +372,6 @@ Item {
                 }
                 Rectangle { width: 1; height: 30; color: scr.app.cLine }
                 SmallButton { app: scr.app; text: "+ Box"; tip: "Another box: the next face, or the middle"; enabled: !!scr.edit && scr.edit.panels.length < 12; onClicked: scr.addPanel() }
-                SmallButton { app: scr.app; text: "Remove box " + (scr.sel + 1); enabled: !!scr.edit && scr.edit.panels.length > 1; onClicked: scr.removePanel() }
                 Rectangle { width: 1; height: 30; color: scr.app.cLine }
                 Text { text: "Background"; height: 30; verticalAlignment: Text.AlignVCenter; color: scr.app.cSub; font.pixelSize: 12; textFormat: Text.PlainText }
                 Segmented {
@@ -356,6 +388,22 @@ Item {
                     text: scr.bgValue
                     onEditingFinished: { var c = text.trim(); if (/^#[0-9a-fA-F]{6}$/.test(c)) scr.setBg(c.toLowerCase()); else text = scr.bgValue }
                 }
+            }
+
+            // the selected box
+            Flow {
+                visible: !!scr.info && !!scr.edit && scr.sel < scr.edit.panels.length
+                Layout.fillWidth: true
+                spacing: 8
+                Rectangle { width: 22; height: 22; y: 4; radius: 4; color: scr.app.panelColour(scr.sel); Text { anchors.centerIn: parent; text: scr.sel + 1; color: "#000"; font.bold: true; font.pixelSize: 12 } }
+                Text { text: "Box " + (scr.sel + 1) + ":"; height: 30; verticalAlignment: Text.AlignVCenter; color: scr.app.cSub; font.pixelSize: 12; textFormat: Text.PlainText }
+                SmallButton { app: scr.app; text: "Zoom out"; tip: "More of the picture in the box (faces smaller). Or the mouse wheel on the box."; onClicked: scr.zoom(scr.sel, 1.12) }
+                SmallButton { app: scr.app; text: "Zoom in"; tip: "Less of the picture (faces bigger)"; onClicked: scr.zoom(scr.sel, 0.89) }
+                SmallButton { app: scr.app; text: "Full width"; tip: "Across the whole reel, as tall as it is"; onClicked: { var d = scr.edit.panels[scr.sel].dst; scr.placeDst(scr.sel, [0, d[1], 1, d[3]]) } }
+                SmallButton { app: scr.app; text: "Full reel"; onClicked: scr.placeDst(scr.sel, [0, 0, 1, 1]) }
+                SmallButton { app: scr.app; text: "Centre"; onClicked: { var d = scr.edit.panels[scr.sel].dst; scr.placeDst(scr.sel, [(1 - d[2]) / 2, (1 - d[3]) / 2, d[2], d[3]]) } }
+                SmallButton { app: scr.app; text: "To front"; enabled: !!scr.edit && scr.sel < scr.edit.panels.length - 1; onClicked: scr.toFront(scr.sel) }
+                SmallButton { app: scr.app; text: "Remove"; enabled: !!scr.edit && scr.edit.panels.length > 1; onClicked: scr.removePanel() }
             }
 
             // the frame with its pieces, and the reel
@@ -409,6 +457,7 @@ Item {
                                     src: scr.frameUrl
                                     onPicked: scr.sel = index
                                     onMoved: function (nb) { scr.moveSrc(index, nb) }
+                                    onZoomed: function (f) { scr.zoom(index, f) }
                                 }
                             }
                         }
@@ -417,11 +466,11 @@ Item {
                 ColumnLayout {
                     Layout.fillHeight: true
                     spacing: 4
-                    Text { text: "The reel: where each box goes"; color: scr.app.cSub; font.pixelSize: 12; textFormat: Text.PlainText }
+                    Text { text: "The reel, as it will look: drag a box anywhere, a corner to any size"; color: scr.app.cSub; font.pixelSize: 12; textFormat: Text.PlainText; Layout.maximumWidth: reelArea.width; elide: Text.ElideRight }
                     Item {
                         id: reelArea
                         Layout.fillHeight: true
-                        Layout.preferredWidth: Math.min(height * scr.ow / scr.oh, 420)
+                        Layout.preferredWidth: Math.min(height * scr.ow / scr.oh, scr.width * 0.4)
                         Rectangle {
                             id: canvas
                             readonly property real r: scr.ow / scr.oh
@@ -456,7 +505,18 @@ Item {
                                     selected: index === scr.sel
                                     onPicked: scr.sel = index
                                     onMoved: function (nd) { scr.moveDst(index, nd) }
+                                    onZoomed: function (f) { scr.zoom(index, f) }
                                 }
+                            }
+                            // Where the captions go (reelcut's default: lower with one box, the middle with more).
+                            Rectangle {
+                                readonly property int margin: scr.app.st.settings && scr.app.st.settings.captionMargin >= 0 ? scr.app.st.settings.captionMargin
+                                                              : (scr.edit && scr.edit.panels.length > 1 ? 860 : 470)
+                                x: 0; width: parent.width; height: parent.height * 110 / 1920
+                                y: parent.height * (1 - (margin + 110) / 1920)
+                                color: "transparent"; border.width: 1; border.color: "#80ffffff"
+                                z: 5
+                                Text { anchors.centerIn: parent; text: "captions"; color: "#c0ffffff"; font.pixelSize: 11; textFormat: Text.PlainText }
                             }
                         }
                     }
@@ -514,7 +574,7 @@ Item {
                 Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText
                 color: scr.app.cFaint; font.pixelSize: 12
                 text: (scr.sceneList.length > 1 ? "Scene " + (scr.idx + 1) + " of " + scr.sceneList.length + ", from " + scr.rel(scr.scene ? scr.scene.start : 0) + ". " : "One scene. ")
-                    + "On the picture, move a box or drag a corner to choose what is shown; on the reel, move a box or drag a corner to give it any size and shape. Boxes snap to faces (white), edges, halves and thirds; a later box covers an earlier one."
+                    + "Any number of boxes, anywhere, any shape: + Box adds one. On the reel, drag a box to place it and a corner to size it; on the picture, choose what it shows. The mouse wheel on a box zooms. Boxes snap to faces (white), edges, halves and thirds; a later box covers an earlier one."
             }
         }
     }

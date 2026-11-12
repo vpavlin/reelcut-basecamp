@@ -48,7 +48,8 @@ Flickable {
         for (var i = 0; i < app.cards.length; i++) if (app.cards[i].file === file) return app.cards[i].thumb
         return ""
     }
-    function cut() { app.act("cutReels", [job.id, fixField.text], "", function () { app.recut = [] }) }
+    function cut() { app.act("cutReels", [job.id, fixField.text]) }
+    function cutSome(ns) { app.act("cutClips", [job.id, fixField.text, JSON.stringify(ns)]) }
 
     ColumnLayout {
         id: col
@@ -81,7 +82,7 @@ Flickable {
                     width: scr.job && scr.job.progress && scr.job.progress.n ? parent.width * Math.min(1, scr.job.progress.i / scr.job.progress.n) : 0
                 }
             }
-            Hint { app: scr.app; color: scr.app.cFaint; Layout.fillWidth: true; text: "At a low priority, so the computer stays usable; each reel shows up here when it's done." }
+            Hint { app: scr.app; color: scr.app.cFaint; Layout.fillWidth: true; text: "Each reel shows up here when it's done. How many cores it may use: Settings, Speed." }
         }
         Card {
             app: scr.app
@@ -101,13 +102,19 @@ Flickable {
                 spacing: 10
                 Text {
                     Layout.fillWidth: true
-                    text: scr.app.recut.length ? "Framed by hand since the last cut: clip " + scr.app.recut.join(", ") + ". Cut again to see it."
+                    text: scr.app.recut.length ? "Framed anew since they were cut: clip " + scr.app.recut.join(", ") + "."
                         : scr.app.chosen.length ? "Cut the " + scr.app.chosen.length + " ticked clips" + (scr.app.framedCount ? ", " + scr.app.chosen.filter(function (n) { return scr.app.framedByHand(n) }).length + " framed by hand" : "")
                         : "No clips ticked: all " + scr.app.clips.length + " are cut"
                     color: scr.app.recut.length ? scr.app.cWord : scr.app.cText; font.pixelSize: 14; font.bold: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText
                 }
                 LogosButton {
-                    text: scr.reels.length ? "Cut again" : "Cut"
+                    visible: scr.app.recut.length > 0
+                    text: "Cut only " + (scr.app.recut.length === 1 ? "that one" : "those " + scr.app.recut.length)
+                    enabled: !scr.app.jobRunning
+                    onClicked: scr.cutSome(scr.app.recut)
+                }
+                LogosButton {
+                    text: scr.reels.length ? "Cut all again" : "Cut"
                     enabled: !scr.app.jobRunning
                     onClicked: scr.cut()
                 }
@@ -305,9 +312,19 @@ Flickable {
                         MouseArea { id: cidMouse; anchors.fill: parent; enabled: !!reel.modelData.cid; hoverEnabled: true; cursorShape: reel.modelData.cid ? Qt.PointingHandCursor : Qt.ArrowCursor; onClicked: scr.app.copyText(reel.modelData.cid) }
                     }
                     Link {
+                        anchors.right: parent.right; anchors.rightMargin: 10; y: parent.height - 24
+                        app: scr.app
+                        visible: reel.modelData.n > 0
+                        strong: scr.app.recut.indexOf(reel.modelData.n) >= 0
+                        text: "Cut again"
+                        font.pixelSize: 11
+                        enabled: !scr.app.jobRunning
+                        onClicked: scr.cutSome([reel.modelData.n])
+                    }
+                    Link {
                         x: 10; y: parent.height - 24
                         app: scr.app
-                        text: "Open in the video player"
+                        text: "Open in player"
                         font.pixelSize: 11
                         onClicked: scr.app.act("openPath", [reel.modelData.file])
                     }

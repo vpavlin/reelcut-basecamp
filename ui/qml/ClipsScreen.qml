@@ -271,7 +271,7 @@ Item {
                 LogosButton {
                     text: "Cut " + (scr.app.chosen.length || "") + " now"
                     enabled: scr.app.chosen.length > 0 && !scr.app.jobRunning
-                    onClicked: scr.app.act("cutReels", [scr.job.id, scr.job.fixes || ""], "", function () { scr.app.recut = []; scr.app.show(4) })
+                    onClicked: scr.app.act("cutReels", [scr.job.id, scr.job.fixes || ""], "", function () { scr.app.show(4) })
                 }
             }
         }

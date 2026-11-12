@@ -17,6 +17,7 @@ Rectangle {
     property string src: ""
     signal moved(var nb)
     signal picked()
+    signal zoomed(real f)   // the wheel: < 1 zooms in (less of the picture), > 1 out
     x: box[0] * pw; y: box[1] * ph; width: box[2] * pw; height: box[3] * ph
     color: "transparent"
     border.width: selected ? 3 : 2; border.color: tint
@@ -74,6 +75,7 @@ Rectangle {
             fb.picked()
         }
         onReleased: function (m) { sb = null; corner = -1 }
+        onWheel: function (w) { fb.picked(); if (w.angleDelta.y !== 0) fb.zoomed(w.angleDelta.y > 0 ? 0.92 : 1.08) }
         onPositionChanged: function (m) {
             if (!sb || !pressed) return
             var p = mapToItem(fb.parent, m.x, m.y)

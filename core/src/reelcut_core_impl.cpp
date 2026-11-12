@@ -44,7 +44,7 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-static const char* kVersion = "0.3.0";
+static const char* kVersion = "0.3.1";
 // Reelcut's own sessions on this computer's shrooms-agent: "reelcut-claude", "reelcut-pi".
 static const char* kLocalSession = "reelcut";
 static const char* kImage = "ghcr.io/vpavlin/reelcut:latest";
@@ -1064,6 +1064,36 @@ struct ReelcutCorePrivate {
             j->fetched = true;
             sideDone();
         });
+    }
+
+    // The video again, alone; the job then goes on with the step it failed in.
+    void refetchVideo(Job& b, bool pulled = false)
+    {
+        const std::string name = "reelcut-fetch-" + b.id;
+        b.status = "running";
+        logLine(b, "The video is not whole: downloading it again.");
+        launch(b, "fetch/" + b.id, runnerBin,
+               stepArgs(b, {"fetch", "--only", "video", QString::fromStdString(b.url), work(b, "")}, name, nullptr), name,
+               [this, id = b.id, pulled](bool ok, const std::string&) {
+            Job* j = find(id); if (!j) return;
+            if (!ok && !pulled && containerRunner() && logHas(*j, "unrecognized arguments") && !busy("pull")) {
+                // An image from before fetch --only: a newer one, then again.
+                logLine(*j, "This reelcut image can't download the video alone yet; getting a newer one.");
+                launch(*j, "pull", runnerBin, {"pull", kImage}, "", [this, id](bool ok, const std::string&) {
+                    Job* j = find(id); if (!j) return;
+                    lastPull = QDateTime::currentMSecsSinceEpoch();
+                    if (!ok) { finishStep(*j, "Could not download a newer reelcut image. " + lastLog(*j)); return; }
+                    refetchVideo(*j, true);
+                });
+                return;
+            }
+            if (!ok) { finishStep(*j, "Downloading the video again failed. " + lastLog(*j)); return; }
+            j->status = "queued";
+            finishStep(*j, "");
+        });
+        describe(b);
+        save();
+        changed();
     }
 
     void startTranscribe(Job& b)
@@ -2902,7 +2932,10 @@ std::string ReelcutCoreImpl::retryJob(const std::string& jobId)
     if (!b) return json({{"ok", false}, {"error", "No such job."}}).dump();
     if (b->status == "running" || b->status == "queued") return d->state().dump();
     if (d->runner.empty() || !d->runnerError.empty()) d->detectRunner();
+    // The video came down cut short (yt-dlp said done): the video again, the transcript kept, then the step.
+    const bool badVideo = b->error.find("cannot read the picture") != std::string::npos && b->file.empty() && !b->url.empty();
     b->error.clear();
+    if (badVideo && !d->runner.empty() && !d->busy("fetch/" + b->id)) { d->refetchVideo(*b); return d->state().dump(); }
     if (b->step == "pick" || b->step == "clips") { d->startPick(*b, b->agent.empty() ? d->agent : b->agent); return d->state().dump(); }
     if (b->step == "done" || b->step == "speakers") return d->state().dump();
     b->status = "queued";

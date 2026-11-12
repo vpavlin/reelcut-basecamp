@@ -2,11 +2,11 @@
   "name": "reelcut",
   "display_name": "Reelcut",
   "icon": "icon.png",
-  "version": "0.2.1",
+  "version": "0.5.1",
   "type": "ui_qml",
   "category": "media",
   "description": "Paste a long video, get short vertical reels with word-by-word captions: transcribed on your computer, clips picked by an agent on your mesh",
-  "view": "Main.qml",
+  "view": "qml/Main.qml",
   "dependencies": [
     "reelcut_core"
   ],

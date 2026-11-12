@@ -3,3 +3,4 @@ ui/cache/
 ui/harness/harness
 ui/harness/harness.moc
 ui/harness/shots/
+ui/qml/cache/

@@ -39,12 +39,13 @@
 #include <thread>
 #include <type_traits>
 #include <unistd.h>
+#include <sys/resource.h>
 #include <vector>
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-static const char* kVersion = "0.2.0";
+static const char* kVersion = "0.5.1";
 // Reelcut's own sessions on this computer's shrooms-agent: "reelcut-claude", "reelcut-pi".
 static const char* kLocalSession = "reelcut";
 static const char* kImage = "ghcr.io/vpavlin/reelcut:latest";
@@ -95,12 +96,40 @@ static auto guarded(const char* where, F fn)
     };
 }
 
-static std::string rootDir()
+// Where Reelcut kept everything before 0.5.0 (one folder for every Basecamp instance).
+static std::string legacyRoot()
 {
-    if (const char* e = std::getenv("REELCUT_HOME")) if (*e) return e;
     QString movies = QStandardPaths::writableLocation(QStandardPaths::MoviesLocation);
     if (movies.isEmpty()) movies = QDir::homePath() + "/Videos";
     return (movies + "/Reelcut").toStdString();
+}
+// The instance's own data folder (Basecamp's module_data, per --user-dir), set once the host says
+// the context is ready; REELCUT_HOME overrides; outside a host, the old folder.
+static std::string g_root;
+static std::string rootDir()
+{
+    if (const char* e = std::getenv("REELCUT_HOME")) if (*e) return e;
+    if (!g_root.empty()) return g_root;
+    return legacyRoot();
+}
+// A path inside Reelcut's folder, or the old one (jobs from before 0.5.0 stay where they were).
+static bool inOurFolders(const std::string& path)
+{
+    std::error_code ec;
+    const std::string p = fs::weakly_canonical(path, ec).string();
+    for (const std::string& r : {rootDir(), legacyRoot()}) {
+        const std::string c = fs::weakly_canonical(r, ec).string();
+        if (!c.empty() && (p == c || p.rfind(c + "/", 0) == 0)) return true;
+    }
+    return false;
+}
+// A picture for the view: the file, with its change time after '#' so a new picture has a new name.
+static std::string pictureRef(const std::string& path)
+{
+    std::error_code ec;
+    if (path.empty() || !fs::exists(path, ec)) return "";
+    auto t = fs::last_write_time(path, ec);
+    return path + "#" + std::to_string((long long)t.time_since_epoch().count());
 }
 
 static std::string readFile(const std::string& path)
@@ -405,6 +434,8 @@ struct Job {
     bool diarRetry = false;
     std::string brief;          // what the person looks for: topics, people, tone, keywords
     std::vector<int> chosen;    // the clips to cut, by number
+    std::vector<int> cutOnly;   // this cut: only these clips, the other reels kept (empty: all chosen, afresh)
+    std::vector<int> recut;     // clips framed anew since their reel was cut
     std::string intro, outro;   // cards (images in the library), "" for none
     std::string frame;          // one frame of the video, copied where the view may load it
     // Logos Storage: per place ("local", or a node's url) the CIDs of what went there: reel file name
@@ -422,7 +453,99 @@ struct Job {
     json forum = json::object(), forumPosted = json::object();
     std::string forumState, forumError;     // forumState "waiting" while the reels go into Storage first, "posting" while replies go out
     quint64 forumGen = 0;
+    // Framing by hand (issue #9). ratio: the reels' shape, "9:16" (default), "4:5" or "1:1".
+    // scenes: reelcut scenes' answer per clip number {start, end, line, scenes: [{start, end, frame
+    // (where the view may load it), faces, suggest}]}; scenesState "" | running | done | failed.
+    // framing: per clip number {scenes: [{start, layout: crop|split|fit, boxes: [[x, y, w, h], …]}]},
+    // only the clips the person framed; the others are cut as the layout says.
+    std::string ratio = "9:16";
+    json scenes = json::object(), framing = json::object();
+    std::string scenesState, scenesError;
+    bool scenesPulled = false;  // scenes met an image without the command: pulled once, not again
+    int scenesGen = 0;
+    int scenesI = 0, scenesN = 0;   // clips done / all, while finding scenes
 };
+
+static const char* const kRatios[] = {"9:16", "4:5", "1:1"};
+static bool knownRatio(const std::string& r)
+{
+    for (auto* k : kRatios) if (r == k) return true;
+    return false;
+}
+
+// A clip's identity for its scenes and framing: they stay while its start, end and last word do.
+static std::string clipKey(const Clip& c) { return c.start + "|" + c.end + "|" + c.until; }
+
+// A framing from the view, checked: {scenes: [{start, layout, boxes}]}, each box four fractions.
+static bool cleanFraming(const json& in, json& out, std::string& error)
+{
+    if (!in.is_object() || !in.contains("scenes") || !in["scenes"].is_array() || in["scenes"].empty()) {
+        error = "A framing needs at least one scene.";
+        return false;
+    }
+    out = {{"scenes", json::array()}};
+    for (auto& sc : in["scenes"]) {
+        if (!sc.is_object() || !sc.contains("start") || !sc["start"].is_number()) { error = "Each scene needs its start."; return false; }
+        const std::string layout = jstr(sc, "layout", "");
+        if (layout == "panels") {
+            // Any number of pieces of the picture (src) placed on the reel (dst), over a background.
+            auto box4 = [&](const json& b, json& nb) {
+                if (!b.is_array() || b.size() != 4) { error = "A box is [x, y, w, h]."; return false; }
+                nb = json::array();
+                for (auto& v : b) {
+                    if (!v.is_number()) { error = "A box is four numbers."; return false; }
+                    nb.push_back(std::clamp(v.get<double>(), 0.0, 1.0));
+                }
+                if (nb[2].get<double>() < 0.01 || nb[3].get<double>() < 0.01) { error = "A box is too small."; return false; }
+                return true;
+            };
+            if (!sc.contains("panels") || !sc["panels"].is_array() || sc["panels"].empty() || sc["panels"].size() > 12) {
+                error = "A scene has 1 to 12 boxes."; return false;
+            }
+            json panels = json::array();
+            for (auto& p : sc["panels"]) {
+                if (!p.is_object() || !p.contains("src") || !p.contains("dst")) { error = "A box needs src and dst."; return false; }
+                json src, dst;
+                if (!box4(p["src"], src) || !box4(p["dst"], dst)) return false;
+                // The box's shape setting, for the editor: "keep", "free" or a preset like "9:16".
+                std::string ratio = jstr(p, "ratio", "keep");
+                static const QRegularExpression preset("^\\d{1,2}:\\d{1,2}$");
+                if (ratio != "keep" && ratio != "free" && !preset.match(QString::fromStdString(ratio)).hasMatch()) ratio = "keep";
+                panels.push_back({{"src", src}, {"dst", dst}, {"ratio", ratio}});
+            }
+            std::string bg = jstr(sc, "bg", "blur");
+            const bool hex = bg.size() == 7 && bg[0] == '#' &&
+                             std::all_of(bg.begin() + 1, bg.end(), [](unsigned char c) { return std::isxdigit(c); });
+            if (bg != "blur" && bg != "black" && !hex) bg = "blur";
+            out["scenes"].push_back({{"start", sc["start"].get<double>()}, {"layout", layout}, {"bg", bg}, {"panels", panels}});
+            continue;
+        }
+        const size_t need = layout == "crop" ? 1 : layout == "split" ? 2 : layout == "fit" ? 0 : 99;
+        if (need == 99) { error = "A scene's layout is crop, split, fit or panels."; return false; }
+        json boxes = json::array();
+        if (need) {
+            if (!sc.contains("boxes") || !sc["boxes"].is_array() || sc["boxes"].size() < need) {
+                error = layout + " needs " + std::to_string(need) + " box" + (need > 1 ? "es." : ".");
+                return false;
+            }
+            for (size_t i = 0; i < need; ++i) {
+                const json& b = sc["boxes"][i];
+                if (!b.is_array() || b.size() != 4) { error = "A box is [x, y, w, h]."; return false; }
+                json nb = json::array();
+                for (auto& v : b) {
+                    if (!v.is_number()) { error = "A box is four numbers."; return false; }
+                    nb.push_back(std::clamp(v.get<double>(), 0.0, 1.0));
+                }
+                if (nb[2].get<double>() < 0.01 || nb[3].get<double>() < 0.01) { error = "A box is too small."; return false; }
+                boxes.push_back(nb);
+            }
+        }
+        out["scenes"].push_back({{"start", sc["start"].get<double>()}, {"layout", layout}, {"boxes", boxes}});
+    }
+    std::sort(out["scenes"].begin(), out["scenes"].end(),
+              [](const json& a, const json& b) { return a["start"].get<double>() < b["start"].get<double>(); });
+    return true;
+}
 
 struct Running {
     QPointer<QProcess> proc;
@@ -448,6 +571,10 @@ struct ReelcutCorePrivate {
     std::string runnerPref = "auto";
     bool autoCut = true;
     bool diarize = true;        // tell the speakers apart after transcribing
+    int cores = 0;              // cores reelcut may use (0: all)
+    bool lowPriority = false;   // let everything else on the computer go first
+    static int allCores() { return std::max(1, (int)std::thread::hardware_concurrency()); }
+    int useCores() const { return cores > 0 ? std::min(cores, allCores()) : allCores(); }
 
     // detected
     std::string runner, runnerBin, runnerError;
@@ -537,12 +664,25 @@ struct ReelcutCorePrivate {
             b.forumError = jstr(x, "forumError", "");
             if (x.contains("chosen") && x["chosen"].is_array())
                 for (auto& n : x["chosen"]) if (n.is_number_integer()) b.chosen.push_back(n.get<int>());
+            if (x.contains("recut") && x["recut"].is_array())
+                for (auto& n : x["recut"]) if (n.is_number_integer()) b.recut.push_back(n.get<int>());
+            if (x.contains("cutOnly") && x["cutOnly"].is_array())
+                for (auto& n : x["cutOnly"]) if (n.is_number_integer()) b.cutOnly.push_back(n.get<int>());
+            b.ratio = jstr(x, "ratio", "9:16");
+            if (!knownRatio(b.ratio)) b.ratio = "9:16";
+            if (x.contains("scenes") && x["scenes"].is_object()) b.scenes = x["scenes"];
+            if (x.contains("framing") && x["framing"].is_object()) b.framing = x["framing"];
+            b.scenesState = b.scenes.empty() ? "" : "done";
             if (b.id.empty() || b.dir.empty()) continue;
             // Whatever ran when Basecamp closed did not finish.
+            // A finished job left "running" by a scene search (0.3.x): finished.
+            if (b.status == "running" && b.step == "done") b.status = "done";
+            if (b.status == "running" && b.step == "clips") b.status = "waiting";
             if (b.status == "running") { b.status = "cancelled"; b.error = "Stopped when Basecamp closed. Retry to run it again."; }
             jobs.push_back(b);
             loadReels(jobs.back());
             loadFrame(jobs.back());
+            loadScenes(jobs.back());
         }
     }
     void save()
@@ -556,10 +696,11 @@ struct ReelcutCorePrivate {
                            {"words", b.words}, {"speakers", b.spk}, {"speakersWanted", b.speakersWanted},
                            {"layout", b.layout}, {"vw", b.vw}, {"vh", b.vh}, {"fetched", b.fetched},
                            {"transcribed", b.transcribed}, {"probed", b.probed}, {"diar", b.diar},
-                           {"brief", b.brief}, {"chosen", b.chosen}, {"intro", b.intro}, {"outro", b.outro},
+                           {"brief", b.brief}, {"chosen", b.chosen}, {"recut", b.recut}, {"cutOnly", b.cutOnly}, {"intro", b.intro}, {"outro", b.outro},
                            {"stored", b.stored}, {"youtube", b.yt}, {"youtubeError", b.ytError},
                            {"youtubeReply", b.ytReply}, {"forum", b.forum}, {"forumPosted", b.forumPosted},
-                           {"forumError", b.forumError}});
+                           {"forumError", b.forumError}, {"ratio", b.ratio}, {"scenes", scenesOnDisk(b)},
+                           {"framing", b.framing}});
         std::error_code ec;
         fs::create_directories(rootDir(), ec);
         json st = settingsJson();
@@ -572,7 +713,8 @@ struct ReelcutCorePrivate {
                 {"autoCount", autoCount}, {"min", minLen}, {"max", maxLen}, {"lead", lead}, {"tail", tail}, {"fade", fade},
                 {"card", card}, {"brief", brief}, {"intro", intro}, {"outro", outro}, {"captionMargin", captionMargin},
                 {"colour", colour}, {"sayingColour", sayingColour}, {"saidColour", saidColour},
-                {"storeTo", storeTo}, {"storeNode", storeNode}, {"forumAlias", forumAlias}};
+                {"storeTo", storeTo}, {"storeNode", storeNode}, {"forumAlias", forumAlias},
+                {"cores", cores}, {"allCores", allCores()}, {"lowPriority", lowPriority}};
     }
     static double jdbl(const json& o, const char* k, double def)
     {
@@ -591,6 +733,8 @@ struct ReelcutCorePrivate {
         fade = std::clamp(jdbl(s, "fade", fade), 0.0, 3.0);
         card = std::clamp(jdbl(s, "card", card), 0.5, 10.0);
         captionMargin = (int)std::clamp<int64_t>(jnum(s, "captionMargin", captionMargin), -1, 1800);
+        cores = (int)std::clamp<int64_t>(jnum(s, "cores", cores), 0, allCores());
+        lowPriority = jbool(s, "lowPriority", lowPriority);
         if (s.contains("storeTo") && s["storeTo"].is_string()) {
             const std::string t = s["storeTo"].get<std::string>();
             if (t == "" || t == "local" || t == "node") storeTo = t;
@@ -653,6 +797,8 @@ struct ReelcutCorePrivate {
         if (!containerRunner()) return reelcutArgs;
         a << "run" << "--rm" << "--name" << QString::fromStdString(name)
           << "-v" << QString::fromStdString(b.dir) + (runner == "podman" ? ":/work:z" : ":/work");
+        // At most this many cores' worth of CPU, and reelcut sizes its threads to it.
+        if (cores > 0) a << QString("--cpus=%1").arg(useCores()) << "-e" << QString("REELCUT_CORES=%1").arg(useCores());
         if (runner == "docker") a << "--user" << QString("%1:%2").arg(::getuid()).arg(::getgid());
         else a << "--userns" << "keep-id";
         if (entrypoint) a << "--entrypoint" << entrypoint;
@@ -715,8 +861,11 @@ struct ReelcutCorePrivate {
                           {"page", fs::exists(page, ec) ? page : ""},
                           {"speakers", b.spk}, {"speakersWanted", b.speakersWanted}, {"layout", b.layout},
                           {"width", b.vw}, {"height", b.vh}, {"frame", b.frame},
-                          {"brief", b.brief}, {"chosen", b.chosen}, {"intro", b.intro}, {"outro", b.outro},
+                          {"brief", b.brief}, {"chosen", b.chosen}, {"recut", b.recut}, {"cutOnly", b.cutOnly}, {"intro", b.intro}, {"outro", b.outro},
                           {"storage", storage},
+                          {"ratio", b.ratio}, {"framing", b.framing},
+                          {"scenes", {{"state", b.scenesState}, {"error", b.scenesError}, {"clips", b.scenes},
+                                      {"i", b.scenesI}, {"n", b.scenesN}}},
                           {"forum", {{"target", b.forum}, {"state", b.forumState}, {"error", b.forumError}}},
                           {"youtube", {{"state", b.ytState}, {"error", b.ytError}, {"who", b.ytWho},
                                        {"reply", b.ytError.empty() ? "" : b.ytReply.substr(0, 4000)}}}});
@@ -798,7 +947,11 @@ struct ReelcutCorePrivate {
         p->setProcessEnvironment(processEnv());
         p->setWorkingDirectory(QString::fromStdString(b.dir));
         // Its own process group, so cancel stops reelcut's helpers (parakeet, ffmpeg) too.
-        p->setChildProcessModifier([] { ::setsid(); });
+        // Low priority when asked: everything else on the computer goes first (podman's conmon and
+        // the container inherit it). It slows reelcut only while something else wants the CPU.
+        const bool nice = lowPriority;
+        p->setChildProcessModifier([nice] { ::setsid(); if (nice) (void)::setpriority(PRIO_PROCESS, 0, 10); });
+        if (cores > 0) { auto env = p->processEnvironment(); env.insert("REELCUT_CORES", QString::number(useCores())); p->setProcessEnvironment(env); }
         auto out = std::make_shared<std::string>();
         const std::string id = b.id;
         const bool heavySlot = slot == "heavy";
@@ -809,8 +962,12 @@ struct ReelcutCorePrivate {
             rm.waitForFinished(20000);
         }
         procs[slot] = Running{p, id, container, false};
-        b.status = "running";
-        b.error.clear();
+        // Finding scenes runs beside the job: it says so in scenes.state, and leaves the job's own
+        // status alone (it used to mark a finished job running for good, and lock its clip list).
+        if (slot.rfind("scenes/", 0) != 0) {
+            b.status = "running";
+            b.error.clear();
+        }
         QObject::connect(p, &QProcess::readyReadStandardOutput, guarded("stdout", [this, p, out, id] {
             QByteArray chunk = p->readAllStandardOutput();
             out->append(chunk.constData(), chunk.size());
@@ -818,6 +975,7 @@ struct ReelcutCorePrivate {
                 for (auto& l : QString::fromUtf8(chunk).split('\n')) {
                     // cut prints one line per reel it wrote.
                     if (j->step == "cut" && l.contains(".mp4 ")) j->progressI++;
+                    if (j->scenesState == "running" && l.startsWith("clip ")) j->scenesI++;
                     logLine(*j, l.toStdString());
                 }
                 changed();
@@ -914,7 +1072,7 @@ struct ReelcutCorePrivate {
         if (b.diar == "after" && b.transcribed) b.diar = "wanted";
         // Side by side only with cores to spare: transcribe takes four, diarize four more. On a
         // 4-core machine the two together took longer than one after the other (257 s against 185 s).
-        static const bool spare = std::thread::hardware_concurrency() >= 8;
+        const bool spare = useCores() >= 8;
         if (audio && b.diar == "wanted" && (spare || b.transcribed) && !busy("diarize/" + id)) startDiarize(b);
         // the frame, once the video is down
         if (b.fetched && !b.probed && (b.duration > 0 || b.transcribed) && !busy("probe/" + id)) startProbe(b);
@@ -954,21 +1112,28 @@ struct ReelcutCorePrivate {
         if (!a.empty()) b.activity = a;
     }
 
-    void pullImage(Job& b)
+    // forScenes: for the scene search beside the job, which leaves the job's status as it is.
+    void pullImage(Job& b, bool forScenes = false)
     {
         const bool had = imagePresent;
-        launch(b, "pull", runnerBin, {"pull", kImage}, "", [this, id = b.id, had](bool ok, const std::string&) {
+        const std::string before = b.status, beforeError = b.error;
+        launch(b, "pull", runnerBin, {"pull", kImage}, "", [this, id = b.id, had, forScenes](bool ok, const std::string&) {
             Job* j = find(id);
             // Tried either way, so an offline machine doesn't try before every job.
             lastPull = QDateTime::currentMSecsSinceEpoch();
             forcePull = false;
-            if (!ok && !had) { if (j) finishStep(*j, "Could not download the reelcut image. " + lastLog(*j)); return; }
+            if (!ok && !had) {
+                if (j && forScenes) { j->scenesState = "failed"; j->scenesError = "Could not download the reelcut image. " + lastLog(*j); sideDone(); return; }
+                if (j) finishStep(*j, "Could not download the reelcut image. " + lastLog(*j));
+                return;
+            }
             if (!ok && j) logLine(*j, "Could not look for a newer image; using the one already here.");
             imagePresent = true;
             // A cut that waited for the image runs now.
-            if (j && !preparing(*j) && j->status == "running") j->status = "queued";
+            if (j && !forScenes && !preparing(*j) && j->status == "running") j->status = "queued";
             sideDone();
         });
+        if (forScenes) { b.status = before; b.error = beforeError; }
     }
 
     void startFetch(Job& b)
@@ -997,6 +1162,36 @@ struct ReelcutCorePrivate {
             j->fetched = true;
             sideDone();
         });
+    }
+
+    // The video again, alone; the job then goes on with the step it failed in.
+    void refetchVideo(Job& b, bool pulled = false)
+    {
+        const std::string name = "reelcut-fetch-" + b.id;
+        b.status = "running";
+        logLine(b, "The video is not whole: downloading it again.");
+        launch(b, "fetch/" + b.id, runnerBin,
+               stepArgs(b, {"fetch", "--only", "video", QString::fromStdString(b.url), work(b, "")}, name, nullptr), name,
+               [this, id = b.id, pulled](bool ok, const std::string&) {
+            Job* j = find(id); if (!j) return;
+            if (!ok && !pulled && containerRunner() && logHas(*j, "unrecognized arguments") && !busy("pull")) {
+                // An image from before fetch --only: a newer one, then again.
+                logLine(*j, "This reelcut image can't download the video alone yet; getting a newer one.");
+                launch(*j, "pull", runnerBin, {"pull", kImage}, "", [this, id](bool ok, const std::string&) {
+                    Job* j = find(id); if (!j) return;
+                    lastPull = QDateTime::currentMSecsSinceEpoch();
+                    if (!ok) { finishStep(*j, "Could not download a newer reelcut image. " + lastLog(*j)); return; }
+                    refetchVideo(*j, true);
+                });
+                return;
+            }
+            if (!ok) { finishStep(*j, "Downloading the video again failed. " + lastLog(*j)); return; }
+            j->status = "queued";
+            finishStep(*j, "");
+        });
+        describe(b);
+        save();
+        changed();
     }
 
     void startTranscribe(Job& b)
@@ -1080,24 +1275,33 @@ struct ReelcutCorePrivate {
         if (containerRunner() && (!imagePresent || forcePull)) { if (!busy("pull")) pullImage(b); return; }
         const std::string name = "reelcut-" + b.id;
         if (b.step == "cut") {
-            b.activity = "Cutting the reels";
-            // New reels: what Storage holds is of the old ones.
-            b.stored = json::object();
-            b.storing.clear();
+            const std::vector<int> only = b.cutOnly;
+            b.activity = only.empty() ? "Cutting the reels" : "Cutting again: clip " + [&] { std::string t; for (int n : only) t += (t.empty() ? "" : ", ") + std::to_string(n); return t; }();
             std::error_code ec;
             fs::create_directories(b.dir + "/reels", ec);
-            for (auto& e : fs::directory_iterator(b.dir + "/reels", ec))
-                if (e.path().extension() == ".mp4" || e.path().extension() == ".ass" || e.path().extension() == ".jpg" || e.path().extension() == ".dur")
+            // A clip's reel files start with its number: "03-…".
+            auto ofClip = [](const fs::path& f) { return std::atoi(f.filename().string().substr(0, f.filename().string().find('-')).c_str()); };
+            auto replaced = [&](const fs::path& f) { return only.empty() || std::find(only.begin(), only.end(), ofClip(f)) != only.end(); };
+            for (auto& e : fs::directory_iterator(b.dir + "/reels", ec)) {
+                const auto x = e.path().extension();
+                if ((x == ".mp4" || x == ".ass" || x == ".jpg" || x == ".dur") && replaced(e.path())) {
+                    // What Storage holds of a replaced reel is of the old one.
+                    for (auto& [place, files] : b.stored.items()) if (files.is_object()) files.erase(e.path().filename().string());
+                    b.storing.erase(e.path().filename().string());
                     fs::remove(e.path(), ec);
+                }
+            }
+            if (only.empty()) { b.stored = json::object(); b.storing.clear(); }
+            else for (auto& [place, files] : b.stored.items()) if (files.is_object()) files.erase("reels.json");
             writeFile(b.dir + "/clips.txt", b.clipsText + "\n");
             QStringList args{"cut", work(b, ""), work(b, "clips.txt"), work(b, "reels")};
             for (auto& f : fixList(b.fixes)) args << "--fix" << QString::fromStdString(f);
             if (!b.layout.empty()) args << "--frame" << QString::fromStdString(b.layout);
             std::string who = speakersArg(b);
             if (!who.empty()) args << "--speakers" << QString::fromStdString(who);
-            QStringList only;
-            for (int n : b.chosen) only << QString::number(n);
-            if (!only.isEmpty()) args << "--only" << only.join(",");
+            QStringList which;
+            for (int n : (only.empty() ? b.chosen : only)) which << QString::number(n);
+            if (!which.isEmpty()) args << "--only" << which.join(",");
             args << "--lead" << QString::number(lead) << "--tail" << QString::number(tail) << "--fade" << QString::number(fade);
             // The cards go into the job's folder, where the container sees them.
             for (auto [flag, path, name] : {std::tuple<const char*, std::string, std::string>{"--intro", b.intro, "card-intro"},
@@ -1113,7 +1317,17 @@ struct ReelcutCorePrivate {
             if (!colour.empty()) args << "--colour" << QString::fromStdString(colour);
             if (!sayingColour.empty()) args << "--saying-colour" << QString::fromStdString(sayingColour);
             if (!saidColour.empty()) args << "--said-colour" << QString::fromStdString(saidColour);
-            b.progressN = b.chosen.empty() ? (int)parseClips(b.clipsText).size() : (int)b.chosen.size();
+            // The shape and the framing by hand: only when set, so an older image still cuts the rest.
+            if (b.ratio != "9:16") args << "--ratio" << QString::fromStdString(b.ratio);
+            dropStale(b);
+            if (!b.framing.empty()) {
+                json clips = json::object();
+                for (auto& [n, f] : b.framing.items())
+                    clips[n] = {{"ratio", b.ratio}, {"scenes", f.contains("scenes") ? f["scenes"] : json::array()}};
+                writeFile(b.dir + "/framing.json", json({{"clips", clips}}).dump(1));
+                args << "--framing" << work(b, "framing.json");
+            }
+            b.progressN = !only.empty() ? (int)only.size() : b.chosen.empty() ? (int)parseClips(b.clipsText).size() : (int)b.chosen.size();
             launch(b, "heavy", runnerBin, stepArgs(b, args, name, nullptr), name, [this, id = b.id](bool ok, const std::string& out) {
                 Job* j = find(id); if (!j) return;
                 if (!ok && !j->newerTried && containerRunner() && logHas(*j, "unrecognized arguments")) {
@@ -1125,8 +1339,13 @@ struct ReelcutCorePrivate {
                     finishStep(*j, "");
                     return;
                 }
-                if (!ok) { finishStep(*j, "Cutting failed. " + lastLog(*j)); return; }
+                if (!ok) { j->cutOnly.clear(); finishStep(*j, "Cutting failed. " + lastLog(*j)); return; }
                 (void)out;
+                // What was cut is up to date with its framing.
+                if (j->cutOnly.empty()) j->recut.clear();
+                else j->recut.erase(std::remove_if(j->recut.begin(), j->recut.end(), [&](int n) {
+                    return std::find(j->cutOnly.begin(), j->cutOnly.end(), n) != j->cutOnly.end(); }), j->recut.end());
+                j->cutOnly.clear();
                 j->step = "thumbs"; j->status = "queued";
                 finishStep(*j, "");
             });
@@ -1275,7 +1494,7 @@ struct ReelcutCorePrivate {
         json a = json::array();
         std::error_code ec;
         for (auto& f : cardFiles()) {
-            std::string thumb;
+            std::string thumb = viewDir.empty() ? pictureRef(f.string()) : "";
             if (!viewDir.empty()) {
                 // The view may load images only from its own folder.
                 std::string dst = viewDir + "/cache/cards/" + f.filename().string();
@@ -1304,12 +1523,143 @@ struct ReelcutCorePrivate {
         b.frame.clear();
         std::error_code ec;
         const std::string src = b.dir + "/frame.jpg";
-        if (viewDir.empty() || !fs::exists(src, ec)) return;
+        if (viewDir.empty()) { b.frame = pictureRef(src); return; }
+        if (!fs::exists(src, ec)) return;
         std::string cache = viewDir + "/cache/" + b.id;
         fs::create_directories(cache, ec);
         std::string dst = cache + "/frame.jpg";
         fs::copy_file(src, dst, fs::copy_options::overwrite_existing, ec);
         if (!ec) b.frame = dst;
+    }
+
+    // scenes.json in the job's folder names the frames by file; the view loads them from its cache,
+    // a new folder each run (scenes-<n>) so it doesn't show the old pictures.
+    void loadScenes(Job& b)
+    {
+        json disk = json::parse(readFile(b.dir + "/scenes/scenes.json"), nullptr, false);
+        if (!disk.is_object() || !disk.contains("clips") || !disk["clips"].is_object()) return;
+        std::error_code ec;
+        const std::string cache = viewDir.empty() ? "" : viewDir + "/cache/" + b.id;
+        const std::string dir = cache.empty() ? "" : cache + "/scenes-" + std::to_string(++b.scenesGen);
+        if (!cache.empty()) {
+            for (auto& e : fs::directory_iterator(cache, ec))
+                if (e.path().filename().string().rfind("scenes-", 0) == 0) fs::remove_all(e.path(), ec);
+            fs::create_directories(dir, ec);
+        }
+        auto clips = parseClips(b.clipsText);
+        for (auto& [n, clip] : b.scenes.items()) {
+            if (!disk["clips"].contains(n) || !clip.is_object()) continue;
+            json fresh = disk["clips"][n];
+            if (!fresh.contains("scenes") || !fresh["scenes"].is_array()) continue;
+            for (auto& sc : fresh["scenes"]) {
+                const std::string f = jstr(sc, "frame", "");
+                const std::string src = b.dir + "/scenes/" + f;
+                std::string shown = viewDir.empty() && !f.empty() ? pictureRef(src) : "";
+                if (!dir.empty() && !f.empty() && fs::exists(src, ec)) {
+                    fs::copy_file(src, dir + "/" + f, fs::copy_options::overwrite_existing, ec);
+                    if (!ec) shown = dir + "/" + f;
+                }
+                sc["frame"] = shown;
+            }
+            fresh["line"] = jstr(clip, "line", "");
+            clip = fresh;
+        }
+    }
+    // What jobs.json keeps of the scenes: each clip's line, the rest is in scenes.json.
+    static json scenesOnDisk(const Job& b)
+    {
+        json out = json::object();
+        for (auto& [n, clip] : b.scenes.items())
+            if (clip.is_object()) out[n] = {{"line", jstr(clip, "line", "")}};
+        return out;
+    }
+    // Scenes and framings of clips that changed (other times, another last word) or are gone.
+    static void dropStale(Job& b)
+    {
+        std::map<std::string, std::string> now;
+        for (auto& c : parseClips(b.clipsText)) now[std::to_string(c.n)] = clipKey(c);
+        for (json* m : {&b.scenes, &b.framing}) {
+            json keep = json::object();
+            for (auto& [n, v] : m->items()) {
+                auto it = now.find(n);
+                if (it != now.end() && jstr(v, "line", "") == it->second) keep[n] = v;
+            }
+            *m = keep;
+        }
+        if (b.scenes.empty() && b.scenesState == "done") b.scenesState = "";
+    }
+
+    // The scenes of every clip: a frame of each, the faces in it, boxes to start from. Beside the queue: it reads the video and a few frames, quickly.
+    void startScenes(Job& b)
+    {
+        if (runner.empty()) { b.scenesState = "failed"; b.scenesError = runnerError.empty() ? "No way to run reelcut here." : runnerError; changed(); return; }
+        if (containerRunner() && !imageChecked) {
+            imageChecked = true;
+            QProcess p; p.setProcessEnvironment(processEnv());
+            p.start(QString::fromStdString(runnerBin), runner == "podman" ? QStringList{"image", "exists", kImage}
+                                                                           : QStringList{"image", "inspect", kImage});
+            imagePresent = p.waitForFinished(15000) && p.exitCode() == 0;
+        }
+        if (containerRunner() && (!imagePresent || forcePull)) {
+            b.scenesState = "running";
+            if (!busy("pull")) pullImage(b, true);
+            // After the pull, again.
+            QTimer::singleShot(3000, guarded("scenes-pull", [this, id = b.id] {
+                Job* j = find(id);
+                if (j && j->scenesState == "running" && !busy("scenes/" + id)) startScenes(*j);
+            }));
+            changed();
+            return;
+        }
+        if (busy("pull")) {
+            QTimer::singleShot(3000, guarded("scenes-pull", [this, id = b.id] {
+                Job* j = find(id);
+                if (j && j->scenesState == "running" && !busy("scenes/" + id)) startScenes(*j);
+            }));
+            return;
+        }
+        const std::string name = "reelcut-scenes-" + b.id;
+        writeFile(b.dir + "/clips.txt", b.clipsText + "\n");
+        std::error_code ec;
+        fs::remove_all(b.dir + "/scenes", ec);
+        QStringList args{"scenes", work(b, ""), work(b, "clips.txt"), work(b, "scenes"),
+                         "--lead", QString::number(lead), "--tail", QString::number(tail)};
+        b.scenesState = "running";
+        b.scenesError.clear();
+        b.scenesI = 0; b.scenesN = (int)parseClips(b.clipsText).size();
+        launch(b, "scenes/" + b.id, runnerBin, stepArgs(b, args, name, nullptr), name, [this, id = b.id, started = b.clipsText](bool ok, const std::string&) {
+            Job* j = find(id); if (!j) return;
+            if (!ok && !j->scenesPulled && containerRunner() && (logHas(*j, "invalid choice") || logHas(*j, "unrecognized arguments"))) {
+                // An image from before framing by hand: a newer one, then again.
+                j->scenesPulled = true;
+                forcePull = true;
+                logLine(*j, "This reelcut image can't find scenes yet; looking for a newer one.");
+                startScenes(*j);
+                return;
+            }
+            if (!ok) {
+                j->scenesState = "failed";
+                j->scenesError = "Could not find the scenes. " + lastLog(*j);
+                sideDone();
+                return;
+            }
+            // Each clip with its line, so a changed clip drops its scenes.
+            json disk = json::parse(readFile(j->dir + "/scenes/scenes.json"), nullptr, false);
+            json fresh = json::object();
+            if (disk.is_object() && disk.contains("clips") && disk["clips"].is_object())
+                for (auto& c : parseClips(j->clipsText)) {
+                    const std::string n = std::to_string(c.n);
+                    if (disk["clips"].contains(n)) fresh[n] = {{"line", clipKey(c)}};
+                }
+            j->scenes = fresh;
+            loadScenes(*j);
+            j->scenesState = "done";
+            sideDone();
+            // The clips changed meanwhile: their scenes too.
+            if (j->clipsText != started && !parseClips(j->clipsText).empty())
+                QTimer::singleShot(0, guarded("scenes-again", [this, id] { if (Job* k = find(id)) if (!busy("scenes/" + id)) startScenes(*k); }));
+        });
+        changed();
     }
 
     void pageThenDone(Job& b, const QString& title)
@@ -1832,6 +2182,8 @@ struct ReelcutCorePrivate {
         else { j.step = "clips"; j.status = "waiting"; }
         save(); changed();
         schedule();
+        // The scenes now, in the background: framing by hand is the usual next step.
+        if (!busy("scenes/" + j.id)) startScenes(j);
     }
     void pickFailed(Job& b, const std::string& why)
     {
@@ -2399,6 +2751,7 @@ struct ReelcutCorePrivate {
             double real = QString::fromStdString(trim(readFile((f.parent_path() / (stem + ".dur")).string()))).toDouble();
             if (real > 0) r.seconds = real;
             std::string jpg = (f.parent_path() / (stem + ".jpg")).string();
+            if (viewDir.empty()) r.thumb = pictureRef(jpg);
             if (!viewDir.empty() && fs::exists(jpg, ec)) {
                 std::string cache = viewDir + "/cache/" + b.id;
                 fs::create_directories(cache, ec);
@@ -2496,9 +2849,25 @@ struct ReelcutCorePrivate {
 
 ReelcutCoreImpl::ReelcutCoreImpl() : d(new ReelcutCorePrivate(this))
 {
-    // A damaged jobs.json must never stop the module from loading.
-    try { d->load(); }
-    catch (const std::exception& e) { std::fprintf(stderr, "[reelcut_core] load: %s\n", e.what()); d->jobs.clear(); }
+    // The jobs are read in onContextReady, once the host has said where this instance keeps its data.
+}
+
+// Before 0.5.0 every Basecamp instance shared ~/Videos/Reelcut. The first instance to start takes
+// over its list, cards and forum key; the job folders stay where they are (they open and play from
+// there), and the old list is renamed so a second instance doesn't take the same jobs.
+static void adoptLegacy(const std::string& root)
+{
+    std::error_code ec;
+    const std::string old = legacyRoot();
+    if (root.empty() || old == root || fs::exists(root + "/jobs.json", ec) || !fs::exists(old + "/jobs.json", ec)) return;
+    fs::create_directories(root, ec);
+    fs::copy_file(old + "/jobs.json", root + "/jobs.json", ec);
+    if (ec) { std::fprintf(stderr, "[reelcut_core] could not take over %s/jobs.json: %s\n", old.c_str(), ec.message().c_str()); return; }
+    if (fs::exists(old + "/.cards", ec)) fs::copy(old + "/.cards", root + "/.cards", fs::copy_options::recursive | fs::copy_options::skip_existing, ec);
+    if (fs::exists(old + "/.forum-key", ec)) fs::copy_file(old + "/.forum-key", root + "/.forum-key", fs::copy_options::skip_existing, ec);
+    fs::rename(old + "/jobs.json", old + "/jobs.json.moved", ec);
+    std::ofstream(old + "/MOVED.txt") << "Reelcut's list of jobs moved to " << root
+                                      << " (Basecamp's data folder for this instance). The job folders here are still used.\n";
 }
 
 ReelcutCoreImpl::~ReelcutCoreImpl()
@@ -2524,6 +2893,14 @@ ReelcutCoreImpl::~ReelcutCoreImpl()
 
 void ReelcutCoreImpl::onContextReady()
 {
+    const std::string data = instancePersistencePath();
+    if (!data.empty()) {
+        g_root = data;
+        if (!std::getenv("REELCUT_HOME")) adoptLegacy(g_root);
+    }
+    // A damaged jobs.json must never stop the module from loading.
+    try { d->load(); }
+    catch (const std::exception& e) { std::fprintf(stderr, "[reelcut_core] load: %s\n", e.what()); d->jobs.clear(); }
     // No calls to other modules here (Basecamp 0.3 rejects them).
     QTimer::singleShot(0, guarded("start", [this] { d->detectRunner(); d->detectLocalAgent(); d->changed(); d->schedule(); }));
 }
@@ -2538,7 +2915,7 @@ std::string ReelcutCoreImpl::setViewDir(const std::string& dir)
     std::string p = localPathFrom(dir);
     while (p.size() > 1 && p.back() == '/') p.pop_back();
     d->viewDir = p;
-    for (auto& b : d->jobs) { d->loadReels(b); d->loadFrame(b); }
+    for (auto& b : d->jobs) { d->loadReels(b); d->loadFrame(b); d->loadScenes(b); }
     return d->state().dump();
 }
 
@@ -2661,7 +3038,10 @@ std::string ReelcutCoreImpl::setClips(const std::string& jobId, const std::strin
     auto clips = parseClips(clipsText);
     if (clips.empty() && !trim(clipsText).empty())
         return json({{"ok", false}, {"error", "No clip lines in that. Each clip is one line: N | START H:MM:SS | END H:MM:SS | speaker | hook | until LASTWORD"}}).dump();
+    const bool changedClips = b->clipsText != ::clipsText(clips);
     b->clipsText = ::clipsText(clips);
+    ReelcutCorePrivate::dropStale(*b);
+    if (changedClips && !clips.empty() && !d->busy("scenes/" + b->id)) d->startScenes(*b);
     // Ticks for clips that are gone go too.
     std::vector<int> keep;
     for (int n : b->chosen) for (auto& c : clips) if (c.n == n) { keep.push_back(n); break; }
@@ -2682,6 +3062,32 @@ std::string ReelcutCoreImpl::cutReels(const std::string& jobId, const std::strin
     if (parseClips(b->clipsText).empty())
         return json({{"ok", false}, {"error", "There are no clips to cut. One line per clip: N | START | END | speaker | hook | until LASTWORD"}}).dump();
     b->fixes = fixesText;
+    b->cutOnly.clear();
+    b->step = "cut"; b->status = "queued"; b->error.clear();
+    d->save();
+    d->schedule();
+    d->changed();
+    return d->state().dump();
+}
+
+std::string ReelcutCoreImpl::cutClips(const std::string& jobId, const std::string& fixesText, const std::string& clipsJson)
+{
+    // Only these clips again; the other reels stay as they are.
+    Job* b = d->find(jobId);
+    if (!b) return json({{"ok", false}, {"error", "No such job."}}).dump();
+    if (b->status == "running" || b->status == "queued") return json({{"ok", false}, {"error", "Wait for the current step to finish."}}).dump();
+    json want = json::parse(clipsJson, nullptr, false);
+    if (!want.is_array() || want.empty()) return json({{"ok", false}, {"error", "Which clips?"}}).dump();
+    auto clips = parseClips(b->clipsText);
+    std::vector<int> only;
+    for (auto& n : want) {
+        if (!n.is_number_integer()) continue;
+        const int v = n.get<int>();
+        if (std::any_of(clips.begin(), clips.end(), [&](const Clip& c) { return c.n == v; }) && std::find(only.begin(), only.end(), v) == only.end()) only.push_back(v);
+    }
+    if (only.empty()) return json({{"ok", false}, {"error", "No such clips."}}).dump();
+    b->fixes = fixesText;
+    b->cutOnly = only;
     b->step = "cut"; b->status = "queued"; b->error.clear();
     d->save();
     d->schedule();
@@ -2705,9 +3111,13 @@ std::string ReelcutCoreImpl::retryJob(const std::string& jobId)
     if (!b) return json({{"ok", false}, {"error", "No such job."}}).dump();
     if (b->status == "running" || b->status == "queued") return d->state().dump();
     if (d->runner.empty() || !d->runnerError.empty()) d->detectRunner();
+    // The video came down cut short (yt-dlp said done): the video again, the transcript kept, then the step.
+    const bool badVideo = b->error.find("cannot read the picture") != std::string::npos && b->file.empty() && !b->url.empty();
     b->error.clear();
+    if (badVideo && !d->runner.empty() && !d->busy("fetch/" + b->id)) { d->refetchVideo(*b); return d->state().dump(); }
     if (b->step == "pick" || b->step == "clips") { d->startPick(*b, b->agent.empty() ? d->agent : b->agent); return d->state().dump(); }
-    if (b->step == "done" || b->step == "speakers") return d->state().dump();
+    if (b->step == "done") { b->status = "done"; d->save(); d->changed(); return d->state().dump(); }
+    if (b->step == "speakers") { b->status = "waiting"; d->save(); d->changed(); return d->state().dump(); }
     b->status = "queued";
     d->save();
     d->schedule();
@@ -2724,7 +3134,7 @@ std::string ReelcutCoreImpl::removeJob(const std::string& jobId, bool deleteFile
     d->jobs.erase(std::remove_if(d->jobs.begin(), d->jobs.end(), [&](const Job& x) { return x.id == id; }), d->jobs.end());
     std::error_code ec;
     // Only ever a job folder inside the Reelcut folder.
-    if (deleteFiles && dir.rfind(rootDir() + "/", 0) == 0 && dir.find("/../") == std::string::npos) fs::remove_all(dir, ec);
+    if (deleteFiles && inOurFolders(dir) && dir != rootDir() && dir != legacyRoot() && dir.find("/../") == std::string::npos) fs::remove_all(dir, ec);
     if (!d->viewDir.empty()) fs::remove_all(d->viewDir + "/cache/" + id, ec);
     d->save();
     d->changed();
@@ -2765,13 +3175,26 @@ std::string ReelcutCoreImpl::openUrl(const std::string& url)
     return spawnOpen(url);
 }
 
+std::string ReelcutCoreImpl::picture(const std::string& ref)
+{
+    // For the view's SandboxImages: the bytes of a picture of ours, as a data URL.
+    std::string path = localPathFrom(ref.substr(0, ref.rfind('#')));
+    std::error_code ec;
+    const std::string ext = QString::fromStdString(fs::path(path).extension().string()).toLower().toStdString();
+    const char* mime = ext == ".jpg" || ext == ".jpeg" ? "image/jpeg" : ext == ".png" ? "image/png" : ext == ".webp" ? "image/webp" : nullptr;
+    if (!mime || !inOurFolders(path) || !fs::is_regular_file(path, ec)) return json({{"ok", false}, {"error", "Not a picture of Reelcut's."}}).dump();
+    if (fs::file_size(path, ec) > 6u * 1024 * 1024) return json({{"ok", false}, {"error", "The picture is too big to show."}}).dump();
+    QFile f(QString::fromStdString(path));
+    if (!f.open(QIODevice::ReadOnly)) return json({{"ok", false}, {"error", "Could not read the picture."}}).dump();
+    return json({{"ok", true}, {"data", std::string("data:") + mime + ";base64," + f.readAll().toBase64().toStdString()}}).dump();
+}
+
 std::string ReelcutCoreImpl::openPath(const std::string& path)
 {
     std::error_code ec;
     fs::path p = fs::weakly_canonical(localPathFrom(path), ec);
-    fs::path root = fs::weakly_canonical(rootDir(), ec);
-    std::string ps = p.string(), rs = root.string();
-    if (ps.rfind(rs + "/", 0) != 0 && ps != rs) return json({{"ok", false}, {"error", "Only files in the Reelcut folder open."}}).dump();
+    std::string ps = p.string();
+    if (!inOurFolders(ps)) return json({{"ok", false}, {"error", "Only files in the Reelcut folder open."}}).dump();
     if (!fs::exists(p, ec)) return json({{"ok", false}, {"error", "It is not there any more."}}).dump();
     return spawnOpen(ps);
 }
@@ -2853,6 +3276,11 @@ std::string ReelcutCoreImpl::setJob(const std::string& jobId, const std::string&
         (std::string(k) == "intro" ? b->intro : b->outro) = v;
         (std::string(k) == "intro" ? d->intro : d->outro) = v;
     }
+    if (o.contains("ratio") && o["ratio"].is_string()) {
+        const std::string r = o["ratio"].get<std::string>();
+        if (!knownRatio(r)) return json({{"ok", false}, {"error", "The ratio is 9:16, 4:5 or 1:1."}}).dump();
+        b->ratio = r;
+    }
     if (o.contains("chosen") && o["chosen"].is_array()) {
         auto clips = parseClips(b->clipsText);
         b->chosen.clear();
@@ -2860,6 +3288,44 @@ std::string ReelcutCoreImpl::setJob(const std::string& jobId, const std::string&
             if (n.is_number_integer())
                 for (auto& c : clips) if (c.n == n.get<int>()) { b->chosen.push_back(c.n); break; }
     }
+    d->save();
+    d->changed();
+    return d->state().dump();
+}
+
+std::string ReelcutCoreImpl::findScenes(const std::string& jobId)
+{
+    Job* b = d->find(jobId);
+    if (!b) return json({{"ok", false}, {"error", "No such job."}}).dump();
+    if (parseClips(b->clipsText).empty()) return json({{"ok", false}, {"error", "There are no clips yet."}}).dump();
+    if (d->busy("scenes/" + jobId)) return d->state().dump();
+    d->startScenes(*b);
+    return d->state().dump();
+}
+
+std::string ReelcutCoreImpl::setFraming(const std::string& jobId, int64_t clip, const std::string& framingJson)
+{
+    Job* b = d->find(jobId);
+    if (!b) return json({{"ok", false}, {"error", "No such job."}}).dump();
+    const Clip* found = nullptr;
+    auto clips = parseClips(b->clipsText);
+    for (auto& c : clips) if (c.n == clip) found = &c;
+    if (!found) return json({{"ok", false}, {"error", "No such clip."}}).dump();
+    const std::string n = std::to_string(clip);
+    json in = json::parse(framingJson, nullptr, false);
+    if (trim(framingJson).empty() || in.is_null()) {
+        b->framing.erase(n);  // back to the automatic layout
+    } else {
+        json clean;
+        std::string error;
+        if (!cleanFraming(in, clean, error)) return json({{"ok", false}, {"error", error}}).dump();
+        clean["line"] = clipKey(*found);
+        b->framing[n] = clean;
+    }
+    // A reel of this clip was cut with the old framing: it wants cutting again.
+    const int cn = (int)clip;
+    if (std::any_of(b->reels.begin(), b->reels.end(), [&](const Reel& r) { return r.n == cn; }) &&
+        std::find(b->recut.begin(), b->recut.end(), cn) == b->recut.end()) b->recut.push_back(cn);
     d->save();
     d->changed();
     return d->state().dump();

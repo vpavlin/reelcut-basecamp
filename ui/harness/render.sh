@@ -9,10 +9,10 @@ if [ ! -x harness ] || [ harness.cpp -nt harness ]; then
   "$QB/libexec/moc" harness.cpp -o harness.moc
   g++ -std=c++17 -fPIC harness.cpp -o harness -I"$QB/include" -I"$QB/include/QtCore" -I"$QB/include/QtGui" \
     -I"$QDECL/include" -I"$QDECL/include/QtQml" -I"$QDECL/include/QtQuick" \
-    -L"$QB/lib" -L"$QDECL/lib" -lQt6Core -lQt6Gui -lQt6Qml -lQt6Quick
+    -L"$QB/lib" -L"$QDECL/lib" -lQt6Core -lQt6Gui -lQt6Qml -lQt6Quick -lQt6Test
 fi
 mkdir -p shots; rm -f shots/*.png
 export QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software QT_QUICK_CONTROLS_STYLE=Basic
 export QML2_IMPORT_PATH="$QDECL/lib/qt-6/qml:$DS" QML_IMPORT_PATH="$QDECL/lib/qt-6/qml:$DS"
 export LD_LIBRARY_PATH="$QB/lib:$QDECL/lib" CTL="${CTL:-$HOME/port-0.3/ctl.sh}"
-./harness "$HERE/../Main.qml" "$HERE/shots" "$1"
+./harness "$HERE/../qml/Main.qml" "$HERE/shots" "$1"

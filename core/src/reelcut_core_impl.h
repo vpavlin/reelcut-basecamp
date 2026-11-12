@@ -135,6 +135,8 @@ public:
 
     // Open a job's folder, a reel or its page with the system's default app. Only paths inside
     // the Reelcut folder open.
+    // A picture of Reelcut's (a reel's thumbnail, a frame) as a data URL, for the view's SandboxImages.
+    std::string picture(const std::string& ref);
     std::string openPath(const std::string& path);
 
     // Opens an http(s) link in the browser (the sandboxed view's Qt.openUrlExternally can't).

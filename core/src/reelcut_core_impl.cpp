@@ -45,7 +45,7 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-static const char* kVersion = "0.4.0";
+static const char* kVersion = "0.5.0";
 // Reelcut's own sessions on this computer's shrooms-agent: "reelcut-claude", "reelcut-pi".
 static const char* kLocalSession = "reelcut";
 static const char* kImage = "ghcr.io/vpavlin/reelcut:latest";
@@ -96,12 +96,40 @@ static auto guarded(const char* where, F fn)
     };
 }
 
-static std::string rootDir()
+// Where Reelcut kept everything before 0.5.0 (one folder for every Basecamp instance).
+static std::string legacyRoot()
 {
-    if (const char* e = std::getenv("REELCUT_HOME")) if (*e) return e;
     QString movies = QStandardPaths::writableLocation(QStandardPaths::MoviesLocation);
     if (movies.isEmpty()) movies = QDir::homePath() + "/Videos";
     return (movies + "/Reelcut").toStdString();
+}
+// The instance's own data folder (Basecamp's module_data, per --user-dir), set once the host says
+// the context is ready; REELCUT_HOME overrides; outside a host, the old folder.
+static std::string g_root;
+static std::string rootDir()
+{
+    if (const char* e = std::getenv("REELCUT_HOME")) if (*e) return e;
+    if (!g_root.empty()) return g_root;
+    return legacyRoot();
+}
+// A path inside Reelcut's folder, or the old one (jobs from before 0.5.0 stay where they were).
+static bool inOurFolders(const std::string& path)
+{
+    std::error_code ec;
+    const std::string p = fs::weakly_canonical(path, ec).string();
+    for (const std::string& r : {rootDir(), legacyRoot()}) {
+        const std::string c = fs::weakly_canonical(r, ec).string();
+        if (!c.empty() && (p == c || p.rfind(c + "/", 0) == 0)) return true;
+    }
+    return false;
+}
+// A picture for the view: the file, with its change time after '#' so a new picture has a new name.
+static std::string pictureRef(const std::string& path)
+{
+    std::error_code ec;
+    if (path.empty() || !fs::exists(path, ec)) return "";
+    auto t = fs::last_write_time(path, ec);
+    return path + "#" + std::to_string((long long)t.time_since_epoch().count());
 }
 
 static std::string readFile(const std::string& path)
@@ -1430,7 +1458,7 @@ struct ReelcutCorePrivate {
         json a = json::array();
         std::error_code ec;
         for (auto& f : cardFiles()) {
-            std::string thumb;
+            std::string thumb = viewDir.empty() ? pictureRef(f.string()) : "";
             if (!viewDir.empty()) {
                 // The view may load images only from its own folder.
                 std::string dst = viewDir + "/cache/cards/" + f.filename().string();
@@ -1459,7 +1487,8 @@ struct ReelcutCorePrivate {
         b.frame.clear();
         std::error_code ec;
         const std::string src = b.dir + "/frame.jpg";
-        if (viewDir.empty() || !fs::exists(src, ec)) return;
+        if (viewDir.empty()) { b.frame = pictureRef(src); return; }
+        if (!fs::exists(src, ec)) return;
         std::string cache = viewDir + "/cache/" + b.id;
         fs::create_directories(cache, ec);
         std::string dst = cache + "/frame.jpg";
@@ -1489,7 +1518,7 @@ struct ReelcutCorePrivate {
             for (auto& sc : fresh["scenes"]) {
                 const std::string f = jstr(sc, "frame", "");
                 const std::string src = b.dir + "/scenes/" + f;
-                std::string shown;
+                std::string shown = viewDir.empty() && !f.empty() ? pictureRef(src) : "";
                 if (!dir.empty() && !f.empty() && fs::exists(src, ec)) {
                     fs::copy_file(src, dir + "/" + f, fs::copy_options::overwrite_existing, ec);
                     if (!ec) shown = dir + "/" + f;
@@ -2686,6 +2715,7 @@ struct ReelcutCorePrivate {
             double real = QString::fromStdString(trim(readFile((f.parent_path() / (stem + ".dur")).string()))).toDouble();
             if (real > 0) r.seconds = real;
             std::string jpg = (f.parent_path() / (stem + ".jpg")).string();
+            if (viewDir.empty()) r.thumb = pictureRef(jpg);
             if (!viewDir.empty() && fs::exists(jpg, ec)) {
                 std::string cache = viewDir + "/cache/" + b.id;
                 fs::create_directories(cache, ec);
@@ -2783,9 +2813,25 @@ struct ReelcutCorePrivate {
 
 ReelcutCoreImpl::ReelcutCoreImpl() : d(new ReelcutCorePrivate(this))
 {
-    // A damaged jobs.json must never stop the module from loading.
-    try { d->load(); }
-    catch (const std::exception& e) { std::fprintf(stderr, "[reelcut_core] load: %s\n", e.what()); d->jobs.clear(); }
+    // The jobs are read in onContextReady, once the host has said where this instance keeps its data.
+}
+
+// Before 0.5.0 every Basecamp instance shared ~/Videos/Reelcut. The first instance to start takes
+// over its list, cards and forum key; the job folders stay where they are (they open and play from
+// there), and the old list is renamed so a second instance doesn't take the same jobs.
+static void adoptLegacy(const std::string& root)
+{
+    std::error_code ec;
+    const std::string old = legacyRoot();
+    if (root.empty() || old == root || fs::exists(root + "/jobs.json", ec) || !fs::exists(old + "/jobs.json", ec)) return;
+    fs::create_directories(root, ec);
+    fs::copy_file(old + "/jobs.json", root + "/jobs.json", ec);
+    if (ec) { std::fprintf(stderr, "[reelcut_core] could not take over %s/jobs.json: %s\n", old.c_str(), ec.message().c_str()); return; }
+    if (fs::exists(old + "/.cards", ec)) fs::copy(old + "/.cards", root + "/.cards", fs::copy_options::recursive | fs::copy_options::skip_existing, ec);
+    if (fs::exists(old + "/.forum-key", ec)) fs::copy_file(old + "/.forum-key", root + "/.forum-key", fs::copy_options::skip_existing, ec);
+    fs::rename(old + "/jobs.json", old + "/jobs.json.moved", ec);
+    std::ofstream(old + "/MOVED.txt") << "Reelcut's list of jobs moved to " << root
+                                      << " (Basecamp's data folder for this instance). The job folders here are still used.\n";
 }
 
 ReelcutCoreImpl::~ReelcutCoreImpl()
@@ -2811,6 +2857,14 @@ ReelcutCoreImpl::~ReelcutCoreImpl()
 
 void ReelcutCoreImpl::onContextReady()
 {
+    const std::string data = instancePersistencePath();
+    if (!data.empty()) {
+        g_root = data;
+        if (!std::getenv("REELCUT_HOME")) adoptLegacy(g_root);
+    }
+    // A damaged jobs.json must never stop the module from loading.
+    try { d->load(); }
+    catch (const std::exception& e) { std::fprintf(stderr, "[reelcut_core] load: %s\n", e.what()); d->jobs.clear(); }
     // No calls to other modules here (Basecamp 0.3 rejects them).
     QTimer::singleShot(0, guarded("start", [this] { d->detectRunner(); d->detectLocalAgent(); d->changed(); d->schedule(); }));
 }
@@ -3018,7 +3072,7 @@ std::string ReelcutCoreImpl::removeJob(const std::string& jobId, bool deleteFile
     d->jobs.erase(std::remove_if(d->jobs.begin(), d->jobs.end(), [&](const Job& x) { return x.id == id; }), d->jobs.end());
     std::error_code ec;
     // Only ever a job folder inside the Reelcut folder.
-    if (deleteFiles && dir.rfind(rootDir() + "/", 0) == 0 && dir.find("/../") == std::string::npos) fs::remove_all(dir, ec);
+    if (deleteFiles && inOurFolders(dir) && dir != rootDir() && dir != legacyRoot() && dir.find("/../") == std::string::npos) fs::remove_all(dir, ec);
     if (!d->viewDir.empty()) fs::remove_all(d->viewDir + "/cache/" + id, ec);
     d->save();
     d->changed();
@@ -3059,13 +3113,26 @@ std::string ReelcutCoreImpl::openUrl(const std::string& url)
     return spawnOpen(url);
 }
 
+std::string ReelcutCoreImpl::picture(const std::string& ref)
+{
+    // For the view's SandboxImages: the bytes of a picture of ours, as a data URL.
+    std::string path = localPathFrom(ref.substr(0, ref.rfind('#')));
+    std::error_code ec;
+    const std::string ext = QString::fromStdString(fs::path(path).extension().string()).toLower().toStdString();
+    const char* mime = ext == ".jpg" || ext == ".jpeg" ? "image/jpeg" : ext == ".png" ? "image/png" : ext == ".webp" ? "image/webp" : nullptr;
+    if (!mime || !inOurFolders(path) || !fs::is_regular_file(path, ec)) return json({{"ok", false}, {"error", "Not a picture of Reelcut's."}}).dump();
+    if (fs::file_size(path, ec) > 6u * 1024 * 1024) return json({{"ok", false}, {"error", "The picture is too big to show."}}).dump();
+    QFile f(QString::fromStdString(path));
+    if (!f.open(QIODevice::ReadOnly)) return json({{"ok", false}, {"error", "Could not read the picture."}}).dump();
+    return json({{"ok", true}, {"data", std::string("data:") + mime + ";base64," + f.readAll().toBase64().toStdString()}}).dump();
+}
+
 std::string ReelcutCoreImpl::openPath(const std::string& path)
 {
     std::error_code ec;
     fs::path p = fs::weakly_canonical(localPathFrom(path), ec);
-    fs::path root = fs::weakly_canonical(rootDir(), ec);
-    std::string ps = p.string(), rs = root.string();
-    if (ps.rfind(rs + "/", 0) != 0 && ps != rs) return json({{"ok", false}, {"error", "Only files in the Reelcut folder open."}}).dump();
+    std::string ps = p.string();
+    if (!inOurFolders(ps)) return json({{"ok", false}, {"error", "Only files in the Reelcut folder open."}}).dump();
     if (!fs::exists(p, ec)) return json({{"ok", false}, {"error", "It is not there any more."}}).dump();
     return spawnOpen(ps);
 }

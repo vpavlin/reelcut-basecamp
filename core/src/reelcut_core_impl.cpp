@@ -39,12 +39,13 @@
 #include <thread>
 #include <type_traits>
 #include <unistd.h>
+#include <sys/resource.h>
 #include <vector>
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-static const char* kVersion = "0.3.1";
+static const char* kVersion = "0.4.0";
 // Reelcut's own sessions on this computer's shrooms-agent: "reelcut-claude", "reelcut-pi".
 static const char* kLocalSession = "reelcut";
 static const char* kImage = "ghcr.io/vpavlin/reelcut:latest";
@@ -432,6 +433,7 @@ struct Job {
     std::string scenesState, scenesError;
     bool scenesPulled = false;  // scenes met an image without the command: pulled once, not again
     int scenesGen = 0;
+    int scenesI = 0, scenesN = 0;   // clips done / all, while finding scenes
 };
 
 static const char* const kRatios[] = {"9:16", "4:5", "1:1"};
@@ -455,8 +457,37 @@ static bool cleanFraming(const json& in, json& out, std::string& error)
     for (auto& sc : in["scenes"]) {
         if (!sc.is_object() || !sc.contains("start") || !sc["start"].is_number()) { error = "Each scene needs its start."; return false; }
         const std::string layout = jstr(sc, "layout", "");
+        if (layout == "panels") {
+            // Any number of pieces of the picture (src) placed on the reel (dst), over a background.
+            auto box4 = [&](const json& b, json& nb) {
+                if (!b.is_array() || b.size() != 4) { error = "A box is [x, y, w, h]."; return false; }
+                nb = json::array();
+                for (auto& v : b) {
+                    if (!v.is_number()) { error = "A box is four numbers."; return false; }
+                    nb.push_back(std::clamp(v.get<double>(), 0.0, 1.0));
+                }
+                if (nb[2].get<double>() < 0.01 || nb[3].get<double>() < 0.01) { error = "A box is too small."; return false; }
+                return true;
+            };
+            if (!sc.contains("panels") || !sc["panels"].is_array() || sc["panels"].empty() || sc["panels"].size() > 12) {
+                error = "A scene has 1 to 12 boxes."; return false;
+            }
+            json panels = json::array();
+            for (auto& p : sc["panels"]) {
+                if (!p.is_object() || !p.contains("src") || !p.contains("dst")) { error = "A box needs src and dst."; return false; }
+                json src, dst;
+                if (!box4(p["src"], src) || !box4(p["dst"], dst)) return false;
+                panels.push_back({{"src", src}, {"dst", dst}});
+            }
+            std::string bg = jstr(sc, "bg", "blur");
+            const bool hex = bg.size() == 7 && bg[0] == '#' &&
+                             std::all_of(bg.begin() + 1, bg.end(), [](unsigned char c) { return std::isxdigit(c); });
+            if (bg != "blur" && bg != "black" && !hex) bg = "blur";
+            out["scenes"].push_back({{"start", sc["start"].get<double>()}, {"layout", layout}, {"bg", bg}, {"panels", panels}});
+            continue;
+        }
         const size_t need = layout == "crop" ? 1 : layout == "split" ? 2 : layout == "fit" ? 0 : 99;
-        if (need == 99) { error = "A scene's layout is crop, split or fit."; return false; }
+        if (need == 99) { error = "A scene's layout is crop, split, fit or panels."; return false; }
         json boxes = json::array();
         if (need) {
             if (!sc.contains("boxes") || !sc["boxes"].is_array() || sc["boxes"].size() < need) {
@@ -783,7 +814,8 @@ struct ReelcutCorePrivate {
                           {"brief", b.brief}, {"chosen", b.chosen}, {"intro", b.intro}, {"outro", b.outro},
                           {"storage", storage},
                           {"ratio", b.ratio}, {"framing", b.framing},
-                          {"scenes", {{"state", b.scenesState}, {"error", b.scenesError}, {"clips", b.scenes}}},
+                          {"scenes", {{"state", b.scenesState}, {"error", b.scenesError}, {"clips", b.scenes},
+                                      {"i", b.scenesI}, {"n", b.scenesN}}},
                           {"forum", {{"target", b.forum}, {"state", b.forumState}, {"error", b.forumError}}},
                           {"youtube", {{"state", b.ytState}, {"error", b.ytError}, {"who", b.ytWho},
                                        {"reply", b.ytError.empty() ? "" : b.ytReply.substr(0, 4000)}}}});
@@ -865,7 +897,8 @@ struct ReelcutCorePrivate {
         p->setProcessEnvironment(processEnv());
         p->setWorkingDirectory(QString::fromStdString(b.dir));
         // Its own process group, so cancel stops reelcut's helpers (parakeet, ffmpeg) too.
-        p->setChildProcessModifier([] { ::setsid(); });
+        // At a low priority: the laptop stays usable (podman's conmon and the container inherit it).
+        p->setChildProcessModifier([] { ::setsid(); (void)::setpriority(PRIO_PROCESS, 0, 10); });
         auto out = std::make_shared<std::string>();
         const std::string id = b.id;
         const bool heavySlot = slot == "heavy";
@@ -885,6 +918,7 @@ struct ReelcutCorePrivate {
                 for (auto& l : QString::fromUtf8(chunk).split('\n')) {
                     // cut prints one line per reel it wrote.
                     if (j->step == "cut" && l.contains(".mp4 ")) j->progressI++;
+                    if (j->scenesState == "running" && l.startsWith("clip ")) j->scenesI++;
                     logLine(*j, l.toStdString());
                 }
                 changed();
@@ -1506,7 +1540,8 @@ struct ReelcutCorePrivate {
                          "--lead", QString::number(lead), "--tail", QString::number(tail)};
         b.scenesState = "running";
         b.scenesError.clear();
-        launch(b, "scenes/" + b.id, runnerBin, stepArgs(b, args, name, nullptr), name, [this, id = b.id](bool ok, const std::string&) {
+        b.scenesI = 0; b.scenesN = (int)parseClips(b.clipsText).size();
+        launch(b, "scenes/" + b.id, runnerBin, stepArgs(b, args, name, nullptr), name, [this, id = b.id, started = b.clipsText](bool ok, const std::string&) {
             Job* j = find(id); if (!j) return;
             if (!ok && !j->scenesPulled && containerRunner() && (logHas(*j, "invalid choice") || logHas(*j, "unrecognized arguments"))) {
                 // An image from before framing by hand: a newer one, then again.
@@ -1534,6 +1569,9 @@ struct ReelcutCorePrivate {
             loadScenes(*j);
             j->scenesState = "done";
             sideDone();
+            // The clips changed meanwhile: their scenes too.
+            if (j->clipsText != started && !parseClips(j->clipsText).empty())
+                QTimer::singleShot(0, guarded("scenes-again", [this, id] { if (Job* k = find(id)) if (!busy("scenes/" + id)) startScenes(*k); }));
         });
         changed();
     }
@@ -2058,6 +2096,8 @@ struct ReelcutCorePrivate {
         else { j.step = "clips"; j.status = "waiting"; }
         save(); changed();
         schedule();
+        // The scenes now, in the background: framing by hand is the usual next step.
+        if (!busy("scenes/" + j.id)) startScenes(j);
     }
     void pickFailed(Job& b, const std::string& why)
     {
@@ -2887,8 +2927,10 @@ std::string ReelcutCoreImpl::setClips(const std::string& jobId, const std::strin
     auto clips = parseClips(clipsText);
     if (clips.empty() && !trim(clipsText).empty())
         return json({{"ok", false}, {"error", "No clip lines in that. Each clip is one line: N | START H:MM:SS | END H:MM:SS | speaker | hook | until LASTWORD"}}).dump();
+    const bool changedClips = b->clipsText != ::clipsText(clips);
     b->clipsText = ::clipsText(clips);
     ReelcutCorePrivate::dropStale(*b);
+    if (changedClips && !clips.empty() && !d->busy("scenes/" + b->id)) d->startScenes(*b);
     // Ticks for clips that are gone go too.
     std::vector<int> keep;
     for (int n : b->chosen) for (auto& c : clips) if (c.n == n) { keep.push_back(n); break; }

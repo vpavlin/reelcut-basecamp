@@ -66,6 +66,8 @@ public:
 
     // Cut the reels (the chosen ones, all when none is chosen). fixesText: one "Heard=Meant" per line or comma, for misheard names.
     std::string cutReels(const std::string& jobId, const std::string& fixesText);
+    // Only these clips (a JSON array of numbers) again; the other reels are kept.
+    std::string cutClips(const std::string& jobId, const std::string& fixesText, const std::string& clipsJson);
 
     // optionsJson: {"brief": "what I'm looking for", "chosen": [2, 5, 7] (the clips to cut), "intro": card, "outro": card,
     // "ratio": "9:16"|"4:5"|"1:1" (the reels' shape, this job)}.

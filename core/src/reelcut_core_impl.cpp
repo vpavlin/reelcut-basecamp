@@ -633,6 +633,9 @@ struct ReelcutCorePrivate {
             b.scenesState = b.scenes.empty() ? "" : "done";
             if (b.id.empty() || b.dir.empty()) continue;
             // Whatever ran when Basecamp closed did not finish.
+            // A finished job left "running" by a scene search (0.3.x): finished.
+            if (b.status == "running" && b.step == "done") b.status = "done";
+            if (b.status == "running" && b.step == "clips") b.status = "waiting";
             if (b.status == "running") { b.status = "cancelled"; b.error = "Stopped when Basecamp closed. Retry to run it again."; }
             jobs.push_back(b);
             loadReels(jobs.back());
@@ -909,8 +912,12 @@ struct ReelcutCorePrivate {
             rm.waitForFinished(20000);
         }
         procs[slot] = Running{p, id, container, false};
-        b.status = "running";
-        b.error.clear();
+        // Finding scenes runs beside the job: it says so in scenes.state, and leaves the job's own
+        // status alone (it used to mark a finished job running for good, and lock its clip list).
+        if (slot.rfind("scenes/", 0) != 0) {
+            b.status = "running";
+            b.error.clear();
+        }
         QObject::connect(p, &QProcess::readyReadStandardOutput, guarded("stdout", [this, p, out, id] {
             QByteArray chunk = p->readAllStandardOutput();
             out->append(chunk.constData(), chunk.size());
@@ -1055,21 +1062,28 @@ struct ReelcutCorePrivate {
         if (!a.empty()) b.activity = a;
     }
 
-    void pullImage(Job& b)
+    // forScenes: for the scene search beside the job, which leaves the job's status as it is.
+    void pullImage(Job& b, bool forScenes = false)
     {
         const bool had = imagePresent;
-        launch(b, "pull", runnerBin, {"pull", kImage}, "", [this, id = b.id, had](bool ok, const std::string&) {
+        const std::string before = b.status, beforeError = b.error;
+        launch(b, "pull", runnerBin, {"pull", kImage}, "", [this, id = b.id, had, forScenes](bool ok, const std::string&) {
             Job* j = find(id);
             // Tried either way, so an offline machine doesn't try before every job.
             lastPull = QDateTime::currentMSecsSinceEpoch();
             forcePull = false;
-            if (!ok && !had) { if (j) finishStep(*j, "Could not download the reelcut image. " + lastLog(*j)); return; }
+            if (!ok && !had) {
+                if (j && forScenes) { j->scenesState = "failed"; j->scenesError = "Could not download the reelcut image. " + lastLog(*j); sideDone(); return; }
+                if (j) finishStep(*j, "Could not download the reelcut image. " + lastLog(*j));
+                return;
+            }
             if (!ok && j) logLine(*j, "Could not look for a newer image; using the one already here.");
             imagePresent = true;
             // A cut that waited for the image runs now.
-            if (j && !preparing(*j) && j->status == "running") j->status = "queued";
+            if (j && !forScenes && !preparing(*j) && j->status == "running") j->status = "queued";
             sideDone();
         });
+        if (forScenes) { b.status = before; b.error = beforeError; }
     }
 
     void startFetch(Job& b)
@@ -1514,9 +1528,16 @@ struct ReelcutCorePrivate {
     void startScenes(Job& b)
     {
         if (runner.empty()) { b.scenesState = "failed"; b.scenesError = runnerError.empty() ? "No way to run reelcut here." : runnerError; changed(); return; }
+        if (containerRunner() && !imageChecked) {
+            imageChecked = true;
+            QProcess p; p.setProcessEnvironment(processEnv());
+            p.start(QString::fromStdString(runnerBin), runner == "podman" ? QStringList{"image", "exists", kImage}
+                                                                           : QStringList{"image", "inspect", kImage});
+            imagePresent = p.waitForFinished(15000) && p.exitCode() == 0;
+        }
         if (containerRunner() && (!imagePresent || forcePull)) {
             b.scenesState = "running";
-            if (!busy("pull")) pullImage(b);
+            if (!busy("pull")) pullImage(b, true);
             // After the pull, again.
             QTimer::singleShot(3000, guarded("scenes-pull", [this, id = b.id] {
                 Job* j = find(id);
@@ -2979,7 +3000,8 @@ std::string ReelcutCoreImpl::retryJob(const std::string& jobId)
     b->error.clear();
     if (badVideo && !d->runner.empty() && !d->busy("fetch/" + b->id)) { d->refetchVideo(*b); return d->state().dump(); }
     if (b->step == "pick" || b->step == "clips") { d->startPick(*b, b->agent.empty() ? d->agent : b->agent); return d->state().dump(); }
-    if (b->step == "done" || b->step == "speakers") return d->state().dump();
+    if (b->step == "done") { b->status = "done"; d->save(); d->changed(); return d->state().dump(); }
+    if (b->step == "speakers") { b->status = "waiting"; d->save(); d->changed(); return d->state().dump(); }
     b->status = "queued";
     d->save();
     d->schedule();

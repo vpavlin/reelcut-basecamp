@@ -127,7 +127,7 @@ Item {
         syncJob()
         root.coreSeen = true
         root.missedPolls = 0
-        if (!obj.thumbsOk) registerViewDir()
+        if (!obj.thumbsOk && !root.sandboxImages) registerViewDir()
     }
     function syncJob() {
         var j = null
@@ -187,6 +187,40 @@ Item {
     }
     function fileUrl(path) {
         return "file://" + String(path).split("/").map(function (seg) { return encodeURIComponent(seg) }).join("/")
+    }
+    // Pictures: through the host's SandboxImages where Basecamp has it (newer than 0.3.2): the core
+    // hands the bytes (picture), the view shows them from memory, nothing is written into the
+    // view's install folder. Older hosts: copies the core puts under this view's folder.
+    readonly property bool sandboxImages: typeof SandboxImages !== "undefined" && SandboxImages !== null && typeof SandboxImages.sourceFor === "function"
+    property var pics: ({})        // picture ref ("path#stamp") -> image source
+    property var picsAsked: ({})
+    property int picsCount: 0
+    function pic(ref) {
+        if (!ref) return ""
+        if (!root.sandboxImages) return root.fileUrl(ref)
+        var have = root.pics[ref]
+        if (have) return have
+        if (!root.picsAsked[ref]) {
+            root.picsAsked[ref] = true
+            callVia(coreName, "picture", [ref], function (raw) {
+                var o = parse(raw)
+                if (!o || !o.ok || !o.data) return
+                var src = ""
+                try { src = SandboxImages.sourceFor(o.data) } catch (e) { return }
+                if (!src) return
+                // A long session: let go of everything now and then (the host caps memory per view).
+                if (root.picsCount > 400) {
+                    for (var k in root.pics) { try { SandboxImages.release(root.pics[k]) } catch (e2) {} }
+                    root.pics = ({}); root.picsAsked = ({}); root.picsCount = 0
+                    root.picsAsked[ref] = true
+                }
+                var n = Object.assign({}, root.pics)
+                n[ref] = src
+                root.picsCount++
+                root.pics = n
+            })
+        }
+        return ""
     }
 
     // ── the screens: 0 Video, 1 Speakers, 2 Clips, 3 Framing, 4 Reels. A job's screen follows its
@@ -393,7 +427,7 @@ Item {
     Timer { id: toastTimer; interval: 4200; onTriggered: root.toastText = "" }
 
     Timer { interval: root.anyRunning ? 1500 : 5000; running: true; repeat: true; onTriggered: root.refresh() }
-    Component.onCompleted: { registerViewDir(); refresh(); callVia(coreName, "listAgents", [], function (raw) { var o = parse(raw); if (o && o.jobs) apply(o) }) }
+    Component.onCompleted: { if (!root.sandboxImages) registerViewDir(); refresh(); callVia(coreName, "listAgents", [], function (raw) { var o = parse(raw); if (o && o.jobs) apply(o) }) }
 
     component Label2: Text { color: root.cSub; font.pixelSize: 12; textFormat: Text.PlainText }
     component Section: Text { color: root.cFaint; font.pixelSize: 11; font.letterSpacing: 1.2; textFormat: Text.PlainText }

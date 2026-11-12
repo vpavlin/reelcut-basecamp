@@ -168,7 +168,7 @@ Flickable {
                         Rectangle {
                             width: 34; height: 34; radius: 4; color: "#000"; clip: true
                             border.width: 1; border.color: scr.app.cLine
-                            Image { anchors.fill: parent; anchors.margins: 1; fillMode: Image.PreserveAspectFit; asynchronous: true; source: scr.cardThumb(cardRow.file) ? scr.app.fileUrl(scr.cardThumb(cardRow.file)) : "" }
+                            Image { anchors.fill: parent; anchors.margins: 1; fillMode: Image.PreserveAspectFit; asynchronous: true; source: scr.cardThumb(cardRow.file) ? scr.app.pic(scr.cardThumb(cardRow.file)) : "" }
                         }
                         ColumnLayout {
                             spacing: 2
@@ -234,7 +234,7 @@ Flickable {
                         id: thumbBox
                         x: 0; y: 0; width: parent.width; height: reel.thumbH
                         color: "#000"
-                        Image { anchors.fill: parent; source: reel.modelData.thumb ? scr.app.fileUrl(reel.modelData.thumb) : ""; fillMode: Image.PreserveAspectFit; asynchronous: true; cache: false }
+                        Image { anchors.fill: parent; source: reel.modelData.thumb ? scr.app.pic(reel.modelData.thumb) : ""; fillMode: Image.PreserveAspectFit; asynchronous: true; cache: false }
                         Rectangle {
                             anchors.centerIn: parent
                             width: 52; height: 52; radius: 26

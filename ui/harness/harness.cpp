@@ -17,6 +17,27 @@
 #define QT_GUI_LIB 1
 #include <QtTest/QTest>
 #include <QWindow>
+#include <QFile>
+#include <QUrl>
+
+// Stand-in for Basecamp's SandboxImages (SANDBOX_IMAGES=1): takes a data URL, hands back a source.
+// Basecamp keeps the pictures in memory; here they go to a temp file. Counts what it was given.
+class SandboxImagesMock : public QObject {
+  Q_OBJECT
+  Q_PROPERTY(int given MEMBER given)
+public:
+  int given = 0;
+  Q_INVOKABLE QString sourceFor(const QString& dataUrl) {
+    int comma = dataUrl.indexOf(',');
+    if (!dataUrl.startsWith("data:image/") || comma < 0) return "";
+    QByteArray bytes = QByteArray::fromBase64(dataUrl.mid(comma + 1).toLatin1());
+    QString path = QString("/tmp/claude-1000/sbimg-%1.img").arg(++given);
+    QFile f(path); if (!f.open(QIODevice::WriteOnly)) return "";
+    f.write(bytes); f.close();
+    return QUrl::fromLocalFile(path).toString();
+  }
+  Q_INVOKABLE void release(const QString&) {}
+};
 
 class Bridge : public QObject {
   Q_OBJECT
@@ -58,6 +79,8 @@ int main(int argc, char** argv) {
   Bridge b; b.ctl = QString::fromLocal8Bit(qgetenv("CTL"));
   QQuickView v;
   v.rootContext()->setContextProperty("logos", &b);
+  SandboxImagesMock sbi;
+  if (qgetenv("SANDBOX_IMAGES") == "1") v.rootContext()->setContextProperty("SandboxImages", &sbi);
   b.win = &v;
   v.setResizeMode(QQuickView::SizeRootObjectToView);
   v.resize(1200, 760);

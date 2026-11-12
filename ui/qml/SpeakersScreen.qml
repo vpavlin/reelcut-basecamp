@@ -90,7 +90,7 @@ Flickable {
                     radius: 6; color: "#000"; clip: true
                     Image {
                         anchors.fill: parent
-                        source: scr.job && scr.job.frame ? scr.app.fileUrl(scr.job.frame) : ""
+                        source: scr.job && scr.job.frame ? scr.app.pic(scr.job.frame) : ""
                         fillMode: Image.PreserveAspectFit
                         asynchronous: true
                         cache: false

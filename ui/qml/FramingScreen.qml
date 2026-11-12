@@ -209,7 +209,7 @@ Item {
     }
     function rel(t) { var d = Math.round(Math.max(0, t - (info ? info.start : 0))); return d > 0 ? app.fmtDur(d) : "0:00" }
     readonly property string bgValue: edit ? edit.bg || "blur" : "blur"
-    readonly property string frameUrl: scene && scene.frame ? app.fileUrl(scene.frame) : ""
+    readonly property string frameUrl: scene && scene.frame ? app.pic(scene.frame) : ""
 
     RowLayout {
         anchors.fill: parent
@@ -489,7 +489,7 @@ Item {
                                 border.color: index === scr.idx ? scr.app.cAccent : scr.app.cLine
                                 Image {
                                     x: 3; y: 3; width: parent.width - 6; height: 54
-                                    source: sc.modelData.frame ? scr.app.fileUrl(sc.modelData.frame) : ""
+                                    source: sc.modelData.frame ? scr.app.pic(sc.modelData.frame) : ""
                                     fillMode: Image.PreserveAspectFit; asynchronous: true
                                     sourceSize.width: 224
                                 }

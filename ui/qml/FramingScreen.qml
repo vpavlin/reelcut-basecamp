@@ -125,15 +125,42 @@ Item {
         if (fs.length <= 4) return "faces"
         return "whole"
     }
+    // ── a box's shape: "keep" (locked to what it is), "free", or a preset (locked to it). The box on the
+    // picture decides it; its place on the reel always has the same shape, only its size changes there.
+    readonly property var shapes: [
+        { v: "keep", l: "Locked" }, { v: "free", l: "Free" }, { v: "9:16", l: "9:16" }, { v: "4:5", l: "4:5" },
+        { v: "1:1", l: "1:1" }, { v: "4:3", l: "4:3" }, { v: "16:9", l: "16:9" }
+    ]
+    function presetPx(r) { var m = /^(\d+):(\d+)$/.exec(r || ""); return m ? Number(m[1]) / Number(m[2]) : 0 }
+    function srcPx(src) { return (src[2] * vw) / Math.max(1e-6, src[3] * vh) }   // width/height in pixels
+    // A place on the reel in the given pixel shape: around its middle, as tall as it was, inside the reel.
+    function fitDst(dst, px) {
+        var a = px * oh / ow
+        var cx = dst[0] + dst[2] / 2, cy = dst[1] + dst[3] / 2, h = dst[3], w = h * a
+        if (w > 1) { w = 1; h = w / a }
+        if (h > 1) { h = 1; w = h * a }
+        return [clamp(cx - w / 2, 0, 1 - w), clamp(cy - h / 2, 0, 1 - h), w, h]
+    }
+    // A piece of the picture in the given pixel shape, around its middle, as tall as it was.
+    function shapeSrc(src, px) {
+        var a = px * vh / vw
+        var cx = src[0] + src[2] / 2, cy = src[1] + src[3] / 2, h = src[3], w = h * a
+        if (w > 1) { w = 1; h = w / a }
+        if (h > 1) { h = 1; w = h * a }
+        return [clamp(cx - w / 2, 0, 1 - w), clamp(cy - h / 2, 0, 1 - h), w, h]
+    }
+    function mkP(src, dst, ratio) { return { src: src, dst: dst, ratio: ratio || "keep" } }
+    function panelsOf(e) { return e.panels.map(function (p) { return mkP(p.src.slice(), p.dst.slice(), p.ratio) }) }
     // A saved scene in any of reelcut's layouts, as pieces.
     function asPanels(e) {
-        if (e.layout === "panels") return (e.panels || []).map(function (p) { return { src: p.src.slice(), dst: p.dst.slice() } })
+        if (e.layout === "panels") return (e.panels || []).map(function (p) { return mkP(p.src.slice(), p.dst.slice(), p.ratio) })
         var b = e.boxes || []
-        if (e.layout === "crop" && b.length) return [{ src: b[0].slice(), dst: [0, 0, 1, 1] }]
-        if (e.layout === "split" && b.length > 1) return [{ src: b[0].slice(), dst: [0, 0, 1, 0.5] }, { src: b[1].slice(), dst: [0, 0.5, 1, 0.5] }]
-        return [{ src: [0, 0, 1, 1], dst: wholeDst() }]
+        if (e.layout === "crop" && b.length) return [mkP(b[0].slice(), [0, 0, 1, 1])]
+        if (e.layout === "split" && b.length > 1) return [mkP(b[0].slice(), [0, 0, 1, 0.5]), mkP(b[1].slice(), [0, 0.5, 1, 0.5])]
+        return [mkP([0, 0, 1, 1], wholeDst())]
     }
-    function refit(e) { return { start: e.start, bg: e.bg, panels: e.panels.map(function (p) { return { src: fitSrc(p.src, p.dst), dst: p.dst } }) } }
+    // Each place on the reel takes its piece's shape (after loading, or the reel's shape changed).
+    function refit(e) { return { start: e.start, bg: e.bg, panels: e.panels.map(function (p) { return mkP(p.src, fitDst(p.dst, srcPx(p.src)), p.ratio) }) } }
     // From what was saved (each scene takes what was in force at its start), or a guess per scene.
     function seed() {
         var key = clipN + "|" + sceneList.map(function (x) { return x.start }).join(",")
@@ -146,7 +173,7 @@ Item {
             for (var j = 0; j < saved.length; j++) if (saved[j].start <= sc.start + 0.05) e = saved[j]
             if (!e && saved.length) e = saved[0]
             out.push(refit(e ? { start: sc.start, bg: e.bg || "blur", panels: asPanels(e) }
-                             : { start: sc.start, bg: "blur", panels: preset(guess(sc), sc) }))
+                             : { start: sc.start, bg: "blur", panels: preset(guess(sc), sc).map(function (p) { return mkP(p.src, p.dst) }) }))
         }
         edits = out
         if (idx >= out.length) idx = 0
@@ -155,34 +182,50 @@ Item {
     }
     function refitAll() { if (edits.length) { edits = edits.map(refit); dirty = true } }
     function put(e) { var a = edits.slice(); a[idx] = e; edits = a; dirty = true }
+    function withPanel(k, p) { var ps = panelsOf(edit); ps[k] = p; put({ start: edit.start, bg: edit.bg, panels: ps }) }
     function usePreset(kind) {
         if (!edit) return
-        put(refit({ start: edit.start, bg: edit.bg, panels: preset(kind, scene) }))
+        put(refit({ start: edit.start, bg: edit.bg, panels: preset(kind, scene).map(function (p) { return mkP(p.src, p.dst) }) }))
         sel = 0
     }
+    // On the picture: what the box shows. A free box may change shape; its place on the reel follows.
     function moveSrc(k, nb) {
-        var ps = edit.panels.slice()
-        ps[k] = { src: nb, dst: ps[k].dst }
-        put({ start: edit.start, bg: edit.bg, panels: ps })
+        var p = edit.panels[k]
+        withPanel(k, mkP(nb, p.ratio === "free" ? fitDst(p.dst, srcPx(nb)) : p.dst, p.ratio))
     }
-    function moveDst(k, nd) {
-        var ps = edit.panels.slice()
-        ps[k] = { src: fitSrc(ps[k].src, nd), dst: nd }
-        put({ start: edit.start, bg: edit.bg, panels: ps })
+    // On the reel: where and how big; the shape stays.
+    function moveDst(k, nd) { var p = edit.panels[k]; withPanel(k, mkP(p.src, nd, p.ratio)) }
+    function setShape(k, r) {
+        if (!edit || k >= edit.panels.length) return
+        var p = edit.panels[k], px = presetPx(r)
+        if (!px) { withPanel(k, mkP(p.src, p.dst, r)); return }
+        var src = shapeSrc(p.src, px)
+        // On the reel: the same area in the new shape, around the same middle.
+        var a = srcPx(src) * oh / ow, area = p.dst[2] * p.dst[3], h = Math.sqrt(area / a)
+        var cx = p.dst[0] + p.dst[2] / 2, cy = p.dst[1] + p.dst[3] / 2
+        withPanel(k, mkP(src, fitDst([cx - h * a / 2, cy - h / 2, h * a, h], srcPx(src)), r))
     }
     // Less (f < 1) or more (f > 1) of the picture in a box, around its middle: zooming out makes faces smaller.
     function zoom(k, f) {
         if (!edit || k >= edit.panels.length) return
         var p = edit.panels[k], cx = p.src[0] + p.src[2] / 2, cy = p.src[1] + p.src[3] / 2
-        var h = clamp(p.src[3] * f, 0.03, 1), w = p.src[2] * f
-        var ps = edit.panels.slice()
-        ps[k] = { src: fitSrc([cx - w / 2, cy - h / 2, w, h], p.dst), dst: p.dst }
-        put({ start: edit.start, bg: edit.bg, panels: ps })
+        var px = srcPx(p.src), h = clamp(p.src[3] * f, 0.03, 1)
+        var src = shapeSrc([cx - h / 2, cy - h / 2, h, h], px)
+        // Too wide for the picture: it stops growing (the shape stays).
+        if (Math.abs(srcPx(src) - px) > 0.01 * px) return
+        withPanel(k, mkP(src, p.dst, p.ratio))
     }
     function placeDst(k, nd) { if (edit && k < edit.panels.length) moveDst(k, nd) }
+    // As wide as the reel, or as big as fits, in its shape.
+    function fullWidth(k) {
+        var p = edit.panels[k], a = srcPx(p.src) * oh / ow, w = 1, h = w / a
+        if (h > 1) { h = 1; w = h * a }
+        moveDst(k, [(1 - w) / 2, clamp(p.dst[1] + p.dst[3] / 2 - h / 2, 0, 1 - h), w, h])
+    }
+    function fillReel(k) { setShape(k, app.jobRatio.value); moveDst(k, [0, 0, 1, 1]) }
     function toFront(k) {
         if (!edit || k >= edit.panels.length - 1) return
-        var ps = edit.panels.slice(), p = ps.splice(k, 1)[0]
+        var ps = panelsOf(edit), p = ps.splice(k, 1)[0]
         ps.push(p)
         put({ start: edit.start, bg: edit.bg, panels: ps })
         sel = ps.length - 1
@@ -191,18 +234,19 @@ Item {
         if (!edit || edit.panels.length >= 12) return
         var d = [0.25, 0.35, 0.5, 0.3]
         var f = faces.length > edit.panels.length ? faces[edit.panels.length] : null
-        var ps = edit.panels.concat([{ src: f ? faceSrc(f, d, 2.4) : fitSrc([0.3, 0.3, 0.4, 0.4], d), dst: d }])
+        var src = f ? faceSrc(f, d, 2.4) : fitSrc([0.3, 0.3, 0.4, 0.4], d)
+        var ps = panelsOf(edit).concat([mkP(src, fitDst(d, srcPx(src)))])
         put({ start: edit.start, bg: edit.bg, panels: ps })
         sel = ps.length - 1
     }
     function removePanel() {
         if (!edit || edit.panels.length <= 1) return
-        var ps = edit.panels.slice(); ps.splice(sel, 1)
+        var ps = panelsOf(edit); ps.splice(sel, 1)
         put({ start: edit.start, bg: edit.bg, panels: ps })
         sel = Math.max(0, sel - 1)
     }
-    function setBg(v) { if (edit) put({ start: edit.start, bg: v, panels: edit.panels }) }
-    function copyOf(e, start) { return { start: start, bg: e.bg, panels: e.panels.map(function (p) { return { src: p.src.slice(), dst: p.dst.slice() } }) } }
+    function setBg(v) { if (edit) put({ start: edit.start, bg: v, panels: panelsOf(edit) }) }
+    function copyOf(e, start) { return { start: start, bg: e.bg, panels: panelsOf(e) } }
     function toFollowing() {
         var a = edits.slice()
         for (var i = idx + 1; i < a.length; i++) a[i] = copyOf(edit, a[i].start)
@@ -397,10 +441,30 @@ Item {
                 spacing: 8
                 Rectangle { width: 22; height: 22; y: 4; radius: 4; color: scr.app.panelColour(scr.sel); Text { anchors.centerIn: parent; text: scr.sel + 1; color: "#000"; font.bold: true; font.pixelSize: 12 } }
                 Text { text: "Box " + (scr.sel + 1) + ":"; height: 30; verticalAlignment: Text.AlignVCenter; color: scr.app.cSub; font.pixelSize: 12; textFormat: Text.PlainText }
+                Text { text: "Shape"; height: 30; verticalAlignment: Text.AlignVCenter; color: scr.app.cSub; font.pixelSize: 12; textFormat: Text.PlainText }
+                // Locked or free: one click.
+                SmallButton {
+                    readonly property bool isFree: !!scr.edit && scr.sel < scr.edit.panels.length && scr.edit.panels[scr.sel].ratio === "free"
+                    app: scr.app
+                    primary: !isFree
+                    text: isFree ? "🔓 Free" : "🔒 Locked"
+                    tip: isFree ? "Drag a corner on the picture to any shape; the reel follows. Click to lock the shape." : "Corners keep the shape. Click to unlock and drag to any shape."
+                    onClicked: scr.setShape(scr.sel, isFree ? "keep" : "free")
+                }
+                ComboBox {
+                    id: shapeBox
+                    width: 110; height: 30
+                    readonly property string cur: scr.edit && scr.sel < scr.edit.panels.length ? scr.edit.panels[scr.sel].ratio || "keep" : "keep"
+                    model: ["as it is", "9:16", "4:5", "1:1", "4:3", "16:9"]
+                    currentIndex: Math.max(0, model.indexOf(cur))
+                    onActivated: function (i) { scr.setShape(scr.sel, i === 0 ? "keep" : model[i]) }
+                    ToolTip.visible: hovered; ToolTip.delay: 500; ToolTip.text: "Lock the box to a shape"
+                }
+                Rectangle { width: 1; height: 30; color: scr.app.cLine }
                 SmallButton { app: scr.app; text: "Zoom out"; tip: "More of the picture in the box (faces smaller). Or the mouse wheel on the box."; onClicked: scr.zoom(scr.sel, 1.12) }
                 SmallButton { app: scr.app; text: "Zoom in"; tip: "Less of the picture (faces bigger)"; onClicked: scr.zoom(scr.sel, 0.89) }
-                SmallButton { app: scr.app; text: "Full width"; tip: "Across the whole reel, as tall as it is"; onClicked: { var d = scr.edit.panels[scr.sel].dst; scr.placeDst(scr.sel, [0, d[1], 1, d[3]]) } }
-                SmallButton { app: scr.app; text: "Full reel"; onClicked: scr.placeDst(scr.sel, [0, 0, 1, 1]) }
+                SmallButton { app: scr.app; text: "Full width"; tip: "As wide as the reel, in its shape"; onClicked: scr.fullWidth(scr.sel) }
+                SmallButton { app: scr.app; text: "Fill the reel"; tip: "The reel's shape, filling it"; onClicked: scr.fillReel(scr.sel) }
                 SmallButton { app: scr.app; text: "Centre"; onClicked: { var d = scr.edit.panels[scr.sel].dst; scr.placeDst(scr.sel, [(1 - d[2]) / 2, (1 - d[3]) / 2, d[2], d[3]]) } }
                 SmallButton { app: scr.app; text: "To front"; enabled: !!scr.edit && scr.sel < scr.edit.panels.length - 1; onClicked: scr.toFront(scr.sel) }
                 SmallButton { app: scr.app; text: "Remove"; enabled: !!scr.edit && scr.edit.panels.length > 1; onClicked: scr.removePanel() }
@@ -448,7 +512,8 @@ Item {
                                     required property int index
                                     app: scr.app
                                     box: scr.edit && index < scr.edit.panels.length ? scr.edit.panels[index].src : [0, 0, 0.1, 0.1]
-                                    aspectN: scr.edit && index < scr.edit.panels.length ? scr.srcAspect(scr.edit.panels[index].dst) : 1
+                                    aspectN: scr.edit && index < scr.edit.panels.length ? scr.edit.panels[index].src[2] / Math.max(1e-6, scr.edit.panels[index].src[3]) : 1
+                                    free: !!scr.edit && index < scr.edit.panels.length && scr.edit.panels[index].ratio === "free"
                                     pw: pic.width; ph: pic.height
                                     faces: scr.faces
                                     label: String(index + 1)
@@ -497,6 +562,7 @@ Item {
                                     readonly property var p: scr.edit && index < scr.edit.panels.length ? scr.edit.panels[index] : { src: [0, 0, 1, 1], dst: [0, 0, 0.1, 0.1] }
                                     dst: p.dst
                                     srcBox: p.src
+                                    aspect: p.dst[2] / Math.max(1e-6, p.dst[3])
                                     src: scr.frameUrl
                                     cw: canvas.width; ch: canvas.height
                                     others: scr.edit ? scr.edit.panels.filter(function (q, i) { return i !== index }).map(function (q) { return q.dst }) : []
@@ -574,7 +640,7 @@ Item {
                 Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText
                 color: scr.app.cFaint; font.pixelSize: 12
                 text: (scr.sceneList.length > 1 ? "Scene " + (scr.idx + 1) + " of " + scr.sceneList.length + ", from " + scr.rel(scr.scene ? scr.scene.start : 0) + ". " : "One scene. ")
-                    + "Any number of boxes, anywhere, any shape: + Box adds one. On the reel, drag a box to place it and a corner to size it; on the picture, choose what it shows. The mouse wheel on a box zooms. Boxes snap to faces (white), edges, halves and thirds; a later box covers an earlier one."
+                    + "Any number of boxes: + Box adds one. On the picture, choose what each box shows; its shape is locked (a preset, or as it is) or free (🔓: drag a corner to any shape). On the reel, move a box and drag a corner to size it; the shape stays. The mouse wheel on a box zooms. Boxes snap to faces (white), edges, halves and thirds; a later box covers an earlier one."
             }
         }
     }

@@ -8,6 +8,7 @@ Rectangle {
     property var app
     property var box: [0, 0, 1, 1]
     property real aspectN: 1
+    property bool free: false      // corners give any shape
     property real pw: 1
     property real ph: 1
     property var faces: []
@@ -89,6 +90,14 @@ Rectangle {
             var left = corner === 0 || corner === 2, top = corner < 2
             var mx = p.x / fb.pw, my = p.y / fb.ph
             var ax = left ? sb[0] + sb[2] : sb[0], ay = top ? sb[1] + sb[3] : sb[1]
+            if (fb.free) {
+                var fx = fb.clamp(mx, 0, 1), fy = fb.clamp(my, 0, 1)
+                var x0 = Math.min(ax, fx), x1 = Math.max(ax, fx), y0 = Math.min(ay, fy), y1 = Math.max(ay, fy)
+                if (x1 - x0 < 0.03) { if (left) x0 = x1 - 0.03; else x1 = x0 + 0.03 }
+                if (y1 - y0 < 0.03) { if (top) y0 = y1 - 0.03; else y1 = y0 + 0.03 }
+                fb.moved([x0, y0, x1 - x0, y1 - y0])
+                return
+            }
             var hh = Math.max(Math.abs(my - ay), Math.abs(mx - ax) / fb.aspectN, 0.04)
             var maxW = left ? ax : 1 - ax, maxH = top ? ay : 1 - ay
             hh = Math.min(hh, maxH, maxW / fb.aspectN)

@@ -15,6 +15,7 @@ Item {
     property color tint: "#ff7a3d"
     property bool selected: false
     property bool editable: true
+    property real aspect: 1          // width/height in fractions of the reel: corners keep it
     signal moved(var nd)
     signal picked()
     signal zoomed(real f)   // the wheel: < 1 zooms in (less of the picture), > 1 out
@@ -103,15 +104,14 @@ Item {
                 return
             }
             var left = corner === 0 || corner === 2, top = corner < 2
-            var mx = pb.clamp(p.x / pb.cw, 0, 1), my = pb.clamp(p.y / pb.ch, 0, 1)
-            var sxv = pb.snap(mx, xs, tx), syv = pb.snap(my, ys, ty)
-            if (sxv !== null) mx = sxv
-            if (syv !== null) my = syv
+            var mx = p.x / pb.cw, my = p.y / pb.ch
             var ax = left ? sb[0] + sb[2] : sb[0], ay = top ? sb[1] + sb[3] : sb[1]
-            var x0 = Math.min(ax, mx), x1 = Math.max(ax, mx), y0 = Math.min(ay, my), y1 = Math.max(ay, my)
-            if (x1 - x0 < 0.05) { if (left) x0 = x1 - 0.05; else x1 = x0 + 0.05 }
-            if (y1 - y0 < 0.03) { if (top) y0 = y1 - 0.03; else y1 = y0 + 0.03 }
-            pb.moved([x0, y0, x1 - x0, y1 - y0])
+            // The shape stays: as big as the pointer asks, within the reel.
+            var hh = Math.max(Math.abs(my - ay), Math.abs(mx - ax) / pb.aspect, 0.03)
+            var maxW = left ? ax : 1 - ax, maxH = top ? ay : 1 - ay
+            hh = Math.min(hh, maxH, maxW / pb.aspect)
+            var ww = hh * pb.aspect
+            pb.moved([left ? ax - ww : ax, top ? ay - hh : ay, ww, hh])
         }
     }
     Repeater {

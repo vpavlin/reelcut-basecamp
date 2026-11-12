@@ -45,7 +45,7 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-static const char* kVersion = "0.5.0";
+static const char* kVersion = "0.5.1";
 // Reelcut's own sessions on this computer's shrooms-agent: "reelcut-claude", "reelcut-pi".
 static const char* kLocalSession = "reelcut";
 static const char* kImage = "ghcr.io/vpavlin/reelcut:latest";
@@ -507,7 +507,11 @@ static bool cleanFraming(const json& in, json& out, std::string& error)
                 if (!p.is_object() || !p.contains("src") || !p.contains("dst")) { error = "A box needs src and dst."; return false; }
                 json src, dst;
                 if (!box4(p["src"], src) || !box4(p["dst"], dst)) return false;
-                panels.push_back({{"src", src}, {"dst", dst}});
+                // The box's shape setting, for the editor: "keep", "free" or a preset like "9:16".
+                std::string ratio = jstr(p, "ratio", "keep");
+                static const QRegularExpression preset("^\\d{1,2}:\\d{1,2}$");
+                if (ratio != "keep" && ratio != "free" && !preset.match(QString::fromStdString(ratio)).hasMatch()) ratio = "keep";
+                panels.push_back({{"src", src}, {"dst", dst}, {"ratio", ratio}});
             }
             std::string bg = jstr(sc, "bg", "blur");
             const bool hex = bg.size() == 7 && bg[0] == '#' &&

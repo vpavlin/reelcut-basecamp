@@ -15,4 +15,4 @@ mkdir -p shots; rm -f shots/*.png
 export QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software QT_QUICK_CONTROLS_STYLE=Basic
 export QML2_IMPORT_PATH="$QDECL/lib/qt-6/qml:$DS" QML_IMPORT_PATH="$QDECL/lib/qt-6/qml:$DS"
 export LD_LIBRARY_PATH="$QB/lib:$QDECL/lib" CTL="${CTL:-$HOME/port-0.3/ctl.sh}"
-./harness "$HERE/../Main.qml" "$HERE/shots" "$1"
+./harness "$HERE/../qml/Main.qml" "$HERE/shots" "$1"

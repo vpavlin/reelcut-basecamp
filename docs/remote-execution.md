@@ -1,6 +1,7 @@
 # Remote execution for Reelcut
 
-*Proposal, 2026-11-13. Step 1 (your own machines) is being built; step 2 (a marketplace) is a design for review.*
+*2026-11-14. Step 1 (your own machines) is built and tested on branch `feat/remote-workers`; step 2 (a marketplace) is a
+design for review. Status and the plan: the last section.*
 
 Today every heavy step runs on the computer Basecamp runs on, in the reelcut container. This proposal moves them to
 another machine, first one you own (step 1), then one rented from a stranger (step 2), while Basecamp stays where
@@ -70,15 +71,8 @@ scripts Reelcut Basecamp ran, so **every remote step is a reelcut command from a
 ### What step 1 does not do
 
 - No payment, no strangers: the worker trusts its paired clients and the client trusts the worker's results.
-- A local file import uploads the video once into Storage; that is slow over the internet, fine on a LAN.
-
-### Building it (this weekend)
-
-1. Protocol + pairing + the worker loop (run, progress, result, cancel) in `reelcut_core`, with a fake-transport test.
-2. The client side: the remote seam in the step runner, file sync before and after a step.
-3. Storage for the reels and imported videos.
-4. View: settings, pairing, where each step runs.
-5. Live test: worker on another machine (atlas or the crib), Basecamp on a laptop; URL job end to end.
+- A local video file is sent to the worker once, over the same link (LAN speed); it stays there.
+- The worker must be reachable directly (same network, or the mesh). Otherwise: step 1b below.
 
 ## Step 2 — a marketplace
 
@@ -175,3 +169,34 @@ ones).
 - **A market module** (generic, not Reelcut-specific): post and read offers/asks, match, reputation. Other apps
   with heavy steps (transcription in general, rendering) could use the same market.
 - **An escrow program on LEZ** (and a small Basecamp module to call it), unless one exists.
+
+## Status and plan
+
+### Done (step 1, branch `feat/remote-workers`, Reelcut 0.6.0, not released yet)
+
+- **reelcut** CLI: `probe` and `thumbs` commands (bfd0f32, image built).
+- **reelcut_core**: worker role and client role, the signed HTTP link, file mirroring, cancel, re-attach after a
+  restart (and reuse of a step that finished meanwhile), noticing a restarted worker. Unit test: 30 checks.
+- **View**: Settings → *Where the work runs* (pick a worker, add one by its code, see what it runs), *Let my other
+  computers use this one* (name, make a pairing code, unpair); running jobs say "· on crib-worker".
+- **Tested live** with two logosctl sessions on the crib (worker + Basecamp): a 6-minute YouTube video through
+  download, transcription (1095 words), speakers, scenes, cut, thumbnails and page, all on the worker; reels
+  byte-identical on the Basecamp side, no video copied; a local file import; cancel; Basecamp restart; worker restart.
+- **Not yet:** a test in the Basecamp GUI itself, and two different machines (the test was two sessions on one).
+
+### Plan
+
+| # | What | Size | Needs from you |
+|---|---|---|---|
+| 1a | **Release 0.6.0 to lan03** (Linux x86 + ARM + Mac, merged), then you try it: Basecamp on your laptop, a worker on a stronger machine | building now | which machine is the worker |
+| 1b | **The Logos link for your own workers**: same steps over Logos Messaging (sealed with the pairing key, acked and resent), files through Logos Storage; for a worker you can't reach directly | 1–2 days | — |
+| 2a | **Market without money**: workers post signed offers on a public Delivery topic; first contact with X25519 keys; jobs carry their inputs by URL or Storage CID | ~2 days | OK to start before payments |
+| 2b | **Leases paid on LEZ** with Backpack's `backpack_access` program as it is (one config per worker: price per hour; the worker serves a client while it's paid) | 1–2 days | LEZ testnet funds for two test wallets |
+| 2c | **Jobs paid on LEZ**: an escrow program (lock, release on accept, refund after a deadline), or payment streams (LIP-155) if they fit | 1–2 weeks | — |
+
+Open questions:
+
+1. Should the market be a **generic module** (any app with heavy steps could post jobs), or **Reelcut-only** first and
+   extracted later? I'd start Reelcut-only, with the messages kept app-neutral.
+2. Pricing: per job kind (transcribe a minute of audio, cut a reel) or per minute of machine time? Leases price by
+   time anyway; for jobs I'd start per job kind.

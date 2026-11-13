@@ -122,7 +122,8 @@ Item {
             return { id: j.id, title: j.title, url: j.url, status: j.status, step: j.step, activity: j.activity,
                      progress: j.progress, duration: j.duration, reels: (j.reels || []).length,
                      clips: (j.clips || []).length, scenes: j.scenes ? j.scenes.state || "" : "",
-                     scenesI: j.scenes ? j.scenes.i || 0 : 0, scenesN: j.scenes ? j.scenes.n || 0 : 0 }
+                     scenesI: j.scenes ? j.scenes.i || 0 : 0, scenesN: j.scenes ? j.scenes.n || 0 : 0,
+                     whereName: j.whereName || "" }
         }))
         syncJob()
         root.coreSeen = true
@@ -349,9 +350,9 @@ Item {
         if (j.status === "cancelled") return "Stopped"
         if (j.status === "queued") return "Waiting for its turn"
         if (j.status === "running") {
-            if (j.step === "cut" && j.progress && j.progress.n) return "Cutting reel " + Math.min(j.progress.i + 1, j.progress.n) + " of " + j.progress.n
+            if (j.step === "cut" && j.progress && j.progress.n) return "Cutting reel " + Math.min(j.progress.i + 1, j.progress.n) + " of " + j.progress.n + (j.whereName ? " · on " + j.whereName : "")
             if (j.step === "pick") return "Picking the clips"
-            return j.activity || "Working"
+            return (j.activity || "Working") + (j.whereName ? " · on " + j.whereName : "")
         }
         if (j.scenes === "running") return "Finding scenes" + (j.scenesN ? " " + j.scenesI + "/" + j.scenesN : "")
         if (j.status === "done") return j.reels + (j.reels === 1 ? " reel" : " reels")
@@ -427,6 +428,8 @@ Item {
     Timer { interval: root.anyRunning ? 1500 : 5000; running: true; repeat: true; onTriggered: root.refresh() }
     Component.onCompleted: { if (!root.sandboxImages) registerViewDir(); refresh(); callVia(coreName, "listAgents", [], function (raw) { var o = parse(raw); if (o && o.jobs) apply(o) }) }
 
+    // New jobs run on a paired worker (settings runOn): this computer then needs no reelcut at all.
+    readonly property bool onWorker: !!(root.st.settings && root.st.settings.runOn)
     component Label2: Text { color: root.cSub; font.pixelSize: 12; textFormat: Text.PlainText }
     component Section: Text { color: root.cFaint; font.pixelSize: 11; font.letterSpacing: 1.2; textFormat: Text.PlainText }
 
@@ -493,11 +496,11 @@ Item {
                         }
                     }
                 }
-                LogosButton { text: "Make reels"; Layout.fillWidth: true; enabled: urlField.text.trim() !== "" && !!root.st.runner && !root.st.runner.error; onClicked: root.start() }
+                LogosButton { text: "Make reels"; Layout.fillWidth: true; enabled: urlField.text.trim() !== "" && (root.onWorker || (!!root.st.runner && !root.st.runner.error)); onClicked: root.start() }
                 Link { app: root; text: "or use a video file…"; Layout.alignment: Qt.AlignHCenter; onClicked: fileDialog.open() }
 
                 Rectangle {
-                    visible: !!root.st.runner && !!root.st.runner.error
+                    visible: !root.onWorker && !!root.st.runner && !!root.st.runner.error
                     Layout.fillWidth: true
                     implicitHeight: runErr.implicitHeight + 20
                     radius: 8
@@ -772,6 +775,14 @@ Item {
             runnerBox.currentIndex = Math.max(0, ["auto", "podman", "docker", "local"].indexOf(s.runner || "auto"))
             coresBox.value = s.cores || 0
             lowPrioBox.checked = s.lowPriority === true
+            var ws = root.st.workers || []
+            runOnBox.ids = [""].concat(ws.map(function (w) { return w.id }))
+            runOnBox.currentIndex = Math.max(0, runOnBox.ids.indexOf(s.runOn || ""))
+            var me = root.st.worker || {}
+            workerBox.checked = me.enabled === true
+            workerName.text = me.name || ""
+            pairCode.text = ""
+            workerCode.text = ""
             open()
             root.callVia(root.coreName, "listAgents", [], function (raw) { var o = root.parse(raw); if (o && o.jobs) root.apply(o) })
         }
@@ -789,7 +800,11 @@ Item {
                 forumAlias: forumAliasField.text.trim(),
                 captionMargin: capPlace.margin, colour: hex(colourRow.field.text), sayingColour: hex(sayingRow.field.text), saidColour: hex(saidRow.field.text),
                 runner: ["auto", "podman", "docker", "local"][runnerBox.currentIndex],
-                cores: coresBox.value, lowPriority: lowPrioBox.checked })], "Saved")
+                cores: coresBox.value, lowPriority: lowPrioBox.checked,
+                runOn: runOnBox.ids[runOnBox.currentIndex] || "" })], "Saved")
+            var me = root.st.worker || {}
+            if (workerBox.checked !== (me.enabled === true) || (workerBox.checked && workerName.text.trim() !== (me.name || "")))
+                root.act("setWorker", [JSON.stringify({ enabled: workerBox.checked, name: workerName.text.trim() })])
             close()
         }
         anchors.centerIn: parent
@@ -1011,6 +1026,105 @@ Item {
                     Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText
                     color: root.cFaint; font.pixelSize: 12
                     text: "All cores at normal priority is the fastest: done sooner, the computer busy meanwhile. Fewer cores keep the rest free, and the job takes longer. Low priority slows Reelcut only while other apps want the CPU. Applies to the next step."
+                }
+
+                Section { text: "WHERE THE WORK RUNS"; Layout.topMargin: 10 }
+                Label2 { text: "Download, transcribe, find scenes and cut on" }
+                ComboBox {
+                    id: runOnBox
+                    property var ids: [""]
+                    Layout.fillWidth: true
+                    model: ids.map(function (id) {
+                        if (!id) return "This computer"
+                        var w = (root.st.workers || []).filter(function (x) { return x.id === id })[0]
+                        return w ? w.name + (w.online ? " (" + (w.cores || "?") + " cores)" : " (not reachable now)") : id
+                    })
+                }
+                Repeater {
+                    model: root.st.workers || []
+                    delegate: RowLayout {
+                        required property var modelData
+                        Layout.fillWidth: true
+                        spacing: 8
+                        Rectangle { width: 8; height: 8; radius: 4; color: modelData.online ? root.cOk : root.cBad }
+                        Text {
+                            Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText; font.pixelSize: 12; color: root.cSub
+                            text: modelData.name + (modelData.online
+                                ? " · " + (modelData.url || "") + (modelData.tasks && modelData.tasks.length ? " · running " + modelData.tasks.map(function (t) { return t.cmd }).join(", ") : " · idle")
+                                : " · " + (modelData.error || "not reachable"))
+                        }
+                        Link { app: root; text: "Remove"; onClicked: root.act("removeWorker", [modelData.id], "Removed " + modelData.name) }
+                    }
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 8
+                    Field { app: root; id: pairCode; Layout.fillWidth: true; Layout.preferredHeight: 34; placeholderText: "A worker's pairing code (rcw1:…)" }
+                    LogosButton { text: "Add worker"; enabled: pairCode.text.trim().indexOf("rcw1:") === 0
+                        onClicked: root.act("addWorker", [pairCode.text.trim()], "Worker added", function (o) {
+                            pairCode.text = ""
+                            var ws = o.workers || []
+                            runOnBox.ids = [""].concat(ws.map(function (w) { return w.id }))
+                            runOnBox.currentIndex = Math.max(0, runOnBox.ids.indexOf(o.settings ? o.settings.runOn || "" : ""))
+                        }) }
+                }
+                Text {
+                    Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText; color: root.cFaint; font.pixelSize: 12
+                    text: "A worker is another computer of yours with Reelcut (Basecamp, or headless with logosctl) and podman, on this network or the mesh. "
+                        + "It downloads the video, does the heavy steps and sends back the transcript, the frames and the reels; the video stays there. "
+                        + "Picking and framing stay here. Applies to new jobs."
+                }
+
+                Check { id: workerBox; text: "Let my other computers use this one as a worker"; Layout.fillWidth: true; Layout.topMargin: 6 }
+                RowLayout {
+                    visible: workerBox.checked
+                    Layout.fillWidth: true
+                    spacing: 8
+                    Label2 { text: "Its name" }
+                    Field { app: root; id: workerName; Layout.fillWidth: true; Layout.preferredHeight: 34; maximumLength: 40 }
+                }
+                Text {
+                    visible: workerBox.checked && !!root.st.worker
+                    Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText; font.pixelSize: 12
+                    color: root.st.worker && root.st.worker.error ? root.cBad : root.cFaint
+                    text: {
+                        var w = root.st.worker || {}
+                        if (w.error) return w.error
+                        if (!w.enabled) return "Save, then pair your other Basecamps."
+                        var c = (w.clients || []).map(function (x) { return x.name }).join(", ")
+                        return "Listening on port " + w.port + "." + (c ? " Paired: " + c + "." : " Not paired with anything yet.")
+                            + (w.tasks && w.tasks.length ? " Running " + w.tasks.length + " step(s) for them now." : "")
+                    }
+                }
+                Repeater {
+                    model: workerBox.checked && root.st.worker ? root.st.worker.clients || [] : []
+                    delegate: RowLayout {
+                        required property var modelData
+                        Layout.fillWidth: true
+                        Text { Layout.fillWidth: true; text: modelData.name; color: root.cSub; font.pixelSize: 12; textFormat: Text.PlainText }
+                        Link { app: root; text: "Unpair"; onClicked: root.act("unpairClient", [modelData.id], "Unpaired") }
+                    }
+                }
+                RowLayout {
+                    visible: workerBox.checked && !!root.st.worker && root.st.worker.enabled
+                    Layout.fillWidth: true
+                    spacing: 8
+                    Field { app: root; id: clientLabel; Layout.fillWidth: true; Layout.preferredHeight: 34; placeholderText: "Which computer (e.g. laptop)"; maximumLength: 40 }
+                    LogosButton { text: "Make a pairing code"
+                        onClicked: root.callVia(root.coreName, "pairClient", [clientLabel.text.trim()], function (raw) {
+                            var o = root.parse(raw)
+                            if (!o || !o.ok) { root.toast(o && o.error ? o.error : "Could not pair.", true); return }
+                            workerCode.text = o.code
+                            clientLabel.text = ""
+                            root.refresh()
+                        }) }
+                }
+                RowLayout {
+                    visible: workerCode.text !== ""
+                    Layout.fillWidth: true
+                    spacing: 8
+                    TextField { id: workerCode; Layout.fillWidth: true; readOnly: true; selectByMouse: true; color: root.cText; font.pixelSize: 11 }
+                    LogosButton { text: "Copy"; onClicked: { workerCode.selectAll(); workerCode.copy(); root.toast("Copied: paste it into the other Basecamp's Settings", false) } }
                 }
 
                 Section { text: "RUNNING"; Layout.topMargin: 10 }

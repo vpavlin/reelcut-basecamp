@@ -19,6 +19,8 @@ logos_module(
         src/reelcut_core_impl.cpp
         src/forum_post.h
         src/forum_post.cpp
+        src/remote.h
+        src/remote.cpp
     INCLUDE_DIRS src
 )
 
@@ -27,3 +29,7 @@ find_path(SODIUM_INCLUDE_DIR sodium.h REQUIRED)
 find_library(SODIUM_LIBRARY NAMES sodium libsodium REQUIRED)
 target_include_directories(${MODULE_NAME}_module_plugin PRIVATE ${SODIUM_INCLUDE_DIR})
 target_link_libraries(${MODULE_NAME}_module_plugin PRIVATE ${SODIUM_LIBRARY})
+
+# Remote execution (src/remote.cpp): a worker's HTTP server and the client. Qt Network is part of qtbase.
+find_package(Qt6 REQUIRED COMPONENTS Network)
+target_link_libraries(${MODULE_NAME}_module_plugin PRIVATE Qt6::Network)

@@ -1,6 +1,7 @@
 #include "reelcut_core_impl.h"
 #include "logos_sdk.h"
 #include "forum_post.h"
+#include "remote.h"
 #include <QMetaObject>
 
 #include <QDateTime>
@@ -12,6 +13,7 @@
 #include <QProcessEnvironment>
 #include <QRegularExpression>
 #include <QStandardPaths>
+#include <QNetworkInterface>
 #include <QSysInfo>
 #include <QTimer>
 #include <QUrl>
@@ -24,6 +26,8 @@
 #include <map>
 #include <set>
 #include <tuple>
+#include <chrono>
+#include <memory>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -45,7 +49,7 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-static const char* kVersion = "0.5.1";
+static const char* kVersion = "0.6.0";
 // Reelcut's own sessions on this computer's shrooms-agent: "reelcut-claude", "reelcut-pi".
 static const char* kLocalSession = "reelcut";
 static const char* kImage = "ghcr.io/vpavlin/reelcut:latest";
@@ -462,6 +466,11 @@ struct Job {
     json scenes = json::object(), framing = json::object();
     std::string scenesState, scenesError;
     bool scenesPulled = false;  // scenes met an image without the command: pulled once, not again
+    // Where the heavy steps run: "" this computer, else a paired worker's id (remote.h). The worker keeps
+    // the media; every other file it writes comes back here, and what Basecamp writes goes there first.
+    std::string where;
+    std::set<std::string> remoteFiles;                  // what the worker's folder holds (names)
+    std::map<std::string, std::string> pushed, pulled;  // name -> "size:mtime" of the copy known to match
     int scenesGen = 0;
     int scenesI = 0, scenesN = 0;   // clips done / all, while finding scenes
 };
@@ -551,6 +560,8 @@ struct Running {
     QPointer<QProcess> proc;
     std::string jobId, container;
     bool cancelled = false;
+    std::string task;           // on a worker: "<pair>/<task id>" (remote.h)
+    bool live() const { return proc || !task.empty(); }
 };
 
 struct ReelcutCorePrivate {
@@ -573,6 +584,21 @@ struct ReelcutCorePrivate {
     bool diarize = true;        // tell the speakers apart after transcribing
     int cores = 0;              // cores reelcut may use (0: all)
     bool lowPriority = false;   // let everything else on the computer go first
+    // ── remote execution (remote.h, docs/remote-execution.md)
+    // This computer as a worker for others:
+    bool workerOn = false;
+    int workerPort = 7471;
+    std::string workerName, workerError;
+    std::vector<reelcut::remote::Pairing> workerClients;    // who may use it
+    std::unique_ptr<reelcut::remote::WorkerServer> server;
+    // Workers this Basecamp sends steps to (by pairing id), and the default for new jobs:
+    std::map<std::string, std::unique_ptr<reelcut::remote::WorkerClient>> workers;
+    std::map<std::string, json> workerSeen;                  // id -> {online, error, hello}
+    std::string runOn;
+    struct RTask { std::string jobId, slot; std::function<void(bool, const std::string&)> done;
+                   std::shared_ptr<std::string> out; bool heavy = false; bool ending = false; };
+    std::map<std::string, RTask> rtasks;                     // "<pair>/<task>"
+    std::set<std::string> fetchWatch;                        // jobs whose download is watched on the worker
     static int allCores() { return std::max(1, (int)std::thread::hardware_concurrency()); }
     int useCores() const { return cores > 0 ? std::min(cores, allCores()) : allCores(); }
 
@@ -632,6 +658,7 @@ struct ReelcutCorePrivate {
         autoCut = jbool(s, "autoCut", autoCut);
         diarize = jbool(s, "diarize", diarize);
         lastPull = jnum(s, "lastPull", 0);
+        runOn = jstr(s, "runOn", "");
         if (!j.contains("jobs") || !j["jobs"].is_array()) return;
         for (auto& x : j["jobs"]) {
             Job b;
@@ -673,6 +700,10 @@ struct ReelcutCorePrivate {
             if (x.contains("scenes") && x["scenes"].is_object()) b.scenes = x["scenes"];
             if (x.contains("framing") && x["framing"].is_object()) b.framing = x["framing"];
             b.scenesState = b.scenes.empty() ? "" : "done";
+            b.where = jstr(x, "where", "");
+            for (auto key : {"pushed", "pulled"})
+                if (x.contains(key) && x[key].is_object())
+                    for (auto& [n, v] : x[key].items()) if (v.is_string()) (std::string(key) == "pushed" ? b.pushed : b.pulled)[n] = v.get<std::string>();
             if (b.id.empty() || b.dir.empty()) continue;
             // Whatever ran when Basecamp closed did not finish.
             // A finished job left "running" by a scene search (0.3.x): finished.
@@ -700,7 +731,7 @@ struct ReelcutCorePrivate {
                            {"stored", b.stored}, {"youtube", b.yt}, {"youtubeError", b.ytError},
                            {"youtubeReply", b.ytReply}, {"forum", b.forum}, {"forumPosted", b.forumPosted},
                            {"forumError", b.forumError}, {"ratio", b.ratio}, {"scenes", scenesOnDisk(b)},
-                           {"framing", b.framing}});
+                           {"framing", b.framing}, {"where", b.where}, {"pushed", b.pushed}, {"pulled", b.pulled}});
         std::error_code ec;
         fs::create_directories(rootDir(), ec);
         json st = settingsJson();
@@ -714,7 +745,7 @@ struct ReelcutCorePrivate {
                 {"card", card}, {"brief", brief}, {"intro", intro}, {"outro", outro}, {"captionMargin", captionMargin},
                 {"colour", colour}, {"sayingColour", sayingColour}, {"saidColour", saidColour},
                 {"storeTo", storeTo}, {"storeNode", storeNode}, {"forumAlias", forumAlias},
-                {"cores", cores}, {"allCores", allCores()}, {"lowPriority", lowPriority}};
+                {"cores", cores}, {"allCores", allCores()}, {"lowPriority", lowPriority}, {"runOn", runOn}};
     }
     static double jdbl(const json& o, const char* k, double def)
     {
@@ -735,6 +766,10 @@ struct ReelcutCorePrivate {
         captionMargin = (int)std::clamp<int64_t>(jnum(s, "captionMargin", captionMargin), -1, 1800);
         cores = (int)std::clamp<int64_t>(jnum(s, "cores", cores), 0, allCores());
         lowPriority = jbool(s, "lowPriority", lowPriority);
+        if (s.contains("runOn") && s["runOn"].is_string()) {
+            const std::string w = s["runOn"].get<std::string>();
+            if (w.empty() || workers.count(w)) runOn = w;
+        }
         if (s.contains("storeTo") && s["storeTo"].is_string()) {
             const std::string t = s["storeTo"].get<std::string>();
             if (t == "" || t == "local" || t == "node") storeTo = t;
@@ -794,7 +829,7 @@ struct ReelcutCorePrivate {
     QStringList stepArgs(const Job& b, const QStringList& reelcutArgs, const std::string& name, const char* entrypoint)
     {
         QStringList a;
-        if (!containerRunner()) return reelcutArgs;
+        if (remote(b) || !containerRunner()) return reelcutArgs;   // a worker wraps it in its own container
         a << "run" << "--rm" << "--name" << QString::fromStdString(name)
           << "-v" << QString::fromStdString(b.dir) + (runner == "podman" ? ":/work:z" : ":/work");
         // At most this many cores' worth of CPU, and reelcut sizes its threads to it.
@@ -807,7 +842,7 @@ struct ReelcutCorePrivate {
     }
     QString work(const Job& b, const std::string& rel) const
     {
-        std::string base = containerRunner() ? "/work" : b.dir;
+        std::string base = (remote(b) || containerRunner()) ? "/work" : b.dir;
         return QString::fromStdString(rel.empty() ? base : base + "/" + rel);
     }
 
@@ -864,6 +899,7 @@ struct ReelcutCorePrivate {
                           {"brief", b.brief}, {"chosen", b.chosen}, {"recut", b.recut}, {"cutOnly", b.cutOnly}, {"intro", b.intro}, {"outro", b.outro},
                           {"storage", storage},
                           {"ratio", b.ratio}, {"framing", b.framing},
+                          {"where", b.where}, {"whereName", b.where.empty() ? "" : workerLabel(b.where)},
                           {"scenes", {{"state", b.scenesState}, {"error", b.scenesError}, {"clips", b.scenes},
                                       {"i", b.scenesI}, {"n", b.scenesN}}},
                           {"forum", {{"target", b.forum}, {"state", b.forumState}, {"error", b.forumError}}},
@@ -886,6 +922,8 @@ struct ReelcutCorePrivate {
             {"forumThreads", forumThreads},
             {"delivery", {{"state", dlState}, {"error", dlError}}},
             {"forumKey", fkey.ok() ? hexBytes(fkey.pk).substr(0, 16) : ""},
+            {"workers", workersJson()},
+            {"worker", workerJson()},
         };
     }
 
@@ -898,11 +936,11 @@ struct ReelcutCorePrivate {
     bool busy(const std::string& slot) const
     {
         auto it = procs.find(slot);
-        return it != procs.end() && it->second.proc;
+        return it != procs.end() && it->second.live();
     }
     bool jobBusy(const std::string& id) const
     {
-        for (auto& [k, r] : procs) if (r.proc && r.jobId == id) return true;
+        for (auto& [k, r] : procs) if (r.live() && r.jobId == id) return true;
         return false;
     }
     static bool preparing(const Job& b) { return b.step == "fetch" || b.step == "transcribe" || b.step == "diarize"; }
@@ -939,10 +977,469 @@ struct ReelcutCorePrivate {
         QTimer::singleShot(0, guarded("schedule", [this] { schedule(); }));
     }
 
+    // What a step prints, from a process here or from a worker.
+    void onStdout(const std::string& id, const QString& chunk)
+    {
+        Job* j = find(id);
+        if (!j) return;
+        for (auto& l : chunk.split('\n')) {
+            // cut prints one line per reel it wrote.
+            if (j->step == "cut" && l.contains(".mp4 ")) j->progressI++;
+            if (j->scenesState == "running" && l.startsWith("clip ")) j->scenesI++;
+            logLine(*j, l.toStdString());
+        }
+        changed();
+    }
+    void onStderr(const std::string& id, const QString& chunk, bool heavySlot)
+    {
+        Job* j = find(id);
+        if (!j) return;
+        // transcribe counts its pieces as "\ri/N".
+        static const QRegularExpression prog("(\\d+)/(\\d+)\\s*$");
+        for (auto& piece : chunk.split(QRegularExpression("[\r\n]"))) {
+            auto m = prog.match(piece.trimmed());
+            if (m.hasMatch() && piece.trimmed() == m.captured(0)) {
+                if (heavySlot) { j->progressI = m.captured(1).toInt(); j->progressN = m.captured(2).toInt(); }
+            } else {
+                logLine(*j, piece.toStdString());
+            }
+        }
+        if (heavySlot && j->status == "running" && preparing(*j)) describe(*j);
+        changed();
+    }
+
+    // ── remote execution: this Basecamp sends steps to a worker ─────────────────────────────────
+    bool remote(const Job& b) const { return !b.where.empty(); }
+    int workerCores(const Job& b) const
+    {
+        auto it = workerSeen.find(b.where);
+        return it == workerSeen.end() ? 4 : (int)jnum(it->second.value("hello", json::object()), "cores", 4);
+    }
+    reelcut::remote::WorkerClient* clientFor(const std::string& id)
+    {
+        auto it = workers.find(id);
+        return it == workers.end() ? nullptr : it->second.get();
+    }
+    std::string workerLabel(const std::string& id) const
+    {
+        auto it = workers.find(id);
+        return it == workers.end() ? id : it->second->pairing().name;
+    }
+    static std::string fileStat(const std::string& path)
+    {
+        std::error_code ec;
+        const auto sz = fs::file_size(path, ec);
+        if (ec) return "";
+        const auto mt = std::chrono::duration_cast<std::chrono::milliseconds>(fs::last_write_time(path, ec).time_since_epoch()).count();
+        return std::to_string(sz) + ":" + std::to_string((long long)mt);
+    }
+    // The name of a task: the same command for the same job is the same task, so a Basecamp that
+    // closed and opened again finds its step still running on the worker instead of starting it twice.
+    static std::string taskId(const std::string& job, const QStringList& argv)
+    {
+        return reelcut::remote::sha256Hex(QByteArray::fromStdString(job + "\x1f") + argv.join("\x1f").toUtf8()).substr(0, 16);
+    }
+
+    void remoteLaunch(Job& b, const std::string& slot, const QStringList& argv, const std::string& container,
+                      std::function<void(bool, const std::string&)> done)
+    {
+        auto* c = clientFor(b.where);
+        const std::string id = b.id;
+        if (!c) {
+            logLine(b, "This job runs on a worker that isn't paired any more. Pair it again, or move the job to this computer.");
+            QTimer::singleShot(0, guarded("remote missing", [done] { done(false, ""); }));
+            return;
+        }
+        const std::string tid = taskId(b.id, argv);
+        const std::string key = c->pairing().id + "/" + tid;
+        procs[slot] = Running{nullptr, id, container, false, key};
+        if (slot.rfind("scenes/", 0) != 0) { b.status = "running"; b.error.clear(); }
+        rtasks[key] = RTask{id, slot, std::move(done), std::make_shared<std::string>(), slot == "heavy", false};
+        json a = json::array();
+        for (auto& x : argv) a.push_back(x.toStdString());
+        pushFiles(b, c, [this, c, key, tid, id, a](const std::string& err) {
+            if (!rtasks.count(key)) return;    // cancelled meanwhile
+            if (!err.empty()) { if (Job* j = find(id)) logLine(*j, "Could not send the files to " + c->pairing().name + ": " + err); remoteEnded(key, false); return; }
+            c->submit({{"id", tid}, {"job", id}, {"argv", a}}, [this, key, id, c](bool ok, const json& r) {
+                if (ok) return;
+                if (Job* j = find(id)) logLine(*j, c->pairing().name + " refused the step: " + jstr(r, "error", "no answer"));
+                remoteEnded(key, false);
+            });
+        });
+        // A download: watch the worker's folder, so transcribing starts as soon as the audio is there.
+        if (slot.rfind("fetch/", 0) == 0) watchFetch(id);
+        changed();
+    }
+
+    void watchFetch(const std::string& id)
+    {
+        if (!fetchWatch.insert(id).second) return;
+        QTimer::singleShot(3000, guarded("remote fetch", [this, id] {
+            fetchWatch.erase(id);
+            Job* j = find(id);
+            if (!j || !busy("fetch/" + id)) return;
+            auto* c = clientFor(j->where);
+            if (!c) return;
+            pullFiles(*j, c, [this, id](const std::string&) {
+                if (Job* j = find(id)) { if (preparing(*j)) advance(*j); watchFetch(id); }
+            });
+        }));
+    }
+
+    // What Basecamp wrote (the clip list, the framing, the cards, the brief) goes to the worker; what was
+    // deleted here (old reels before a new cut, old scenes) goes there too.
+    void pushFiles(Job& b, reelcut::remote::WorkerClient* c, std::function<void(const std::string&)> then)
+    {
+        std::vector<std::string> up, gone;
+        std::error_code ec;
+        std::set<std::string> here;
+        for (auto it = fs::recursive_directory_iterator(b.dir, ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+            if (!it->is_regular_file(ec)) continue;
+            const std::string rel = fs::relative(it->path(), b.dir, ec).string();
+            if (rel.empty() || rel[0] == '.' || rel.find("/.") != std::string::npos || reelcut::remote::isMedia(rel)) continue;
+            if (rel.size() > 9 && rel.compare(rel.size() - 9, 9, ".download") == 0) continue;
+            here.insert(rel);
+            const std::string st = fileStat(it->path().string());
+            auto pu = b.pushed.find(rel);
+            if (pu != b.pushed.end() && pu->second == st) continue;
+            up.push_back(rel);
+        }
+        for (auto& [n, st] : b.pushed) if (!here.count(n) && !reelcut::remote::isMedia(n) && !fs::exists(b.dir + "/" + n, ec)) gone.push_back(n);
+        for (auto& n : gone) { b.pushed.erase(n); b.pulled.erase(n); b.remoteFiles.erase(n); }
+        auto step = std::make_shared<std::function<void(size_t)>>();
+        const std::string id = b.id;
+        *step = [this, c, id, up, gone, then, step](size_t i) {
+            Job* j = find(id);
+            if (!j) return;
+            if (i < gone.size()) { c->remove(id, gone[i], [step, i](bool) { (*step)(i + 1); }); return; }
+            const size_t k = i - gone.size();
+            if (k >= up.size()) { save(); then(""); return; }
+            const std::string path = j->dir + "/" + up[k];
+            c->upload(id, up[k], path, [this, id, name = up[k], path, step, i, then](bool ok, const std::string& err) {
+                if (!ok) { then(name + ": " + err); return; }
+                if (Job* j = find(id)) { j->pushed[name] = fileStat(path); j->remoteFiles.insert(name); }
+                (*step)(i + 1);
+            });
+        };
+        (*step)(0);
+    }
+
+    // Everything the worker wrote comes here, except the media.
+    void pullFiles(Job& b, reelcut::remote::WorkerClient* c, std::function<void(const std::string&)> then)
+    {
+        const std::string id = b.id;
+        c->files(id, [this, c, id, then](bool ok, const json& r) {
+            Job* j = find(id);
+            if (!j) return;
+            if (!ok) { then(jstr(r, "error", "no answer")); return; }
+            std::vector<std::pair<std::string, std::string>> want;
+            std::set<std::string> there;
+            for (auto& f : r.value("files", json::array())) {
+                const std::string name = jstr(f, "name", "");
+                if (!reelcut::remote::safeName(name)) continue;
+                there.insert(name);
+                if (reelcut::remote::isMedia(name)) continue;
+                const std::string st = std::to_string(jnum(f, "size", 0)) + ":" + std::to_string(jnum(f, "mtime", 0));
+                auto pl = j->pulled.find(name);
+                if (pl != j->pulled.end() && pl->second == st) continue;
+                want.push_back({name, st});
+            }
+            // gone on the worker (and known to have come from there): gone here too
+            std::error_code ec;
+            for (auto it = j->pulled.begin(); it != j->pulled.end();) {
+                if (!there.count(it->first)) { fs::remove(j->dir + "/" + it->first, ec); j->pushed.erase(it->first); it = j->pulled.erase(it); }
+                else ++it;
+            }
+            j->remoteFiles = there;
+            auto step = std::make_shared<std::function<void(size_t)>>();
+            *step = [this, c, id, want, then, step](size_t i) {
+                Job* j = find(id);
+                if (!j) return;
+                if (i >= want.size()) { save(); then(""); return; }
+                const std::string path = j->dir + "/" + want[i].first;
+                c->download(id, want[i].first, path, [this, id, i, path, want, step, then](bool ok, const std::string& err) {
+                    Job* j = find(id);
+                    if (!j) return;
+                    if (!ok) { then(want[i].first + ": " + err); return; }
+                    j->pulled[want[i].first] = want[i].second;
+                    j->pushed[want[i].first] = fileStat(path);
+                    (*step)(i + 1);
+                });
+            };
+            (*step)(0);
+        });
+    }
+
+    // A worker's event: what a task printed, or that it ended.
+    void onWorkerEvent(const std::string& pair, const json& ev)
+    {
+        const std::string kind = jstr(ev, "kind", "");
+        if (kind == "tasks" || kind == "resync") {
+            // what the worker runs now, for Settings (a change only: no redraw per poll)
+            json& h = workerSeen[pair]["hello"];
+            if (!h.is_object()) h = json::object();
+            const json tasks = ev.value("tasks", json::array());
+            if (h.value("tasks", json::array()) != tasks) { h["tasks"] = tasks; changed(); }
+            if (kind != "resync") return;
+            // The worker restarted (or lost track): a step it no longer runs has ended.
+            std::set<std::string> running;
+            for (auto& t : ev.value("tasks", json::array())) running.insert(pair + "/" + jstr(t, "id", ""));
+            std::vector<std::string> lost;
+            for (auto& [key, t] : rtasks) if (key.rfind(pair + "/", 0) == 0 && !running.count(key) && !t.ending) lost.push_back(key);
+            for (auto& key : lost) {
+                if (Job* j = find(rtasks[key].jobId)) logLine(*j, "The worker restarted; this step stopped there.");
+                remoteEnded(key, false);
+            }
+            return;
+        }
+        const std::string key = pair + "/" + jstr(ev, "task", "");
+        auto it = rtasks.find(key);
+        if (it == rtasks.end()) return;
+        RTask& t = it->second;
+        if (kind == "out") {
+            const std::string text = jstr(ev, "text", "");
+            t.out->append(text + "\n");
+            onStdout(t.jobId, QString::fromStdString(text));
+        } else if (kind == "err") {
+            onStderr(t.jobId, QString::fromStdString(jstr(ev, "text", "")), t.heavy);
+        } else if (kind == "done" && !t.ending) {
+            t.ending = true;
+            const bool ok = jbool(ev, "ok", false);
+            Job* j = find(t.jobId);
+            auto* c = j ? clientFor(j->where) : nullptr;
+            if (!j || !c) { remoteEnded(key, false); return; }
+            // the files first, then the step counts as done
+            pullFiles(*j, c, [this, key, ok](const std::string& err) {
+                auto it = rtasks.find(key);
+                if (it == rtasks.end()) return;
+                if (!err.empty()) if (Job* j = find(it->second.jobId)) logLine(*j, "Could not bring the files back: " + err);
+                remoteEnded(key, ok && err.empty());
+            });
+        }
+    }
+
+    // As launch()'s end: the slot frees, and done() runs unless the step was cancelled.
+    void remoteEnded(const std::string& key, bool ok)
+    {
+        auto it = rtasks.find(key);
+        if (it == rtasks.end()) return;
+        RTask t = it->second;
+        rtasks.erase(it);
+        auto pit = procs.find(t.slot);
+        bool cancelled = false;
+        if (pit != procs.end() && pit->second.task == key) { cancelled = pit->second.cancelled; procs.erase(pit); }
+        else cancelled = true;
+        Job* j = find(t.jobId);
+        if (!j || cancelled) { save(); changed(); QTimer::singleShot(0, guarded("schedule", [this] { schedule(); })); return; }
+        t.done(ok, *t.out);
+    }
+
+    // ── the workers this Basecamp knows (their keys are secrets: a file only this user reads)
+    std::string workersFile() const { return rootDir() + "/workers.json"; }
+    void loadWorkers()
+    {
+        json j = json::parse(readFile(workersFile()), nullptr, false);
+        if (j.is_object() && j.contains("workers") && j["workers"].is_array())
+            for (auto& w : j["workers"]) { reelcut::remote::Pairing p; if (reelcut::remote::pairingFrom(w, p)) addClient(p); }
+        if (j.is_object() && j.contains("worker") && j["worker"].is_object()) {
+            const json& me = j["worker"];
+            workerOn = jbool(me, "enabled", false);
+            workerPort = (int)std::clamp<int64_t>(jnum(me, "port", 7471), 1, 65535);
+            workerName = jstr(me, "name", "");
+            for (auto& c : me.value("clients", json::array())) { reelcut::remote::Pairing p; if (reelcut::remote::pairingFrom(c, p)) workerClients.push_back(p); }
+        }
+    }
+    void saveWorkers()
+    {
+        json ws = json::array(), cs = json::array();
+        for (auto& [id, c] : workers) ws.push_back(reelcut::remote::pairingJson(c->pairing(), true));
+        for (auto& p : workerClients) cs.push_back(reelcut::remote::pairingJson(p, true));
+        json j = {{"workers", ws}, {"worker", {{"enabled", workerOn}, {"port", workerPort}, {"name", workerName}, {"clients", cs}}}};
+        std::error_code ec;
+        fs::create_directories(rootDir(), ec);
+        writeFile(workersFile(), j.dump(2));
+        fs::permissions(workersFile(), fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, ec);
+    }
+    void addClient(const reelcut::remote::Pairing& p)
+    {
+        auto c = std::make_unique<reelcut::remote::WorkerClient>(p);
+        const std::string id = p.id;
+        c->onEvent = [this, id](const json& ev) { onWorkerEvent(id, ev); };
+        c->onOnline = [this, id](bool on, const std::string& why) {
+            workerSeen[id]["online"] = on;
+            workerSeen[id]["error"] = on ? "" : why;
+            if (auto* c = clientFor(id)) { workerSeen[id]["hello"] = c->lastHello(); workerSeen[id]["url"] = c->pairing().url; }
+            changed();
+        };
+        workers[id] = std::move(c);
+        workerSeen[id] = {{"online", false}, {"error", ""}, {"hello", json::object()}};
+        auto* raw = workers[id].get();
+        raw->hello([this, id](bool, const json&) {
+            if (auto* c = clientFor(id)) { workerSeen[id]["hello"] = c->lastHello(); workerSeen[id]["url"] = c->pairing().url; c->listen(); }
+            changed();
+        });
+    }
+    json workerJson() const
+    {
+        json cl = json::array();
+        const json st = server ? server->status() : json::object();
+        const json seen = st.value("seen", json::object());
+        for (auto& p : workerClients) cl.push_back({{"id", p.id}, {"name", p.name}, {"seen", jnum(seen, p.name.c_str(), 0)}});
+        return {{"enabled", workerOn}, {"port", workerPort}, {"name", workerName.empty() ? QSysInfo::machineHostName().toStdString() : workerName},
+                {"listening", server && server->listening()}, {"error", workerError}, {"clients", cl},
+                {"tasks", st.value("tasks", json::array())}};
+    }
+    json workersJson() const
+    {
+        json a = json::array();
+        for (auto& [id, c] : workers) {
+            const json seen = workerSeen.count(id) ? workerSeen.at(id) : json::object();
+            const json h = seen.value("hello", json::object());
+            a.push_back({{"id", id}, {"name", c->pairing().name}, {"online", c->online()}, {"error", jstr(seen, "error", "")},
+                         {"url", c->pairing().url}, {"urls", c->pairing().urls}, {"cores", jnum(h, "cores", 0)},
+                         {"version", jstr(h, "version", "")}, {"runner", jstr(h, "runner", "")},
+                         {"tasks", h.value("tasks", json::array())}});
+        }
+        return a;
+    }
+
+    // ── this computer as a worker for others
+    void applyWorker()
+    {
+        if (!workerOn) { server.reset(); workerError.clear(); return; }
+        if (!server) {
+            const std::string root = rootDir() + "/worker";
+            std::error_code ec;
+            fs::create_directories(root, ec);
+            server = std::make_unique<reelcut::remote::WorkerServer>(root, [this](const std::string& dir, const QStringList& argv,
+                                                                                  const std::string& name, reelcut::remote::RunHooks h) {
+                return runForClient(dir, argv, name, std::move(h));
+            });
+            server->onChange = [this] { changed(); };
+        }
+        server->setPairings(workerClients);
+        server->setInfo({{"name", workerName.empty() ? QSysInfo::machineHostName().toStdString() : workerName},
+                         {"version", kVersion}, {"cores", useCores()}, {"allCores", allCores()}, {"runner", runner},
+                         {"image", kImage}});
+        if (!server->listening() || server->port() != workerPort) workerError = server->listen(workerPort);
+    }
+    // A paired client's command. The image first, if it's more than a day old (once at a time; the
+    // commands wait for it), so a worker gets reelcut's fixes and new commands like a Basecamp does.
+    bool workerPulling = false;
+    std::vector<std::function<void()>> afterPull;
+    std::function<void()> runForClient(const std::string& dir, const QStringList& argv, const std::string& name,
+                                       reelcut::remote::RunHooks h)
+    {
+        if (!runner.empty() && containerRunner() && QDateTime::currentMSecsSinceEpoch() - lastPull > kImageMaxAgeMs) {
+            auto cancelled = std::make_shared<bool>(false);
+            auto stopper = std::make_shared<std::function<void()>>();
+            afterPull.push_back([this, dir, argv, name, h, cancelled, stopper] {
+                if (*cancelled) return;
+                *stopper = runNow(dir, argv, name, h);
+            });
+            h.err("Getting the newest reelcut image on the worker first\n");
+            if (!workerPulling) {
+                workerPulling = true;
+                auto* p = new QProcess();
+                p->setProcessEnvironment(processEnv());
+                QObject::connect(p, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), guarded("worker pull", [this, p](int, QProcess::ExitStatus) {
+                    p->deleteLater();
+                    lastPull = QDateTime::currentMSecsSinceEpoch();   // tried either way (an offline worker uses what it has)
+                    workerPulling = false;
+                    save();
+                    auto waiting = std::move(afterPull);
+                    afterPull.clear();
+                    for (auto& f : waiting) f();
+                }));
+                p->start(QString::fromStdString(runnerBin), {"pull", kImage});
+            }
+            return [cancelled, stopper, h] { *cancelled = true; if (*stopper) (*stopper)(); else h.done(false); };
+        }
+        return runNow(dir, argv, name, std::move(h));
+    }
+    std::function<void()> runNow(const std::string& dir, const QStringList& argv, const std::string& name,
+                                 reelcut::remote::RunHooks h)
+    {
+        if (runner.empty()) {
+            QTimer::singleShot(0, guarded("worker no runner", [h, e = runnerError] { h.err("No way to run reelcut on the worker: " + e + "\n"); h.done(false); }));
+            return [] {};
+        }
+        QStringList args;
+        std::string bin = runnerBin;
+        if (containerRunner()) {
+            args << "run" << "--rm" << "--name" << QString::fromStdString(name)
+                 << "-v" << QString::fromStdString(dir) + (runner == "podman" ? ":/work:z" : ":/work");
+            if (cores > 0) args << QString("--cpus=%1").arg(useCores()) << "-e" << QString("REELCUT_CORES=%1").arg(useCores());
+            if (runner == "docker") args << "--user" << QString("%1:%2").arg(::getuid()).arg(::getgid());
+            else args << "--userns" << "keep-id";
+            args << kImage << argv;
+        } else {
+            // reelcut on PATH: /work is the folder itself
+            for (auto a : argv) { if (a == "/work") a = QString::fromStdString(dir); else if (a.startsWith("/work/")) a = QString::fromStdString(dir) + a.mid(5); args << a; }
+        }
+        auto* p = new QProcess();
+        p->setProcessEnvironment(processEnv());
+        p->setWorkingDirectory(QString::fromStdString(dir));
+        const bool nice = lowPriority;
+        p->setChildProcessModifier([nice] { ::setsid(); if (nice) (void)::setpriority(PRIO_PROCESS, 0, 10); });
+        if (cores > 0) { auto env = p->processEnvironment(); env.insert("REELCUT_CORES", QString::number(useCores())); p->setProcessEnvironment(env); }
+        auto partial = std::make_shared<QString>();
+        QObject::connect(p, &QProcess::readyReadStandardOutput, guarded("worker stdout", [p, h, partial] {
+            *partial += QString::fromUtf8(p->readAllStandardOutput());
+            int nl;
+            while ((nl = partial->indexOf('\n')) >= 0) { h.out(partial->left(nl).toStdString()); partial->remove(0, nl + 1); }
+        }));
+        QObject::connect(p, &QProcess::readyReadStandardError, guarded("worker stderr", [p, h] { h.err(p->readAllStandardError().toStdString()); }));
+        auto ended = std::make_shared<bool>(false);
+        QObject::connect(p, qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
+                         guarded("worker finished", [p, h, partial, ended](int code, QProcess::ExitStatus st) {
+            p->deleteLater();
+            if (!partial->isEmpty()) h.out(partial->toStdString());
+            if (*ended) return;
+            *ended = true;
+            h.done(st == QProcess::NormalExit && code == 0);
+        }));
+        QObject::connect(p, &QProcess::errorOccurred, guarded("worker start", [p, h, ended](QProcess::ProcessError e) {
+            if (e != QProcess::FailedToStart || *ended) return;
+            *ended = true;
+            p->deleteLater();
+            h.err("Could not start reelcut on the worker.\n");
+            h.done(false);
+        }));
+        p->start(QString::fromStdString(bin), args);
+        const bool container = containerRunner();
+        const std::string rb = runnerBin;
+        QPointer<QProcess> pp(p);
+        return [pp, container, rb, name] {
+            if (!pp) return;
+            const pid_t pid = (pid_t)pp->processId();
+            if (pid > 0) ::kill(-pid, SIGTERM);
+            if (container) detached(rb, {"rm", "-f", QString::fromStdString(name)});
+            QTimer::singleShot(3000, [pp, pid] { if (pp && pid > 0) ::kill(-pid, SIGKILL); });
+        };
+    }
+    // Where a client can reach this worker: every address of this computer that isn't loopback.
+    std::vector<std::string> workerUrls() const
+    {
+        std::vector<std::string> v;
+        for (auto& a : QNetworkInterface::allAddresses()) {
+            if (a.isLoopback() || a.isLinkLocal()) continue;
+            const QString host = a.protocol() == QAbstractSocket::IPv6Protocol ? "[" + a.toString() + "]" : a.toString();
+            v.push_back("http://" + host.toStdString() + ":" + std::to_string(workerPort));
+        }
+        // a name first: it survives DHCP changes on a LAN
+        const std::string hn = QSysInfo::machineHostName().toStdString();
+        if (!hn.empty()) v.insert(v.begin(), "http://" + hn + ":" + std::to_string(workerPort));
+        if (v.size() > 12) v.resize(12);
+        return v;
+    }
+
     // Starts a process for the job in a slot; done(exitOk, stdout) runs when it ends (not when cancelled).
     void launch(Job& b, const std::string& slot, const std::string& bin, const QStringList& args, const std::string& container,
                 std::function<void(bool, const std::string&)> done)
     {
+        // On a worker: everything but pulling the image (the worker has its own) and copying an import.
+        if (remote(b) && slot != "pull" && bin != "cp") { remoteLaunch(b, slot, args, container, std::move(done)); return; }
         auto* p = new QProcess();
         p->setProcessEnvironment(processEnv());
         p->setWorkingDirectory(QString::fromStdString(b.dir));
@@ -971,32 +1468,10 @@ struct ReelcutCorePrivate {
         QObject::connect(p, &QProcess::readyReadStandardOutput, guarded("stdout", [this, p, out, id] {
             QByteArray chunk = p->readAllStandardOutput();
             out->append(chunk.constData(), chunk.size());
-            if (Job* j = find(id)) {
-                for (auto& l : QString::fromUtf8(chunk).split('\n')) {
-                    // cut prints one line per reel it wrote.
-                    if (j->step == "cut" && l.contains(".mp4 ")) j->progressI++;
-                    if (j->scenesState == "running" && l.startsWith("clip ")) j->scenesI++;
-                    logLine(*j, l.toStdString());
-                }
-                changed();
-            }
+            onStdout(id, QString::fromUtf8(chunk));
         }));
         QObject::connect(p, &QProcess::readyReadStandardError, guarded("stderr", [this, p, id, heavySlot] {
-            QString chunk = QString::fromUtf8(p->readAllStandardError());
-            Job* j = find(id);
-            if (!j) return;
-            // transcribe counts its pieces as "\ri/N".
-            static const QRegularExpression prog("(\\d+)/(\\d+)\\s*$");
-            for (auto& piece : chunk.split(QRegularExpression("[\r\n]"))) {
-                auto m = prog.match(piece.trimmed());
-                if (m.hasMatch() && piece.trimmed() == m.captured(0)) {
-                    if (heavySlot) { j->progressI = m.captured(1).toInt(); j->progressN = m.captured(2).toInt(); }
-                } else {
-                    logLine(*j, piece.toStdString());
-                }
-            }
-            if (heavySlot && j->status == "running" && preparing(*j)) describe(*j);
-            changed();
+            onStderr(id, QString::fromUtf8(p->readAllStandardError()), heavySlot);
         }));
         QObject::connect(p, qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
                          guarded("finished", [this, p, out, id, slot, done](int code, QProcess::ExitStatus st) {
@@ -1027,6 +1502,14 @@ struct ReelcutCorePrivate {
     {
         if (b.fetched) return true;
         if (!b.file.empty()) return false;
+        if (remote(b)) {
+            for (auto& n : b.remoteFiles)
+                if (n.rfind("audio.", 0) == 0 && !reelcut::remote::isMedia(n.substr(6))) {
+                    const std::string ext = fs::path(n).extension().string();
+                    if (ext != ".part" && ext != ".ytdl" && ext != ".tmp" && ext != ".temp") return true;
+                }
+            return false;
+        }
         std::error_code ec;
         for (auto& e : fs::directory_iterator(b.dir, ec)) {
             std::string n = e.path().filename().string();
@@ -1043,10 +1526,11 @@ struct ReelcutCorePrivate {
     {
         if (b.status != "queued" && b.status != "running") return;
         const std::string id = b.id;
-        if (runner.empty()) { finishStep(b, runnerError.empty() ? "No way to run reelcut here." : runnerError); return; }
+        if (!remote(b) && runner.empty()) { finishStep(b, runnerError.empty() ? "No way to run reelcut here." : runnerError); return; }
         if (b.diar.empty()) b.diar = diarize ? "wanted" : "off";
         // The image first: a new download looks for a newer one (once a day), so a fix in reelcut reaches an existing install.
-        if (containerRunner()) {
+        // (A worker keeps its own image.)
+        if (!remote(b) && containerRunner()) {
             if (!imageChecked) {
                 imageChecked = true;
                 QProcess p; p.setProcessEnvironment(processEnv());
@@ -1072,7 +1556,7 @@ struct ReelcutCorePrivate {
         if (b.diar == "after" && b.transcribed) b.diar = "wanted";
         // Side by side only with cores to spare: transcribe takes four, diarize four more. On a
         // 4-core machine the two together took longer than one after the other (257 s against 185 s).
-        const bool spare = useCores() >= 8;
+        const bool spare = (remote(b) ? workerCores(b) : useCores()) >= 8;
         if (audio && b.diar == "wanted" && (spare || b.transcribed) && !busy("diarize/" + id)) startDiarize(b);
         // the frame, once the video is down
         if (b.fetched && !b.probed && (b.duration > 0 || b.transcribed) && !busy("probe/" + id)) startProbe(b);
@@ -1095,7 +1579,7 @@ struct ReelcutCorePrivate {
         const std::string id = b.id;
         std::vector<std::string> parts;
         auto h = procs.find("heavy");
-        const bool transcribing = h != procs.end() && h->second.proc && h->second.jobId == id && preparing(b);
+        const bool transcribing = h != procs.end() && h->second.live() && h->second.jobId == id && preparing(b);
         if (busy("pull") && procs["pull"].jobId == id)
             parts.push_back(imagePresent ? "Looking for a newer reelcut image" : "Downloading the reelcut image (about 1 GB, once)");
         if (transcribing)
@@ -1138,6 +1622,31 @@ struct ReelcutCorePrivate {
 
     void startFetch(Job& b)
     {
+        if (!b.file.empty() && remote(b)) {
+            // A local video for a worker: sent there once (fast on a LAN); it stays there.
+            std::string ext = fs::path(b.file).extension().string();
+            if (ext.empty()) ext = ".mp4";
+            auto* c = clientFor(b.where);
+            const std::string id = b.id, src = b.file, key = "import/" + b.id;
+            if (!c) { finishStep(b, "This job runs on a worker that isn't paired any more."); return; }
+            procs["fetch/" + id] = Running{nullptr, id, "", false, key};
+            b.status = "running"; b.error.clear();
+            logLine(b, "Sending the video to " + c->pairing().name + ".");
+            c->upload(id, "video" + ext, src, [this, id, src, key, ext](bool ok, const std::string& err) {
+                auto pit = procs.find("fetch/" + id);
+                const bool cancelled = pit == procs.end() || pit->second.task != key || pit->second.cancelled;
+                if (pit != procs.end() && pit->second.task == key) procs.erase(pit);
+                Job* j = find(id); if (!j) return;
+                if (cancelled) { sideDone(); return; }
+                if (!ok) { finishStep(*j, "Could not send the video to the worker: " + err); return; }
+                if (j->title.empty()) j->title = fs::path(src).stem().string();
+                j->remoteFiles.insert("video" + ext);
+                j->fetched = true;
+                sideDone();
+            });
+            changed();
+            return;
+        }
         if (!b.file.empty()) {
             // A local video: copied into the job's folder, so the steps (and the container) see it.
             std::string src = b.file;
@@ -1240,7 +1749,8 @@ struct ReelcutCorePrivate {
                              .arg(shq(w), QString::number(b.duration > 0 ? (int)(b.duration * 0.4) : 60));
         QStringList args;
         std::string bin = runnerBin;
-        if (containerRunner()) args = stepArgs(b, {"-c", script}, name, "sh");
+        if (remote(b)) args = {"probe", work(b, ""), "--at", QString::number(b.duration > 0 ? (int)(b.duration * 0.4) : 60)};
+        else if (containerRunner()) args = stepArgs(b, {"-c", script}, name, "sh");
         else { bin = "sh"; args = {"-c", script}; }
         launch(b, "probe/" + b.id, bin, args, name, [this, id = b.id](bool, const std::string&) {
             Job* j = find(id); if (!j) return;
@@ -1271,8 +1781,8 @@ struct ReelcutCorePrivate {
     // After picking: cut, previews, the page; one at a time over all jobs.
     void runStep(Job& b)
     {
-        if (runner.empty()) { finishStep(b, runnerError.empty() ? "No way to run reelcut here." : runnerError); return; }
-        if (containerRunner() && (!imagePresent || forcePull)) { if (!busy("pull")) pullImage(b); return; }
+        if (!remote(b) && runner.empty()) { finishStep(b, runnerError.empty() ? "No way to run reelcut here." : runnerError); return; }
+        if (!remote(b) && containerRunner() && (!imagePresent || forcePull)) { if (!busy("pull")) pullImage(b); return; }
         const std::string name = "reelcut-" + b.id;
         if (b.step == "cut") {
             const std::vector<int> only = b.cutOnly;
@@ -1330,7 +1840,7 @@ struct ReelcutCorePrivate {
             b.progressN = !only.empty() ? (int)only.size() : b.chosen.empty() ? (int)parseClips(b.clipsText).size() : (int)b.chosen.size();
             launch(b, "heavy", runnerBin, stepArgs(b, args, name, nullptr), name, [this, id = b.id](bool ok, const std::string& out) {
                 Job* j = find(id); if (!j) return;
-                if (!ok && !j->newerTried && containerRunner() && logHas(*j, "unrecognized arguments")) {
+                if (!ok && !j->newerTried && !remote(*j) && containerRunner() && logHas(*j, "unrecognized arguments")) {
                     // An image from before these settings: a newer one, then the cut again.
                     j->newerTried = true;
                     forcePull = true;
@@ -1359,7 +1869,8 @@ struct ReelcutCorePrivate {
             QString title = QString::fromStdString(b.title.empty() ? "Reels" : b.title);
             QStringList args;
             std::string bin = runnerBin;
-            if (containerRunner()) args = stepArgs(b, {"-c", script}, name, "sh");
+            if (remote(b)) args = {"thumbs", reels};
+            else if (containerRunner()) args = stepArgs(b, {"-c", script}, name, "sh");
             else { bin = "sh"; args = {"-c", script}; }
             launch(b, "heavy", bin, args, name, [this, id = b.id, title](bool ok, const std::string&) {
                 Job* j = find(id); if (!j) return;
@@ -1592,15 +2103,15 @@ struct ReelcutCorePrivate {
     // The scenes of every clip: a frame of each, the faces in it, boxes to start from. Beside the queue: it reads the video and a few frames, quickly.
     void startScenes(Job& b)
     {
-        if (runner.empty()) { b.scenesState = "failed"; b.scenesError = runnerError.empty() ? "No way to run reelcut here." : runnerError; changed(); return; }
-        if (containerRunner() && !imageChecked) {
+        if (!remote(b) && runner.empty()) { b.scenesState = "failed"; b.scenesError = runnerError.empty() ? "No way to run reelcut here." : runnerError; changed(); return; }
+        if (!remote(b) && containerRunner() && !imageChecked) {
             imageChecked = true;
             QProcess p; p.setProcessEnvironment(processEnv());
             p.start(QString::fromStdString(runnerBin), runner == "podman" ? QStringList{"image", "exists", kImage}
                                                                            : QStringList{"image", "inspect", kImage});
             imagePresent = p.waitForFinished(15000) && p.exitCode() == 0;
         }
-        if (containerRunner() && (!imagePresent || forcePull)) {
+        if (!remote(b) && containerRunner() && (!imagePresent || forcePull)) {
             b.scenesState = "running";
             if (!busy("pull")) pullImage(b, true);
             // After the pull, again.
@@ -1629,7 +2140,7 @@ struct ReelcutCorePrivate {
         b.scenesI = 0; b.scenesN = (int)parseClips(b.clipsText).size();
         launch(b, "scenes/" + b.id, runnerBin, stepArgs(b, args, name, nullptr), name, [this, id = b.id, started = b.clipsText](bool ok, const std::string&) {
             Job* j = find(id); if (!j) return;
-            if (!ok && !j->scenesPulled && containerRunner() && (logHas(*j, "invalid choice") || logHas(*j, "unrecognized arguments"))) {
+            if (!ok && !j->scenesPulled && !remote(*j) && containerRunner() && (logHas(*j, "invalid choice") || logHas(*j, "unrecognized arguments"))) {
                 // An image from before framing by hand: a newer one, then again.
                 j->scenesPulled = true;
                 forcePull = true;
@@ -1953,7 +2464,7 @@ struct ReelcutCorePrivate {
     void startPick(Job& b, const std::string& who)
     {
         if (who.empty()) { b.step = "clips"; b.status = "waiting"; save(); changed(); return; }
-        if (runner.empty()) { b.status = "failed"; b.error = runnerError; save(); changed(); return; }
+        if (!remote(b) && runner.empty()) { b.status = "failed"; b.error = runnerError; save(); changed(); return; }
         const bool local = who == "auto" || who.rfind("local:", 0) == 0;
         std::string harness;
         if (local) { detectLocalAgent(); if (jbool(localAgent, "ok", false)) harness = localHarness(who); }
@@ -1969,6 +2480,14 @@ struct ReelcutCorePrivate {
         b.activity = "Asking " + label + " for " + std::to_string(count) + " clips to choose from";
         save(); changed();
         // First the prompt (reelcut prompt prints the instructions and the transcript)...
+        if (remote(b)) {
+            // on the worker (this computer may have no reelcut at all); the brief goes inline
+            launch(b, "prompt/" + b.id, runnerBin, promptArgs(b, true), "", [this, id = b.id, who, local, harness, shrooms](bool ok, const std::string& out) {
+                Job* j = find(id);
+                promptDone(id, who, local, harness, shrooms, ok, out, j ? lastLog(*j) : "");
+            });
+            return;
+        }
         QStringList pa = promptArgs(b);
         QStringList args = containerRunner() ? stepArgs(b, pa, "reelcut-prompt-" + b.id, nullptr) : pa;
         auto* p = new QProcess();
@@ -1977,11 +2496,21 @@ struct ReelcutCorePrivate {
         QObject::connect(p, qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
                          guarded("prompt", [this, p, id = b.id, who, label, local, harness, shrooms](int code, QProcess::ExitStatus st) {
             p->deleteLater();
-            std::string prompt = p->readAllStandardOutput().toStdString();
+            const std::string prompt = p->readAllStandardOutput().toStdString();
+            promptDone(id, who, local, harness, shrooms, st == QProcess::NormalExit && code == 0, prompt,
+                       trim(p->readAllStandardError().toStdString()));
+        }));
+        p->start(QString::fromStdString(runnerBin), args);
+        (void)label;
+    }
+    void promptDone(const std::string& id, const std::string& who, bool local, const std::string& harness,
+                    const std::string& shrooms, bool ok, const std::string& prompt, const std::string& err)
+    {
+        {
             Job* j = find(id);
             if (!j || j->status != "running" || j->step != "pick") return;
-            if (st != QProcess::NormalExit || code != 0 || prompt.empty()) {
-                pickFailed(*j, "Could not build the prompt: " + trim(p->readAllStandardError().toStdString()));
+            if (!ok || prompt.empty()) {
+                pickFailed(*j, "Could not build the prompt: " + err);
                 return;
             }
             std::string ask = "From the Reelcut app on Basecamp (" + QSysInfo::machineHostName().toStdString() +
@@ -1994,16 +2523,15 @@ struct ReelcutCorePrivate {
             }
             if (local) askLocal(*j, harness, ask);
             else askMesh(*j, who, ask, shrooms);
-        }));
-        p->start(QString::fromStdString(runnerBin), args);
-        (void)label;
+        }
     }
 
     // reelcut prompt for a job: how many, how long, and the brief (from a file: it can be long).
-    QStringList promptArgs(const Job& b)
+    QStringList promptArgs(const Job& b, bool inlineBrief = false)
     {
         QStringList pa = {"prompt", work(b, ""), "-n", QString::number(count), "--min", QString::number(minLen),
                           "--max", QString::number(maxLen)};
+        if (inlineBrief) { if (!trim(b.brief).empty()) pa << "--brief" << QString::fromStdString(b.brief.substr(0, 4000)); return pa; }
         std::error_code ec;
         if (!trim(b.brief).empty()) { writeFile(b.dir + "/brief.txt", b.brief + "\n"); pa << "--brief-file" << work(b, "brief.txt"); }
         else fs::remove(b.dir + "/brief.txt", ec);
@@ -2796,6 +3324,7 @@ struct ReelcutCorePrivate {
         b.created = QDateTime::currentMSecsSinceEpoch();
         b.dir = rootDir() + "/" + QDateTime::currentDateTime().toString("yyyy-MM-dd-HHmm").toStdString() + "-" + b.id;
         b.brief = brief; b.intro = intro; b.outro = outro;
+        if (!runOn.empty() && workers.count(runOn)) b.where = runOn;
         std::error_code ec;
         fs::create_directories(b.dir, ec);
         jobs.push_back(b);
@@ -2807,6 +3336,17 @@ struct ReelcutCorePrivate {
     {
         bool any = false;
         for (auto& [slot, r] : procs) {
+            if (!r.proc && !r.task.empty() && r.jobId == id) {
+                any = true;
+                r.cancelled = true;
+                const auto slash = r.task.find('/');
+                if (slash != std::string::npos) if (auto* c = clientFor(r.task.substr(0, slash))) c->cancel(r.task.substr(slash + 1));
+                const std::string key = r.task;
+                // the worker says "done" (cancelled) and the slot frees; if it doesn't answer, free it anyway
+                QTimer::singleShot(8000, guarded("remote cancel", [this, key] { if (rtasks.count(key)) remoteEnded(key, false); }));
+                if (key.rfind("import/", 0) == 0) { procs.erase(slot); break; }
+                continue;
+            }
             if (!r.proc || r.jobId != id) continue;
             any = true;
             r.cancelled = true;
@@ -2899,10 +3439,12 @@ void ReelcutCoreImpl::onContextReady()
         if (!std::getenv("REELCUT_HOME")) adoptLegacy(g_root);
     }
     // A damaged jobs.json must never stop the module from loading.
+    try { d->loadWorkers(); }
+    catch (const std::exception& e) { std::fprintf(stderr, "[reelcut_core] workers: %s\n", e.what()); }
     try { d->load(); }
     catch (const std::exception& e) { std::fprintf(stderr, "[reelcut_core] load: %s\n", e.what()); d->jobs.clear(); }
     // No calls to other modules here (Basecamp 0.3 rejects them).
-    QTimer::singleShot(0, guarded("start", [this] { d->detectRunner(); d->detectLocalAgent(); d->changed(); d->schedule(); }));
+    QTimer::singleShot(0, guarded("start", [this] { d->detectRunner(); d->detectLocalAgent(); d->applyWorker(); d->changed(); d->schedule(); }));
 }
 
 std::string ReelcutCoreImpl::snapshot()
@@ -3015,7 +3557,13 @@ std::string ReelcutCoreImpl::getPrompt(const std::string& jobId)
     if (!fs::exists(b->dir + "/transcript-ts.txt", ec)) return json({{"ok", false}, {"error", "Transcribe it first."}}).dump();
     // reelcut prompt prints the instructions (the brief, the lengths) and the transcript.
     std::string text;
-    {
+    if (d->remote(*b)) {
+        auto* c = d->clientFor(b->where);
+        if (!c) return json({{"ok", false}, {"error", "This job's worker isn't paired any more."}}).dump();
+        std::string err;
+        text = c->runSync(b->id, d->promptArgs(*b, true), 30000, err);
+        if (text.empty()) return json({{"ok", false}, {"error", "Could not build the prompt on " + c->pairing().name + ": " + err}}).dump();
+    } else {
         if (d->runner.empty()) return json({{"ok", false}, {"error", d->runnerError}}).dump();
         QStringList pa = d->promptArgs(*b);
         QStringList args = d->containerRunner() ? d->stepArgs(*b, pa, "reelcut-prompt-" + b->id, nullptr) : pa;
@@ -3114,7 +3662,7 @@ std::string ReelcutCoreImpl::retryJob(const std::string& jobId)
     // The video came down cut short (yt-dlp said done): the video again, the transcript kept, then the step.
     const bool badVideo = b->error.find("cannot read the picture") != std::string::npos && b->file.empty() && !b->url.empty();
     b->error.clear();
-    if (badVideo && !d->runner.empty() && !d->busy("fetch/" + b->id)) { d->refetchVideo(*b); return d->state().dump(); }
+    if (badVideo && (d->remote(*b) || !d->runner.empty()) && !d->busy("fetch/" + b->id)) { d->refetchVideo(*b); return d->state().dump(); }
     if (b->step == "pick" || b->step == "clips") { d->startPick(*b, b->agent.empty() ? d->agent : b->agent); return d->state().dump(); }
     if (b->step == "done") { b->status = "done"; d->save(); d->changed(); return d->state().dump(); }
     if (b->step == "speakers") { b->status = "waiting"; d->save(); d->changed(); return d->state().dump(); }
@@ -3131,6 +3679,7 @@ std::string ReelcutCoreImpl::removeJob(const std::string& jobId, bool deleteFile
     if (!b) return json({{"ok", false}, {"error", "No such job."}}).dump();
     d->stop(*b);
     std::string dir = b->dir, id = b->id;
+    if (deleteFiles && d->remote(*b)) if (auto* c = d->clientFor(b->where)) c->forget(id);
     d->jobs.erase(std::remove_if(d->jobs.begin(), d->jobs.end(), [&](const Job& x) { return x.id == id; }), d->jobs.end());
     std::error_code ec;
     // Only ever a job folder inside the Reelcut folder.
@@ -3206,7 +3755,7 @@ std::string ReelcutCoreImpl::diarizeJob(const std::string& jobId, int64_t speake
     if (b->status == "running" || b->status == "queued") return json({{"ok", false}, {"error", "Wait for the current step to finish."}}).dump();
     std::error_code ec;
     if (!fs::exists(b->dir + "/words.json", ec)) return json({{"ok", false}, {"error", "Transcribe it first."}}).dump();
-    if (d->runner.empty()) return json({{"ok", false}, {"error", d->runnerError}}).dump();
+    if (!d->remote(*b) && d->runner.empty()) return json({{"ok", false}, {"error", d->runnerError}}).dump();
     b->speakersWanted = (int)std::clamp<int64_t>(speakers, 0, 12);
     b->spk.erase("error");
     b->diar = "wanted";
@@ -3495,4 +4044,71 @@ std::string ReelcutCoreImpl::addCard(const std::string& imagePath)
     d->changed();
     json st = d->state(); st["added"] = dst;
     return st.dump();
+}
+
+std::string ReelcutCoreImpl::setWorker(const std::string& optionsJson)
+{
+    json o = json::parse(optionsJson, nullptr, false);
+    if (!o.is_object()) return json({{"ok", false}, {"error", "Bad worker options."}}).dump();
+    if (o.contains("enabled") && o["enabled"].is_boolean()) d->workerOn = o["enabled"].get<bool>();
+    if (o.contains("port")) d->workerPort = (int)std::clamp<int64_t>(jnum(o, "port", d->workerPort), 1024, 65535);
+    if (o.contains("name") && o["name"].is_string()) d->workerName = trim(o["name"].get<std::string>()).substr(0, 40);
+    d->saveWorkers();
+    d->applyWorker();
+    d->changed();
+    return d->state().dump();
+}
+
+std::string ReelcutCoreImpl::pairClient(const std::string& label)
+{
+    reelcut::remote::Pairing p;
+    p.key = reelcut::remote::newKey();
+    if (p.key.size() != 32) return json({{"ok", false}, {"error", "Could not make a key."}}).dump();
+    p.id = reelcut::remote::pairId(p.key);
+    p.name = trim(label).substr(0, 40);
+    if (p.name.empty()) p.name = "Basecamp " + p.id.substr(0, 4);
+    d->workerClients.push_back(p);
+    d->saveWorkers();
+    if (!d->workerOn) d->workerOn = true;   // pairing means serving
+    d->saveWorkers();
+    d->applyWorker();
+    const std::string name = d->workerName.empty() ? QSysInfo::machineHostName().toStdString() : d->workerName;
+    const std::string code = reelcut::remote::pairingCode(name, d->workerUrls(), p.key);
+    d->changed();
+    return json({{"ok", true}, {"code", code}, {"id", p.id}, {"error", d->workerError}}).dump();
+}
+
+std::string ReelcutCoreImpl::unpairClient(const std::string& id)
+{
+    auto& v = d->workerClients;
+    v.erase(std::remove_if(v.begin(), v.end(), [&](const reelcut::remote::Pairing& p) { return p.id == id; }), v.end());
+    d->saveWorkers();
+    d->applyWorker();
+    d->changed();
+    return d->state().dump();
+}
+
+std::string ReelcutCoreImpl::addWorker(const std::string& code)
+{
+    reelcut::remote::Pairing p;
+    std::string err;
+    if (!reelcut::remote::parsePairingCode(code, p, err)) return json({{"ok", false}, {"error", err}}).dump();
+    d->workers.erase(p.id);
+    d->addClient(p);
+    if (d->runOn.empty()) d->runOn = p.id;   // the first worker becomes where new jobs run
+    d->saveWorkers();
+    d->save();
+    d->changed();
+    return d->state().dump();
+}
+
+std::string ReelcutCoreImpl::removeWorker(const std::string& id)
+{
+    d->workers.erase(id);
+    d->workerSeen.erase(id);
+    if (d->runOn == id) d->runOn.clear();
+    d->saveWorkers();
+    d->save();
+    d->changed();
+    return d->state().dump();
 }

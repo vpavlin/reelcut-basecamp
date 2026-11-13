@@ -144,6 +144,24 @@ public:
     // Opens an http(s) link in the browser (the sandboxed view's Qt.openUrlExternally can't).
     std::string openUrl(const std::string& url);
 
+    // ── remote execution (docs/remote-execution.md): the heavy steps on another computer you own.
+    // This computer as a worker for others: optionsJson {"enabled": bool, "port": 7471, "name": "studio-box"}.
+    std::string setWorker(const std::string& optionsJson);
+
+    // A pairing code for one more Basecamp (label: whose it is), to paste into that Basecamp's
+    // addWorker: {"ok": true, "code": "rcw1:…", "id": …}.
+    std::string pairClient(const std::string& label);
+
+    // Stop serving a paired Basecamp.
+    std::string unpairClient(const std::string& id);
+
+    // Send this Basecamp's heavy steps to a worker: its pairing code. New jobs run there when settings
+    // "runOn" is its id (setSettings).
+    std::string addWorker(const std::string& code);
+
+    // Forget a worker (its jobs stay, and say so until it is paired again).
+    std::string removeWorker(const std::string& id);
+
     void onContextReady() override;
 
 logos_events:

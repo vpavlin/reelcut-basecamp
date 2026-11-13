@@ -1,0 +1,24 @@
+[package]
+name = "reelcut_lease"
+version = "0.1.0"
+edition = "2024"
+license = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+borsh.workspace = true
+common.workspace = true
+lee.workspace = true
+lee_core.workspace = true
+program_loader_core.workspace = true
+sequencer_service_rpc = { workspace = true, features = ["client"] }
+wallet.workspace = true
+reelcut_lease_core = { path = "core" }
+reelcut_lease_methods = { path = "methods" }
+clap.workspace = true
+hex.workspace = true
+program_deployment = { path = "../program_deployment" }
+tokio = { workspace = true, features = ["macros"] }

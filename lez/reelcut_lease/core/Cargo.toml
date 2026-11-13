@@ -1,0 +1,13 @@
+[package]
+name = "reelcut_lease_core"
+version = "0.1.0"
+edition = "2024"
+license = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+borsh.workspace = true
+lee_core.workspace = true
+sha2.workspace = true

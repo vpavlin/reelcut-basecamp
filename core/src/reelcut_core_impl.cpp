@@ -613,7 +613,11 @@ struct ReelcutCorePrivate {
     struct LeaseSeen { long long paidThrough = 0, checked = 0; bool checking = false; std::string error; };
     std::map<std::string, LeaseSeen> leases;                 // client public key (raw) -> what the chain said
     QNetworkAccessManager* mkNam = nullptr;
-    static constexpr long long kResultsGraceMs = 3600LL * 1000;   // a lapsed client may still collect results
+    // After a lease ends: no new steps, but the results stay downloadable for `mkKeepMs` (stated in the
+    // offer), and for as long as the client keeps downloading (a request in the last 15 min) up to 7 days:
+    // a slow link (Logos Storage) mustn't lose a finished cut.
+    long long mkKeepMs = 24LL * 3600 * 1000;
+    static constexpr long long kActiveWindowMs = 15LL * 60 * 1000, kHardCapMs = 7LL * 24 * 3600 * 1000;
     static int allCores() { return std::max(1, (int)std::thread::hardware_concurrency()); }
     int useCores() const { return cores > 0 ? std::min(cores, allCores()) : allCores(); }
 
@@ -1284,6 +1288,7 @@ struct ReelcutCorePrivate {
             mkSequencer = jstr(mk, "sequencer", mkSequencer);
             mkProgram = jstr(mk, "program", "");
             mkAccount = jstr(mk, "account", "");
+            mkKeepMs = std::clamp<int64_t>(jnum(mk, "keepHours", 24), 1, 168) * 3600LL * 1000;
         }
         // market workers this Basecamp rented (by their offer)
         if (j.is_object() && j.contains("market") && j["market"].is_array())
@@ -1299,7 +1304,7 @@ struct ReelcutCorePrivate {
         for (auto& [id, o] : marketOffers) mws.push_back(o);
         json j = {{"workers", ws}, {"market", mws},
                   {"worker", {{"enabled", workerOn}, {"port", workerPort}, {"name", workerName}, {"clients", cs},
-                              {"market", {{"enabled", marketOn}, {"sequencer", mkSequencer}, {"program", mkProgram}, {"account", mkAccount}}}}}};
+                              {"market", {{"enabled", marketOn}, {"sequencer", mkSequencer}, {"program", mkProgram}, {"account", mkAccount}, {"keepHours", mkKeepMs / 3600000}}}}}};
         std::error_code ec;
         fs::create_directories(rootDir(), ec);
         writeFile(workersFile(), j.dump(2));
@@ -1358,7 +1363,9 @@ struct ReelcutCorePrivate {
         const bool stale = l.checked == 0 || now - l.checked > 60000 || (l.paidThrough > 0 && l.paidThrough - now < 120000 && now - l.checked > 15000);
         if (stale && !l.checking) checkLease(cpk);
         if (l.paidThrough == 0) { if (l.checked == 0 || l.checking) return 0; why = l.error.empty() ? "no paid rental for your key at this worker" : l.error; return -1; }
-        if (now > l.paidThrough + kResultsGraceMs) { why = "your rental ended: renew it"; return -1; }
+        const long long seen = server ? server->lastSeen(pairId) : 0;
+        const bool downloading = seen > 0 && now - seen < kActiveWindowMs && now < l.paidThrough + kHardCapMs;
+        if (now > l.paidThrough + mkKeepMs && !downloading) { why = "your rental ended and its results are no longer kept: renew it"; return -1; }
         out.id = pairId;
         out.key = reelcut::lease::sharedKey(mkSecret, mkPublic, cpk);
         out.name = "market " + pairId.substr(2, 8);
@@ -1424,7 +1431,7 @@ struct ReelcutCorePrivate {
         return {{"enabled", workerOn}, {"port", workerPort}, {"name", workerName.empty() ? QSysInfo::machineHostName().toStdString() : workerName},
                 {"listening", server && server->listening()}, {"error", workerError}, {"clients", cl},
                 {"tasks", st.value("tasks", json::array())}, {"key", reelcut::lease::toHex(mkPublic)},
-                {"market", {{"enabled", marketOn}, {"sequencer", mkSequencer}, {"program", mkProgram}, {"account", mkAccount}}}};
+                {"market", {{"enabled", marketOn}, {"sequencer", mkSequencer}, {"program", mkProgram}, {"account", mkAccount}, {"keepHours", mkKeepMs / 3600000}}}};
     }
     json workersJson() const
     {
@@ -1462,7 +1469,7 @@ struct ReelcutCorePrivate {
         server->setInfo({{"name", workerName.empty() ? QSysInfo::machineHostName().toStdString() : workerName},
                          {"version", kVersion}, {"cores", useCores()}, {"allCores", allCores()}, {"runner", runner},
                          {"image", kImage}, {"key", reelcut::lease::toHex(mkPublic)},
-                         {"market", {{"enabled", marketOn}, {"sequencer", mkSequencer}, {"program", mkProgram}, {"account", mkAccount}}}});
+                         {"market", {{"enabled", marketOn}, {"sequencer", mkSequencer}, {"program", mkProgram}, {"account", mkAccount}, {"keepHours", mkKeepMs / 3600000}}}});
         if (!server->listening() || server->port() != workerPort) workerError = server->listen(workerPort);
     }
     // A paired client's command. The image first, if it's more than a day old (once at a time; the
@@ -4200,6 +4207,7 @@ std::string ReelcutCoreImpl::setWorker(const std::string& optionsJson)
         std::string raw;
         if (m.contains("enabled") && m["enabled"].is_boolean()) d->marketOn = m["enabled"].get<bool>();
         if (m.contains("sequencer") && m["sequencer"].is_string()) d->mkSequencer = trim(m["sequencer"].get<std::string>());
+        if (m.contains("keepHours")) d->mkKeepMs = std::clamp<int64_t>(jnum(m, "keepHours", 24), 1, 168) * 3600LL * 1000;
         for (auto [k, v] : {std::pair<const char*, std::string*>{"program", &d->mkProgram}, {"account", &d->mkAccount}})
             if (m.contains(k) && m[k].is_string()) {
                 const std::string x = trim(m[k].get<std::string>());

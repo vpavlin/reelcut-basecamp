@@ -95,6 +95,7 @@ public:
     void setPairings(const std::vector<Pairing>& p);
     void setInfo(const json& info) { m_info = info; }   // name, version, cores: what /v1/hello says
     json status() const;                                // for the snapshot: tasks running, clients seen
+    long long lastSeen(const std::string& pair) const { auto it = m_seen.find(pair); return it == m_seen.end() ? 0 : it->second; }
     std::function<void()> onChange;
     // A client that isn't paired: a market client ("m-" + its public key in hex). Fill `out` (id, key,
     // name) and return 1 to serve it, 0 when its lease is being checked (asked to try again in a moment),

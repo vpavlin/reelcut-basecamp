@@ -102,6 +102,7 @@ std::optional<Offer> parseOffer(const std::string& st)
     o.priceLo = r.u64(); o.priceHi = r.u64();
     o.periodMs = r.u64(); o.maxPeriods = r.u32();
     o.open = r.take(1)[0] != 0;
+    o.key = r.take(32);
     o.rentals = r.u64(); o.periodsSold = r.u64();
     if (!r.ok || r.i != st.size()) return std::nullopt;
     return o;
@@ -117,13 +118,14 @@ std::optional<Lease> parseLease(const std::string& st)
     return l;
 }
 
-std::string setOfferMessage(const std::string& treasury, uint64_t price, uint64_t periodMs, uint32_t maxPeriods, bool open)
+std::string setOfferMessage(const std::string& treasury, uint64_t price, uint64_t periodMs, uint32_t maxPeriods, bool open, const std::string& key)
 {
     std::string m(1, '\0');               // Message::SetOffer
     m += treasury;
     le(m, price, 8); le(m, 0, 8);         // u128
     le(m, periodMs, 8); le(m, maxPeriods, 4);
     m.push_back(open ? 1 : 0);
+    m += key.size() == 32 ? key : std::string(32, '\0');
     return m;
 }
 

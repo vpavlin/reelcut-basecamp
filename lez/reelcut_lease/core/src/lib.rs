@@ -13,6 +13,9 @@ pub struct Offer {
     pub max_periods: u32,
     /// Off: no new rentals (running leases stay valid).
     pub open: bool,
+    /// The worker's link key (X25519 public key): clients talk only to the worker holding it, so an
+    /// offer seen elsewhere (with another address or key) can't send them to someone else.
+    pub key: [u8; 32],
 }
 
 /// What clients did at a worker: written by this program only. (Reviews and other reputation

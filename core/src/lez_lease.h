@@ -24,6 +24,7 @@ struct Offer {
     uint64_t periodMs = 0;
     uint32_t maxPeriods = 0;
     bool open = false;
+    std::string key;                     // the worker's link key (X25519 public)
     uint64_t rentals = 0, periodsSold = 0;
 };
 struct Lease {
@@ -33,7 +34,7 @@ struct Lease {
 std::optional<Offer> parseOffer(const std::string& state);
 std::optional<Lease> parseLease(const std::string& state);
 
-std::string setOfferMessage(const std::string& treasury, uint64_t price, uint64_t periodMs, uint32_t maxPeriods, bool open);
+std::string setOfferMessage(const std::string& treasury, uint64_t price, uint64_t periodMs, uint32_t maxPeriods, bool open, const std::string& key);
 std::string rentMessage(const std::string& clientKey, const std::string& payer, uint32_t periods, uint64_t nowMs);
 
 // The two keys' shared secret as a 32-byte HMAC key for the worker link (X25519, then BLAKE2b with both

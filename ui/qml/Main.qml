@@ -783,6 +783,11 @@ Item {
             workerName.text = me.name || ""
             pairCode.text = ""
             workerCode.text = ""
+            var lw = root.st.lezWallet || {}
+            lezConfigField.text = lw.config || ""
+            lezStorageField.text = lw.storage || ""
+            lezPayerField.text = lw.payer || ""
+            lezPasswordField.text = ""
             open()
             root.callVia(root.coreName, "listAgents", [], function (raw) { var o = root.parse(raw); if (o && o.jobs) root.apply(o) })
         }
@@ -1056,6 +1061,73 @@ Item {
                         Link { app: root; text: "Remove"; onClicked: root.act("removeWorker", [modelData.id], "Removed " + modelData.name) }
                     }
                 }
+                // The market: workers others offer, checked against the chain
+                RowLayout {
+                    Layout.fillWidth: true; spacing: 8
+                    LogosButton { text: "Find workers on the market"; enabled: !root.st.market || root.st.market.state !== "searching"
+                        onClicked: root.act("findWorkers", []) }
+                    Text {
+                        Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText; font.pixelSize: 12
+                        color: root.st.market && root.st.market.error ? root.cBad : root.cFaint
+                        text: !root.st.market ? "" : root.st.market.error ? root.st.market.error
+                            : root.st.market.state === "searching" ? "Looking at the offers posted lately…"
+                            : root.st.market.state === "checking" ? "Checking them against the chain…"
+                            : root.st.market.state === "done" ? ((root.st.market.found || []).length + " offer(s)") : ""
+                    }
+                }
+                Repeater {
+                    model: root.st.market ? root.st.market.found || [] : []
+                    delegate: RowLayout {
+                        required property var modelData
+                        readonly property var o: modelData.offer || {}
+                        readonly property var c: modelData.chain
+                        readonly property bool added: (root.st.workers || []).some(function (w) { return w.market && w.name === o.name })
+                        Layout.fillWidth: true; spacing: 8
+                        Text {
+                            Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText; font.pixelSize: 12
+                            color: modelData.error ? root.cBad : root.cSub
+                            text: o.name + " · " + (o.cores || "?") + " cores · " + (c ? c.price + " per " + Math.round(c.periodMs / 60000) + " min, "
+                                  + c.rentals + " rentals so far" + (c.open ? "" : " · closed") : modelData.error || "checking…")
+                        }
+                        LogosButton { text: added ? "Added" : "Add"; enabled: !!c && c.open && !added
+                            onClicked: root.act("addMarketWorker", [JSON.stringify(o)], "Added " + o.name) }
+                    }
+                }
+                Text {
+                    Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText; color: root.cFaint; font.pixelSize: 12
+                    text: "A rented worker sees the videos it works on: rent strangers' workers for public videos, use your own for private ones. Everything between you and it is encrypted."
+                }
+                // Rented workers (the market): price, how long you're paid up, rent more
+                Repeater {
+                    model: (root.st.workers || []).filter(function (w) { return w.market })
+                    delegate: ColumnLayout {
+                        required property var modelData
+                        readonly property var rent: modelData.rental || {}
+                        readonly property var offer: rent.offer || {}
+                        Layout.fillWidth: true
+                        spacing: 4
+                        Text {
+                            Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText; font.pixelSize: 12
+                            color: rent.state === "failed" ? root.cBad : root.cFaint
+                            text: {
+                                var t = modelData.name + ": "
+                                if (offer.price !== undefined) t += offer.price + " per " + Math.round((offer.periodMs || 0) / 60000) + " min (up to " + offer.maxPeriods + "). "
+                                var left = (rent.paidThrough || 0) - Date.now()
+                                t += left > 0 ? "Paid for " + Math.ceil(left / 60000) + " more min." : "Not rented now."
+                                if (rent.state === "paying") t += " Paying…"
+                                if (rent.state === "confirming") t += " Waiting for the chain…"
+                                if (rent.state === "failed") t += " " + (rent.error || "The payment failed.")
+                                return t
+                            }
+                        }
+                        RowLayout {
+                            spacing: 8
+                            SpinBox { id: periodsBox; from: 1; to: offer.maxPeriods || 24; value: 1; editable: true }
+                            LogosButton { text: "Rent"; enabled: rent.state !== "paying" && rent.state !== "confirming"
+                                onClicked: root.act("rentWorker", [modelData.id, periodsBox.value], "Paying " + modelData.name) }
+                        }
+                    }
+                }
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: 8
@@ -1073,6 +1145,21 @@ Item {
                     text: "A worker is another computer of yours with Reelcut (Basecamp, or headless with logosctl) and podman, on this network or the mesh. "
                         + "It downloads the video, does the heavy steps and sends back the transcript, the frames and the reels; the video stays there. "
                         + "Picking and framing stay here. Applies to new jobs."
+                }
+
+                Label2 { text: "Paying for rented workers: your LEZ wallet"; Layout.topMargin: 6 }
+                RowLayout {
+                    Layout.fillWidth: true; spacing: 8
+                    Field { app: root; id: lezConfigField; Layout.fillWidth: true; Layout.preferredHeight: 32; placeholderText: "wallet_config.json" }
+                    Field { app: root; id: lezStorageField; Layout.fillWidth: true; Layout.preferredHeight: 32; placeholderText: "storage.json" }
+                }
+                RowLayout {
+                    Layout.fillWidth: true; spacing: 8
+                    Field { app: root; id: lezPayerField; Layout.fillWidth: true; Layout.preferredHeight: 32; placeholderText: "Paying account (base58)" }
+                    Field { app: root; id: lezPasswordField; Layout.preferredWidth: 140; Layout.preferredHeight: 32; placeholderText: "Password"; echoMode: TextInput.Password }
+                    LogosButton { text: "Save wallet"
+                        onClicked: root.act("setLezWallet", [JSON.stringify({ config: lezConfigField.text.trim(), storage: lezStorageField.text.trim(),
+                                                                                payer: lezPayerField.text.trim(), password: lezPasswordField.text })], "Wallet saved") }
                 }
 
                 Check { id: workerBox; text: "Let my other computers use this one as a worker"; Layout.fillWidth: true; Layout.topMargin: 6 }

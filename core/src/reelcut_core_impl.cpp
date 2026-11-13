@@ -3,6 +3,7 @@
 #include "forum_post.h"
 #include "remote.h"
 #include "lez_lease.h"
+#include "logos_lp_client.h"
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
@@ -943,6 +944,8 @@ struct ReelcutCorePrivate {
             {"forumKey", fkey.ok() ? hexBytes(fkey.pk).substr(0, 16) : ""},
             {"workers", workersJson()},
             {"marketKey", reelcut::lease::toHex(mkPublic)},
+            {"market", {{"state", findState}, {"error", findError}, {"found", found}}},
+            {"lezWallet", {{"config", lezConfig}, {"storage", lezStorage}, {"payer", lezPayer}, {"password", !lezPassword.empty()}}},
             {"worker", workerJson()},
         };
     }
@@ -1290,6 +1293,10 @@ struct ReelcutCorePrivate {
             mkAccount = jstr(mk, "account", "");
             mkKeepMs = std::clamp<int64_t>(jnum(mk, "keepHours", 24), 1, 168) * 3600LL * 1000;
         }
+        if (j.is_object() && j.contains("lez") && j["lez"].is_object()) {
+            const json& l = j["lez"];
+            lezConfig = jstr(l, "config", ""); lezStorage = jstr(l, "storage", ""); lezPassword = jstr(l, "password", ""); lezPayer = jstr(l, "payer", "");
+        }
         // market workers this Basecamp rented (by their offer)
         if (j.is_object() && j.contains("market") && j["market"].is_array())
             for (auto& o : j["market"]) addMarketClient(o);
@@ -1303,6 +1310,7 @@ struct ReelcutCorePrivate {
         json mws = json::array();
         for (auto& [id, o] : marketOffers) mws.push_back(o);
         json j = {{"workers", ws}, {"market", mws},
+                  {"lez", {{"config", lezConfig}, {"storage", lezStorage}, {"password", lezPassword}, {"payer", lezPayer}}},
                   {"worker", {{"enabled", workerOn}, {"port", workerPort}, {"name", workerName}, {"clients", cs},
                               {"market", {{"enabled", marketOn}, {"sequencer", mkSequencer}, {"program", mkProgram}, {"account", mkAccount}, {"keepHours", mkKeepMs / 3600000}}}}}};
         std::error_code ec;
@@ -1311,6 +1319,242 @@ struct ReelcutCorePrivate {
         fs::permissions(workersFile(), fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, ec);
     }
     std::map<std::string, json> marketOffers;                // pairing id ("m-…") -> the worker's offer
+    // Paying (client side): the person's LEZ wallet, opened in lez_core (called by name: no build-time
+    // dependency on LEZ), and the account that pays.
+    std::string lezConfig, lezStorage, lezPassword, lezPayer;   // payer: base58
+    std::unique_ptr<logos::LpClient> lez;
+    struct Rental { std::string state, error, tx; long long paidThrough = 0, checked = 0, wantAbove = 0; json offer; };
+    std::map<std::string, Rental> rentals;                   // market worker id -> what the chain and the last rent said
+
+    // A JSON-RPC call to a sequencer; cb(result or null, error).
+    void rpc(const std::string& url, const std::string& method, const json& params, std::function<void(const json&, const std::string&)> cb)
+    {
+        if (!mkNam) mkNam = new QNetworkAccessManager(loop);
+        QNetworkRequest rq(QUrl(QString::fromStdString(url)));
+        rq.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+        QNetworkReply* r = mkNam->post(rq, QByteArray::fromStdString(json({{"jsonrpc", "2.0"}, {"id", 1}, {"method", method}, {"params", params}}).dump()));
+        QTimer::singleShot(15000, r, [r] { if (r->isRunning()) r->abort(); });
+        QObject::connect(r, &QNetworkReply::finished, loop, guarded("rpc", [r, cb] {
+            r->deleteLater();
+            const json j = json::parse(r->readAll().toStdString(), nullptr, false);
+            if (r->error() != QNetworkReply::NoError || !j.is_object()) { cb(json(), "the chain didn't answer: " + r->errorString().toStdString()); return; }
+            if (j.contains("error")) { cb(json(), "the chain refused: " + j["error"].dump().substr(0, 200)); return; }
+            cb(j.value("result", json()), "");
+        }));
+    }
+    // One program's state of an account (raw bytes), from getAccountView.
+    static std::string actorState(const json& result, const std::string& program)
+    {
+        std::string bytes;
+        if (!result.is_object()) return bytes;
+        const json st = result.value("data", json::object()).value("actor_states", json::object());
+        if (st.contains(program) && st[program].is_array()) for (auto& b : st[program]) bytes.push_back((char)b.get<int>());
+        return bytes;
+    }
+    // A market worker's terms and this Basecamp's lease there, read from the chain (not from the worker).
+    void refreshRental(const std::string& id, std::function<void()> then = nullptr)
+    {
+        auto it = marketOffers.find(id);
+        if (it == marketOffers.end()) return;
+        const json o = it->second;
+        const std::string seq = jstr(o, "sequencer", mkSequencer), program = jstr(o, "program", ""), worker = jstr(o, "account", "");
+        std::string prog, wk;
+        if (!reelcut::lease::unbase58(program, prog) || !reelcut::lease::unbase58(worker, wk)) { rentals[id].error = "the offer has no LEZ terms"; return; }
+        rpc(seq, "getAccountView", json::array({{{"account_id", worker}, {"program_account_id", program}}}),
+            [this, id, seq, program, prog, wk, then](const json& res, const std::string& err) {
+            Rental& r = rentals[id];
+            if (!err.empty()) { r.error = err; changed(); return; }
+            auto offer = reelcut::lease::parseOffer(actorState(res, program));
+            if (!offer) { r.error = "this worker has no offer on the chain"; changed(); return; }
+            // the key it was offered with must be the one on the chain: else it's someone else's address
+            const std::string offeredKey = QByteArray::fromHex(QByteArray::fromStdString(jstr(marketOffers[id], "key", ""))).toStdString();
+            if (offer->key != offeredKey) { r.error = "this offer's key isn't the one on the chain: not paying"; r.offer = json(); changed(); return; }
+            r.offer = {{"treasury", reelcut::lease::base58(offer->treasury)}, {"price", offer->priceLo}, {"periodMs", offer->periodMs},
+                       {"maxPeriods", offer->maxPeriods}, {"open", offer->open}, {"rentals", offer->rentals}, {"periodsSold", offer->periodsSold}};
+            const std::string lease = reelcut::lease::base58(reelcut::lease::leaseAccount(prog, wk, mkPublic));
+            rpc(seq, "getAccountView", json::array({{{"account_id", lease}, {"program_account_id", program}}}),
+                [this, id, then](const json& res2, const std::string& err2) {
+                Rental& r = rentals[id];
+                r.checked = QDateTime::currentMSecsSinceEpoch();
+                if (!err2.empty()) { r.error = err2; changed(); return; }
+                auto l = reelcut::lease::parseLease(actorState(res2, jstr(marketOffers[id], "program", "")));
+                r.paidThrough = l && l->clientKey == mkPublic ? (long long)l->paidThroughMs : 0;
+                if (r.state == "confirming" && r.paidThrough > r.wantAbove) { r.state = "paid"; r.error.clear(); }
+                if (then) then();
+                changed();
+            });
+        });
+    }
+    // Pay for `periods` more at a market worker, from the person's LEZ wallet (lez_core).
+    std::string rent(const std::string& id, int periods)
+    {
+        auto it = marketOffers.find(id);
+        if (it == marketOffers.end()) return "Not a market worker.";
+        if (lezConfig.empty() || lezStorage.empty() || lezPayer.empty()) return "Set your LEZ wallet and paying account in Settings first.";
+        Rental& r = rentals[id];
+        if (r.state == "paying" || r.state == "confirming") return "";
+        if (r.offer.is_null() || r.offer.empty()) { refreshRental(id, [this, id, periods] { rent(id, periods); }); return ""; }
+        if (!jbool(r.offer, "open", false)) return "This worker takes no new rentals.";
+        if (periods < 1 || periods > (int)jnum(r.offer, "maxPeriods", 1)) return "This worker rents 1 to " + std::to_string(jnum(r.offer, "maxPeriods", 1)) + " periods.";
+        const json o = it->second;
+        std::string prog, wk, treasury, payer;
+        if (!reelcut::lease::unbase58(jstr(o, "program", ""), prog) || !reelcut::lease::unbase58(jstr(o, "account", ""), wk) ||
+            !reelcut::lease::unbase58(jstr(r.offer, "treasury", ""), treasury) || !reelcut::lease::unbase58(lezPayer, payer))
+            return "The offer or your paying account isn't a LEZ account id.";
+        const std::string lease = reelcut::lease::leaseAccount(prog, wk, mkPublic);
+        const std::string msg = reelcut::lease::rentMessage(mkPublic, payer, (uint32_t)periods, (uint64_t)QDateTime::currentMSecsSinceEpoch());
+        json bytes = json::array();
+        for (unsigned char c : msg) bytes.push_back((int)c);
+        using reelcut::lease::toHex;
+        const std::string native(32, ' ');
+        const json args = json::array({json::array({toHex(wk), toHex(payer), toHex(treasury), toHex(lease)}), 0,
+                                       json::array({false, true, false, false}), bytes, toHex(payer),
+                                       json::array({toHex(prog), toHex(native), toHex(native), toHex(prog)})});
+        r.state = "paying"; r.error.clear(); r.tx.clear(); r.wantAbove = std::max<long long>(r.paidThrough, QDateTime::currentMSecsSinceEpoch());
+        changed();
+        if (!lez) lez = std::make_unique<logos::LpClient>("lez_core", "reelcut_core");
+        // the wallet first (an open wallet answers list_accounts), then the transaction
+        auto send = [this, id, args] {
+            lez->invokeAsyncResult("send_generic_public_transaction", args, [this, id](nlohmann::json v, const logos::CallError& e) {
+                onLoop([this, id, v, code = e.code] {
+                    Rental& r = rentals[id];
+                    json res = v.is_string() ? json::parse(v.get<std::string>(), nullptr, false) : v;
+                    if (!res.is_object() || !jbool(res, "success", false)) {
+                        r.state = "failed";
+                        r.error = res.is_object() ? jstr(res, "error", "the wallet refused") : "lez_core didn't answer (" + code + "): is it installed?";
+                        changed(); return;
+                    }
+                    r.tx = jstr(res, "tx_hash", "");
+                    r.state = "confirming";
+                    changed();
+                    watchRental(id, 0);
+                });
+            }, 120000);
+        };
+        lez->invokeAsyncResult("list_accounts", json::array(), [this, id, send](nlohmann::json v, const logos::CallError&) {
+            onLoop([this, id, v, send] {
+                if (v.is_array()) { send(); return; }
+                lez->invokeAsyncResult("open", json::array({lezConfig, lezStorage, lezPassword, true}), [this, id, send](nlohmann::json ov, const logos::CallError& e) {
+                    onLoop([this, id, ov, send, code = e.code] {
+                        if (!ov.is_number() || ov.get<long long>() != 0) {
+                            Rental& r = rentals[id];
+                            r.state = "failed";
+                            r.error = ov.is_number() ? "could not open the LEZ wallet (error " + std::to_string(ov.get<long long>()) + ")" : "lez_core didn't answer (" + code + "): is it installed?";
+                            changed(); return;
+                        }
+                        send();
+                    });
+                }, 60000);
+            });
+        }, 30000);
+        return "";
+    }
+    // ── offers on Logos Messaging: workers on the market post one every 10 min (Store keeps them);
+    // "Find workers" reads them back and checks each against the chain.
+    static constexpr const char* kOffersTopic = "/reelcut-market/1/offers/json";
+    bool offerTimerArmed = false;
+    json found = json::array();          // offers found: [{offer, chain: {...} | null, error}]
+    std::string findState, findError;
+    json offerJson() const
+    {
+        return {{"v", 1}, {"name", workerName.empty() ? QSysInfo::machineHostName().toStdString() : workerName},
+                {"urls", workerUrls()}, {"key", reelcut::lease::toHex(mkPublic)}, {"account", mkAccount}, {"program", mkProgram},
+                {"sequencer", mkSequencer}, {"cores", useCores()}, {"keepHours", mkKeepMs / 3600000},
+                {"ts", QDateTime::currentMSecsSinceEpoch()}};
+    }
+    void postOffer()
+    {
+        if (!marketOn || !server || mkProgram.empty() || mkAccount.empty()) { offerTimerArmed = false; return; }
+        ensureDelivery([this](const std::string& err) {
+            if (!err.empty()) return;
+            subscribeTopic(kOffersTopic);
+            const std::string wire = offerJson().dump();
+            q->modules().delivery_module.sendAsyncResult(kOffersTopic, std::vector<uint8_t>(wire.begin(), wire.end()),
+                                                          [](logos::AsyncResult<StdLogosResult>) {}, 30000);
+        });
+        QTimer::singleShot(10 * 60 * 1000, loop, guarded("offer", [this] { postOffer(); }));
+    }
+    void findWorkers()
+    {
+        if (findState == "searching") return;
+        findState = "searching"; findError.clear();
+        changed();
+        ensureDelivery([this](const std::string& err) {
+            if (!err.empty()) { findState = "failed"; findError = err; changed(); return; }
+            auto acc = std::make_shared<std::map<std::string, json>>();
+            queryOffers(acc, 0, "", 0);
+        });
+    }
+    void queryOffers(std::shared_ptr<std::map<std::string, json>> acc, size_t peer, const std::string& cursor, int page)
+    {
+        const auto peers = reelcut::forum::storeNodes();
+        if (peer >= peers.size()) { offersDone(*acc); return; }
+        const long long since = (QDateTime::currentMSecsSinceEpoch() - 3LL * 3600 * 1000) * 1000000LL;   // ns, the last 3 h
+        json rq = {{"requestId", QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString()}, {"includeData", true},
+                   {"paginationForward", false}, {"paginationLimit", 100}, {"timeStart", since},
+                   {"pubsubTopic", reelcut::forum::pubsubTopic(kOffersTopic, 3)}, {"contentTopics", json::array({kOffersTopic})}};
+        if (!cursor.empty()) rq["paginationCursor"] = cursor;
+        q->modules().delivery_module.storeQueryAsyncResult(rq.dump(), peers[peer], 8000, [this, acc, peer, page](logos::AsyncResult<StdLogosResult> ar) {
+            json resp;
+            if (ar.ok() && ar.value.success) { resp = ar.value.value; if (resp.is_string()) resp = json::parse(resp.get<std::string>(), nullptr, false); }
+            onLoop([this, acc, peer, page, resp] {
+                std::string next;
+                if (resp.is_object() && resp.contains("messages") && resp["messages"].is_array()) {
+                    for (auto& m : resp["messages"]) {
+                        if (!m.is_object() || !m.contains("message")) continue;
+                        const QByteArray raw = QByteArray::fromBase64(QByteArray::fromStdString(jstr(m["message"], "payload", "")));
+                        const json o = json::parse(raw.toStdString(), nullptr, false);
+                        if (!o.is_object() || jnum(o, "v", 0) != 1 || jstr(o, "key", "").size() != 64) continue;
+                        const std::string k = jstr(o, "key", "");
+                        if (!acc->count(k) || jnum((*acc)[k], "ts", 0) < jnum(o, "ts", 0)) (*acc)[k] = o;   // the newest per worker
+                    }
+                    next = jstr(resp, "paginationCursor", "");
+                }
+                if (!next.empty() && page < 5) queryOffers(acc, peer, next, page + 1);
+                else if (!acc->empty()) offersDone(*acc);        // one store node that knew is enough
+                else queryOffers(acc, peer + 1, "", 0);
+            });
+        }, 20000);
+    }
+    void offersDone(const std::map<std::string, json>& acc)
+    {
+        found = json::array();
+        for (auto& [k, o] : acc) {
+            if (reelcut::lease::toHex(mkPublic) == k) continue;   // our own
+            found.push_back({{"offer", o}, {"chain", nullptr}, {"error", ""}});
+        }
+        findState = "checking";
+        changed();
+        // each against the chain: terms from there, and the key must be the one the chain names
+        for (size_t i = 0; i < found.size(); ++i) {
+            const json o = found[i]["offer"];
+            rpc(jstr(o, "sequencer", mkSequencer), "getAccountView", json::array({{{"account_id", jstr(o, "account", "")}, {"program_account_id", jstr(o, "program", "")}}}),
+                [this, i, o](const json& res, const std::string& err) {
+                if (i >= found.size()) return;
+                json& f = found[i];
+                auto off = err.empty() ? reelcut::lease::parseOffer(actorState(res, jstr(o, "program", ""))) : std::nullopt;
+                if (!off) f["error"] = err.empty() ? "no offer on the chain" : err;
+                else if (reelcut::lease::toHex(off->key) != jstr(o, "key", "")) f["error"] = "its key isn't the one on the chain";
+                else f["chain"] = {{"price", off->priceLo}, {"periodMs", off->periodMs}, {"maxPeriods", off->maxPeriods}, {"open", off->open},
+                                   {"rentals", off->rentals}, {"periodsSold", off->periodsSold}};
+                findState = "done";
+                changed();
+            });
+        }
+        if (found.empty()) findState = "done";
+        changed();
+    }
+
+    // After sending: read the lease until it's extended (blocks are seconds to minutes apart).
+    void watchRental(const std::string& id, int tries)
+    {
+        QTimer::singleShot(tries == 0 ? 8000 : 15000, loop, guarded("rental", [this, id, tries] {
+            Rental& r = rentals[id];
+            if (r.state != "confirming") return;
+            if (tries > 60) { r.state = "failed"; r.error = "sent, but not on the chain after 15 minutes (tx " + r.tx.substr(0, 12) + ")"; changed(); return; }
+            refreshRental(id, [this, id, tries] { if (rentals[id].state == "confirming") watchRental(id, tries + 1); });
+        }));
+    }
     void loadMarketKey()
     {
         const std::string path = rootDir() + "/market.key";
@@ -1348,6 +1592,7 @@ struct ReelcutCorePrivate {
         marketOffers[localId] = offer;
         workers.erase(localId);
         addClient(p, localId);
+        QTimer::singleShot(0, loop, guarded("rental", [this, localId] { refreshRental(localId); }));
         return true;
     }
 
@@ -1443,6 +1688,8 @@ struct ReelcutCorePrivate {
                          {"url", c->pairing().url}, {"urls", c->pairing().urls}, {"cores", jnum(h, "cores", 0)},
                          {"version", jstr(h, "version", "")}, {"runner", jstr(h, "runner", "")},
                          {"market", id.rfind("m-", 0) == 0},
+                         {"rental", rentals.count(id) ? json({{"state", rentals.at(id).state}, {"error", rentals.at(id).error}, {"tx", rentals.at(id).tx},
+                                                              {"paidThrough", rentals.at(id).paidThrough}, {"offer", rentals.at(id).offer}}) : json(nullptr)},
                          {"tasks", h.value("tasks", json::array())}, {"boot", c->boot()}, {"restarts", jnum(seen, "restarts", 0)},
                          {"waiting", [&] { int n = 0; for (auto& [k, t] : rtasks) if (k.rfind(id + "/", 0) == 0) ++n; return n; }()}});
         }
@@ -1471,6 +1718,7 @@ struct ReelcutCorePrivate {
                          {"image", kImage}, {"key", reelcut::lease::toHex(mkPublic)},
                          {"market", {{"enabled", marketOn}, {"sequencer", mkSequencer}, {"program", mkProgram}, {"account", mkAccount}, {"keepHours", mkKeepMs / 3600000}}}});
         if (!server->listening() || server->port() != workerPort) workerError = server->listen(workerPort);
+        if (marketOn && !offerTimerArmed) { offerTimerArmed = true; QTimer::singleShot(5000, loop, guarded("offer", [this] { postOffer(); })); }
     }
     // A paired client's command. The image first, if it's more than a day old (once at a time; the
     // commands wait for it), so a worker gets reelcut's fixes and new commands like a Basecamp does.
@@ -4282,5 +4530,34 @@ std::string ReelcutCoreImpl::addMarketWorker(const std::string& offerJson)
     if (!o.is_object() || !d->addMarketClient(o)) return json({{"ok", false}, {"error", "Not a worker offer (name, urls, key)."}}).dump();
     d->saveWorkers();
     d->changed();
+    return d->state().dump();
+}
+
+std::string ReelcutCoreImpl::setLezWallet(const std::string& walletJson)
+{
+    json w = json::parse(walletJson, nullptr, false);
+    if (!w.is_object()) return json({{"ok", false}, {"error", "Bad wallet settings."}}).dump();
+    std::string raw;
+    const std::string payer = trim(jstr(w, "payer", d->lezPayer));
+    if (!payer.empty() && !reelcut::lease::unbase58(payer, raw)) return json({{"ok", false}, {"error", "The paying account isn't a LEZ account id (base58)."}}).dump();
+    d->lezConfig = localPathFrom(jstr(w, "config", d->lezConfig));
+    d->lezStorage = localPathFrom(jstr(w, "storage", d->lezStorage));
+    if (w.contains("password") && w["password"].is_string()) d->lezPassword = w["password"].get<std::string>();
+    d->lezPayer = payer;
+    d->saveWorkers();
+    d->changed();
+    return d->state().dump();
+}
+
+std::string ReelcutCoreImpl::rentWorker(const std::string& workerId, int64_t periods)
+{
+    const std::string err = d->rent(workerId, (int)std::clamp<int64_t>(periods, 0, 10000));
+    if (!err.empty()) return json({{"ok", false}, {"error", err}}).dump();
+    return d->state().dump();
+}
+
+std::string ReelcutCoreImpl::findWorkers()
+{
+    d->findWorkers();
     return d->state().dump();
 }

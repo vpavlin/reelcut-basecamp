@@ -168,6 +168,20 @@ public:
     // paid lease there (lez/reelcut_lease).
     std::string addMarketWorker(const std::string& offerJson);
 
+    // Your LEZ wallet, for paying market workers through lez_core: walletJson {"config": wallet_config.json path,
+    // "storage": storage.json path, "password", "payer": the paying account (base58)}. Kept in an owner-only file.
+    std::string setLezWallet(const std::string& walletJson);
+
+    // Look for workers on the market: offers posted on Logos Messaging in the last hours, each checked
+    // against the chain. Results in snapshot().market {state, error, found: [{offer, chain, error}]};
+    // add one with addMarketWorker(offer).
+    std::string findWorkers();
+
+    // Rent a market worker for `periods` more periods: its terms are read from the chain, the payment goes from
+    // your paying account through lez_core, and the lease is watched until the chain shows it. Progress in
+    // snapshot().workers[].rental {state: paying|confirming|paid|failed, error, tx, paidThrough, offer}.
+    std::string rentWorker(const std::string& workerId, int64_t periods);
+
     void onContextReady() override;
 
 logos_events:

@@ -1,7 +1,7 @@
 //! reelcut-lease: deploy and drive the reelcut_lease program from a LEZ wallet (tests, ops).
 //!
 //!   reelcut_lease deploy <payer>                                 -> program account id
-//!   reelcut_lease offer  <program> <worker> <treasury> <price> <period_ms> <max_periods> [--closed]
+//!   reelcut_lease offer  <program> <worker> <treasury> <price> <period_ms> <max_periods> <key_hex> [--closed]
 //!   reelcut_lease rent   <program> <worker> <client_key_hex> <payer> <periods>
 //!   reelcut_lease show   <program> <worker> [client_key_hex]     -> the offer (and a lease) as JSON
 //!
@@ -24,7 +24,7 @@ struct Cli {
 enum Cmd {
     Deploy { payer: AccountId },
     Offer { program: AccountId, worker: AccountId, treasury: AccountId, price: u128, period_ms: u64, max_periods: u32,
-            #[arg(long)] closed: bool },
+            key: String, #[arg(long)] closed: bool },
     Rent { program: AccountId, worker: AccountId, client_key: String, payer: AccountId, periods: u32 },
     Show { program: AccountId, worker: AccountId, client_key: Option<String> },
 }
@@ -52,8 +52,8 @@ async fn main() -> Result<()> {
             let id = program_deployment::deploy_program(&mut w, elf, payer).await?;
             println!("{id}");
         }
-        Cmd::Offer { program, worker, treasury, price, period_ms, max_periods, closed } => {
-            let m = Message::SetOffer(Offer { treasury, price_per_period: price, period_ms, max_periods, open: !closed });
+        Cmd::Offer { program, worker, treasury, price, period_ms, max_periods, key, closed } => {
+            let m = Message::SetOffer(Offer { treasury, price_per_period: price, period_ms, max_periods, open: !closed, key: key32(&key)? });
             let accounts = vec![AccountIdentity::Public(worker).select_program_actor_state(program)];
             let h = w.send_pub_tx_paid_by(accounts, 0, ser(&m).into(), None).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
             println!("{}", hex::encode(h.as_ref()));
@@ -74,8 +74,8 @@ async fn main() -> Result<()> {
         Cmd::Show { program, worker, client_key } => {
             let offer = read_offer(&w, program, worker).await?;
             let mut out = format!("{{\"offer\":{}", match &offer {
-                Some(o) => format!("{{\"treasury\":\"{}\",\"price\":{},\"periodMs\":{},\"maxPeriods\":{},\"open\":{},\"rentals\":{},\"periodsSold\":{}}}",
-                    o.offer.treasury, o.offer.price_per_period, o.offer.period_ms, o.offer.max_periods, o.offer.open,
+                Some(o) => format!("{{\"treasury\":\"{}\",\"price\":{},\"periodMs\":{},\"maxPeriods\":{},\"open\":{},\"key\":\"{}\",\"rentals\":{},\"periodsSold\":{}}}",
+                    o.offer.treasury, o.offer.price_per_period, o.offer.period_ms, o.offer.max_periods, o.offer.open, hex::encode(o.offer.key),
                     o.record.rentals, o.record.periods_sold),
                 None => "null".into(),
             });

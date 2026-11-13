@@ -19,6 +19,7 @@
 
 #include <sodium.h>
 
+#include <cstring>
 #include <filesystem>
 #include <map>
 
@@ -196,21 +197,115 @@ bool safeName(const std::string& name)
     return true;
 }
 
-// ── signing ──────────────────────────────────────────────────────────────────────────────────
+// ── sealing ──────────────────────────────────────────────────────────────────────────────────
 std::string sha256Hex(const QByteArray& b)
 {
     return QCryptographicHash::hash(b, QCryptographicHash::Sha256).toHex().toStdString();
 }
-std::string sign(const std::string& key, const std::string& method, const std::string& pathQuery,
-                 const std::string& ts, const std::string& bodySha)
+
+std::string subKey(const std::string& key, const char* label)
 {
-    const std::string msg = method + "\n" + pathQuery + "\n" + ts + "\n" + bodySha;
-    unsigned char mac[crypto_auth_hmacsha256_BYTES];
-    crypto_auth_hmacsha256_state st;
-    crypto_auth_hmacsha256_init(&st, (const unsigned char*)key.data(), key.size());
-    crypto_auth_hmacsha256_update(&st, (const unsigned char*)msg.data(), msg.size());
-    crypto_auth_hmacsha256_final(&st, mac);
-    return hex(mac, sizeof mac);
+    unsigned char out[32];
+    crypto_generichash(out, sizeof out, (const unsigned char*)label, std::strlen(label),
+                       (const unsigned char*)key.data(), key.size());
+    return std::string((const char*)out, sizeof out);
+}
+
+static void be32(QByteArray& o, quint32 v) { o.append(char(v >> 24)); o.append(char(v >> 16)); o.append(char(v >> 8)); o.append(char(v)); }
+static quint32 rbe32(const QByteArray& b) { return (quint32((unsigned char)b[0]) << 24) | (quint32((unsigned char)b[1]) << 16) | (quint32((unsigned char)b[2]) << 8) | quint32((unsigned char)b[3]); }
+
+QByteArray seal(const std::string& key, const std::string& ad, const std::string& plain, std::string* nonceOut)
+{
+    const std::string k = subKey(key, "reelcut-link/env");
+    unsigned char nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
+    randombytes_buf(nonce, sizeof nonce);
+    std::string ct(plain.size() + crypto_aead_xchacha20poly1305_ietf_ABYTES, '\0');
+    unsigned long long n = 0;
+    crypto_aead_xchacha20poly1305_ietf_encrypt((unsigned char*)ct.data(), &n, (const unsigned char*)plain.data(), plain.size(),
+                                               (const unsigned char*)ad.data(), ad.size(), nullptr, nonce, (const unsigned char*)k.data());
+    ct.resize(n);
+    QByteArray out;
+    be32(out, quint32(sizeof nonce + ct.size()));
+    out.append((const char*)nonce, sizeof nonce);
+    out.append(ct.data(), (qsizetype)ct.size());
+    if (nonceOut) nonceOut->assign((const char*)nonce, sizeof nonce);
+    return out;
+}
+
+int openFrame(const std::string& key, const std::string& ad, QByteArray& buf, std::string& plain, std::string* nonceOut)
+{
+    if (buf.size() < 4) return 0;
+    const quint32 len = rbe32(buf);
+    if (len < crypto_aead_xchacha20poly1305_ietf_NPUBBYTES + crypto_aead_xchacha20poly1305_ietf_ABYTES || len > 8 * 1024 * 1024) return -1;
+    if ((quint32)buf.size() < 4 + len) return 0;
+    const std::string k = subKey(key, "reelcut-link/env");
+    const unsigned char* nonce = (const unsigned char*)buf.constData() + 4;
+    const unsigned char* ct = nonce + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;
+    const size_t ctLen = len - crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;
+    plain.assign(ctLen, '\0');
+    unsigned long long n = 0;
+    if (crypto_aead_xchacha20poly1305_ietf_decrypt((unsigned char*)plain.data(), &n, nullptr, ct, ctLen,
+                                                   (const unsigned char*)ad.data(), ad.size(), nonce, (const unsigned char*)k.data()) != 0)
+        return -1;
+    plain.resize(n);
+    if (nonceOut) nonceOut->assign((const char*)nonce, crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
+    buf.remove(0, 4 + len);
+    return 1;
+}
+
+static const qint64 kChunk = 64 * 1024;
+qint64 streamSize(qint64 plainSize)
+{
+    const qint64 chunks = std::max<qint64>(1, (plainSize + kChunk - 1) / kChunk);
+    return crypto_secretstream_xchacha20poly1305_HEADERBYTES + chunks * (4 + crypto_secretstream_xchacha20poly1305_ABYTES) + plainSize;
+}
+using SsState = crypto_secretstream_xchacha20poly1305_state;
+static_assert(sizeof(SsState) <= 64 * 8, "secretstream state fits");
+
+StreamWriter::StreamWriter(const std::string& key, const std::string& ad) : m_ad(ad)
+{
+    const std::string k = subKey(key, "reelcut-link/file");
+    unsigned char h[crypto_secretstream_xchacha20poly1305_HEADERBYTES];
+    crypto_secretstream_xchacha20poly1305_init_push(reinterpret_cast<SsState*>(m_state), h, (const unsigned char*)k.data());
+    m_header = QByteArray((const char*)h, sizeof h);
+}
+QByteArray StreamWriter::push(const QByteArray& plain, bool last)
+{
+    QByteArray ct(plain.size() + crypto_secretstream_xchacha20poly1305_ABYTES, '\0');
+    unsigned long long n = 0;
+    crypto_secretstream_xchacha20poly1305_push(reinterpret_cast<SsState*>(m_state), (unsigned char*)ct.data(), &n,
+        (const unsigned char*)plain.constData(), plain.size(), (const unsigned char*)m_ad.data(), m_ad.size(),
+        last ? crypto_secretstream_xchacha20poly1305_TAG_FINAL : 0);
+    QByteArray out;
+    be32(out, quint32(n));
+    out.append(ct.constData(), (qsizetype)n);
+    return out;
+}
+bool StreamReader::feed(QByteArray& buf, QByteArray& plainOut)
+{
+    if (!m_started) {
+        if (buf.size() < (qsizetype)crypto_secretstream_xchacha20poly1305_HEADERBYTES) return true;
+        const std::string k = subKey(m_key, "reelcut-link/file");
+        if (crypto_secretstream_xchacha20poly1305_init_pull(reinterpret_cast<SsState*>(m_state), (const unsigned char*)buf.constData(),
+                                                            (const unsigned char*)k.data()) != 0) return false;
+        buf.remove(0, crypto_secretstream_xchacha20poly1305_HEADERBYTES);
+        m_started = true;
+    }
+    while (!m_done && buf.size() >= 4) {
+        const quint32 len = rbe32(buf);
+        if (len < crypto_secretstream_xchacha20poly1305_ABYTES || len > kChunk + crypto_secretstream_xchacha20poly1305_ABYTES) return false;
+        if ((quint32)buf.size() < 4 + len) break;
+        QByteArray pt(len - crypto_secretstream_xchacha20poly1305_ABYTES, '\0');
+        unsigned long long n = 0;
+        unsigned char tag = 0;
+        if (crypto_secretstream_xchacha20poly1305_pull(reinterpret_cast<SsState*>(m_state), (unsigned char*)pt.data(), &n, &tag,
+                (const unsigned char*)buf.constData() + 4, len, (const unsigned char*)m_ad.data(), m_ad.size()) != 0) return false;
+        pt.resize((qsizetype)n);
+        plainOut.append(pt);
+        buf.remove(0, 4 + len);
+        if (tag == crypto_secretstream_xchacha20poly1305_TAG_FINAL) m_done = true;
+    }
+    return true;
 }
 
 // ── the worker ───────────────────────────────────────────────────────────────────────────────
@@ -221,10 +316,14 @@ struct WorkerServer::Conn {
     QUrlQuery query;
     std::map<std::string, std::string> headers;
     qint64 length = 0;
-    // PUT /v1/file streams to a file
+    // the sealed request: its pairing, key and nonce (the reply is bound to it), and its body
+    std::string pair, key, nonce;
+    QByteArray body;
+    bool opened = false;
+    // PUT /v1/file streams to a file, decrypted on the way
     std::unique_ptr<QFile> sink;
-    std::string sinkPath, sinkFinal, sinkSha, pair;
-    qint64 got = 0;
+    std::unique_ptr<StreamReader> sinkStream;
+    std::string sinkPath, sinkFinal, sinkSha;
     QCryptographicHash hash{QCryptographicHash::Sha256};
     // GET /v1/file streams from one
     std::unique_ptr<QFile> source;
@@ -307,23 +406,6 @@ void WorkerServer::onData(QTcpSocket* s)
     auto it = m_conns.find(s);
     if (it == m_conns.end()) return;
     Conn& c = *it->second;
-    if (c.sink) {   // the body of a PUT, straight to its file
-        QByteArray b = s->readAll();
-        const qint64 take = std::min<qint64>(b.size(), c.length - c.got);
-        c.sink->write(b.constData(), take);
-        c.hash.addData(QByteArrayView(b.constData(), take));
-        c.got += take;
-        if (c.got >= c.length) {
-            c.sink->close(); c.sink.reset();
-            const std::string sha = c.hash.result().toHex().toStdString();
-            if (!c.sinkSha.empty() && sha != c.sinkSha) { QFile::remove(QString::fromStdString(c.sinkPath)); reply(s, 400, {{"error", "the file arrived damaged"}}); return; }
-            std::error_code ec;
-            fs::rename(c.sinkPath, c.sinkFinal, ec);
-            if (ec) { reply(s, 500, {{"error", ec.message()}}); return; }
-            reply(s, 200, {{"ok", true}, {"sha", sha}});
-        }
-        return;
-    }
     c.buf += s->readAll();
     if (!c.headersDone) {
         const int end = c.buf.indexOf("\r\n\r\n");
@@ -331,11 +413,6 @@ void WorkerServer::onData(QTcpSocket* s)
         const QList<QByteArray> lines = c.buf.left(end).split('\n');
         const QList<QByteArray> rl = lines.value(0).trimmed().split(' ');
         if (rl.size() < 2) { s->abort(); return; }
-        c.method = QString::fromLatin1(rl[0]);
-        c.target = QString::fromLatin1(rl[1]);
-        const QUrl u(c.target);
-        c.path = u.path();
-        c.query = QUrlQuery(u);
         c.headers.clear();
         for (int i = 1; i < lines.size(); ++i) {
             const int colon = lines[i].indexOf(':');
@@ -345,13 +422,18 @@ void WorkerServer::onData(QTcpSocket* s)
         c.length = QString::fromStdString(c.headers.count("content-length") ? c.headers["content-length"] : "0").toLongLong();
         c.buf.remove(0, end + 4);
         c.headersDone = true;
-        // a PUT of a file: check who asks first, then stream the body to disk
+        if (QString::fromLatin1(rl[0]) != "POST" || QUrl(QString::fromLatin1(rl[1])).path() != "/v2") { reply(s, 404, {{"error", "only sealed requests (POST /v2)"}}); return; }
+    }
+    if (!c.opened) {
+        std::string err;
+        const int r = open(c, err);
+        if (r == 0) { if (c.buf.size() > 9 * 1024 * 1024) s->abort(); return; }
+        if (r < 0) { reply(s, c.retry ? 503 : 403, {{"error", err}}); return; }
+        // an upload: its file follows the envelope as an encrypted stream
         if (c.method == "PUT" && c.path == "/v1/file") {
-            std::string pair, err;
-            if (!auth(c, pair, err)) { reply(s, 403, {{"error", err}}); return; }
             const std::string job = c.query.queryItemValue("job", QUrl::FullyDecoded).toStdString(), name = c.query.queryItemValue("name", QUrl::FullyDecoded).toStdString();
             if (!safeName(job) || job.find('/') != std::string::npos || !safeName(name)) { reply(s, 400, {{"error", "bad name"}}); return; }
-            const std::string dir = jobDir(pair, job);
+            const std::string dir = jobDir(c.pair, job);
             std::error_code ec;
             fs::create_directories(fs::path(dir + "/" + name).parent_path(), ec);
             c.sinkFinal = dir + "/" + name;
@@ -359,45 +441,63 @@ void WorkerServer::onData(QTcpSocket* s)
             c.sinkSha = c.query.queryItemValue("sha", QUrl::FullyDecoded).toStdString();
             c.sink = std::make_unique<QFile>(QString::fromStdString(c.sinkPath));
             if (!c.sink->open(QIODevice::WriteOnly | QIODevice::Truncate)) { c.sink.reset(); reply(s, 500, {{"error", "can't write"}}); return; }
-            c.got = 0;
-            // feed what already arrived
-            QByteArray rest = c.buf; c.buf.clear();
-            const qint64 take = std::min<qint64>(rest.size(), c.length);
-            c.sink->write(rest.constData(), take);
-            c.hash.addData(QByteArrayView(rest.constData(), take));
-            c.got = take;
-            if (c.got >= c.length) { c.buf.clear(); onData(s); }
-            return;
+            c.sinkStream = std::make_unique<StreamReader>(c.key, c.nonce);
         }
     }
-    if (c.buf.size() < c.length) { if (c.length > 4 * 1024 * 1024) s->abort(); return; }
+    if (c.sink) {
+        QByteArray plain;
+        if (!c.sinkStream->feed(c.buf, plain)) { c.sink->close(); QFile::remove(QString::fromStdString(c.sinkPath)); c.sink.reset(); reply(s, 400, {{"error", "the file arrived damaged"}}); return; }
+        if (!plain.isEmpty()) { c.sink->write(plain); c.hash.addData(plain); }
+        if (!c.sinkStream->done()) return;
+        c.sink->close(); c.sink.reset();
+        const std::string sha = c.hash.result().toHex().toStdString();
+        if (!c.sinkSha.empty() && sha != c.sinkSha) { QFile::remove(QString::fromStdString(c.sinkPath)); reply(s, 400, {{"error", "the file arrived damaged"}}); return; }
+        std::error_code ec;
+        fs::rename(c.sinkPath, c.sinkFinal, ec);
+        if (ec) { reply(s, 500, {{"error", ec.message()}}); return; }
+        reply(s, 200, {{"ok", true}, {"sha", sha}});
+        return;
+    }
     handle(s, c);
 }
 
-bool WorkerServer::auth(Conn& c, std::string& pair, std::string& error)
+// The sealed envelope: who (X-Rc-Pair), opened with that pairing's key; a fresh time and an unseen nonce.
+// 1 opened, 0 needs more bytes, -1 refused (`err`; c.retry: a market client's lease is being checked).
+int WorkerServer::open(Conn& c, std::string& err)
 {
-    pair = c.headers.count("x-rc-pair") ? c.headers["x-rc-pair"] : "";
+    const std::string pair = c.headers.count("x-rc-pair") ? c.headers["x-rc-pair"] : "";
+    if (c.buf.size() < 4) return 0;
     auto p = m_pairs.find(pair);
     Pairing market;
     // a market client is asked about on every request: its lease can run out (resolve() caches the chain)
     if (resolve && pair.rfind("m-", 0) == 0) {
         std::string why;
         const int r = resolve(pair, market, why);
-        if (r <= 0) { error = r == 0 ? "checking your lease, try again in a moment" : why; c.retry = r == 0; return false; }
+        if (r <= 0) { err = r == 0 ? "checking your lease, try again in a moment" : why; c.retry = r == 0; return -1; }
         m_pairs[pair] = market;
         p = m_pairs.find(pair);
     }
-    if (p == m_pairs.end()) { error = "not paired with this worker"; return false; }
-    const std::string ts = c.headers.count("x-rc-ts") ? c.headers["x-rc-ts"] : "";
-    const std::string sig = c.headers.count("x-rc-sig") ? c.headers["x-rc-sig"] : "";
-    const std::string bodySha = c.headers.count("x-rc-body") ? c.headers["x-rc-body"] : "";
-    const long long t = QString::fromStdString(ts).toLongLong();
-    if (std::llabs(nowMs() - t) > 120000) { error = "the clocks differ by more than two minutes"; return false; }
-    if (sig != sign(p->second.key, c.method.toStdString(), c.target.toStdString(), ts, bodySha)) { error = "bad signature"; return false; }
-    if (!m_sigs.insert(sig).second) { error = "replayed request"; return false; }
-    if (m_sigs.size() > 20000) m_sigs.clear();
-    m_seen[pair] = nowMs();
-    return true;
+    if (p == m_pairs.end()) { err = "not paired with this worker"; return -1; }
+    std::string plain, nonce;
+    const int r = openFrame(p->second.key, "req|" + pair, c.buf, plain, &nonce);
+    if (r == 0) return 0;
+    if (r < 0) { err = "not sealed with this pairing's key"; return -1; }
+    const json env = json::parse(plain, nullptr, false);
+    if (!env.is_object()) { err = "a damaged request"; return -1; }
+    const long long t = env.value("t", 0LL);
+    if (std::llabs(nowMs() - t) > 120000) { err = "the clocks differ by more than two minutes"; return -1; }
+    const long long now = nowMs();
+    if (m_nonces.size() > 5000) for (auto it = m_nonces.begin(); it != m_nonces.end();) it = now - it->second > 180000 ? m_nonces.erase(it) : std::next(it);
+    if (!m_nonces.emplace(nonce, now).second) { err = "replayed request"; return -1; }
+    c.pair = pair; c.key = p->second.key; c.nonce = nonce; c.opened = true;
+    c.method = QString::fromStdString(env.value("m", std::string()));
+    c.target = QString::fromStdString(env.value("p", std::string()));
+    const QUrl u(c.target);
+    c.path = u.path();
+    c.query = QUrlQuery(u);
+    c.body = QByteArray::fromStdString(env.value("b", std::string()));
+    m_seen[pair] = now;
+    return 1;
 }
 
 std::string WorkerServer::jobDir(const std::string& pair, const std::string& job) const
@@ -407,10 +507,17 @@ std::string WorkerServer::jobDir(const std::string& pair, const std::string& job
 
 void WorkerServer::reply(QTcpSocket* s, int code, const json& body)
 {
-    const QByteArray b = QByteArray::fromStdString(body.dump());
-    const char* text = code == 200 ? "OK" : code == 400 ? "Bad Request" : code == 403 ? "Forbidden" : code == 404 ? "Not Found"
-                     : code == 402 ? "Payment Required" : code == 503 ? "Service Unavailable" : "Error";
-    QByteArray h = "HTTP/1.1 " + QByteArray::number(code) + " " + text + "\r\nContent-Type: application/json\r\nContent-Length: " +
+    // after the envelope opened: a sealed reply bound to the request's nonce (HTTP 200 either way);
+    // before (who's asking is unknown): a plain error, which says nothing about any job
+    auto it = m_conns.find(s);
+    Conn* c = it == m_conns.end() ? nullptr : it->second.get();
+    QByteArray b;
+    int http = code;
+    if (c && c->opened) { b = seal(c->key, "rep|" + c->pair + "|" + c->nonce, json({{"code", code}, {"body", body}}).dump()); http = 200; }
+    else b = QByteArray::fromStdString(body.dump());
+    const char* text = http == 200 ? "OK" : http == 400 ? "Bad Request" : http == 403 ? "Forbidden" : http == 404 ? "Not Found"
+                     : http == 402 ? "Payment Required" : http == 503 ? "Service Unavailable" : "Error";
+    QByteArray h = "HTTP/1.1 " + QByteArray::number(http) + " " + text + "\r\nContent-Type: application/octet-stream\r\nContent-Length: " +
                    QByteArray::number(b.size()) + "\r\nConnection: close\r\n\r\n";
     s->write(h + b);
     s->disconnectFromHost();
@@ -418,16 +525,32 @@ void WorkerServer::reply(QTcpSocket* s, int code, const json& body)
 
 void WorkerServer::replyFile(QTcpSocket* s, const std::string& path)
 {
+    auto it = m_conns.find(s);
+    if (it == m_conns.end() || !it->second->opened) { s->abort(); return; }
+    Conn& c = *it->second;
     auto f = std::make_unique<QFile>(QString::fromStdString(path));
     if (!f->open(QIODevice::ReadOnly)) { reply(s, 404, {{"error", "no such file"}}); return; }
     const qint64 size = f->size();
-    s->write("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: " + QByteArray::number(size) +
-             "\r\nConnection: close\r\n\r\n");
+    const std::string ad = "rep|" + c.pair + "|" + c.nonce;
+    const QByteArray head = seal(c.key, ad, json({{"code", 200}, {"body", {{"size", size}}}}).dump());
+    auto w = std::make_shared<StreamWriter>(c.key, ad);
+    s->write("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: " +
+             QByteArray::number(head.size() + streamSize(size)) + "\r\nConnection: close\r\n\r\n");
+    s->write(head);
+    s->write(w->header());
     QFile* raw = f.release();
     raw->setParent(s);
-    auto pump = [s, raw] {
-        while (s->bytesToWrite() < 1024 * 1024 && !raw->atEnd()) s->write(raw->read(256 * 1024));
-        if (raw->atEnd() && s->bytesToWrite() == 0) s->disconnectFromHost();
+    auto sent = std::make_shared<qint64>(0);
+    auto finished = std::make_shared<bool>(false);
+    auto pump = [s, raw, w, sent, size, finished] {
+        while (!*finished && s->bytesToWrite() < 1024 * 1024) {
+            const QByteArray chunk = raw->read(kChunk);
+            *sent += chunk.size();
+            const bool last = *sent >= size || chunk.isEmpty();
+            s->write(w->push(chunk, last));
+            if (last) *finished = true;
+        }
+        if (*finished && s->bytesToWrite() == 0) s->disconnectFromHost();
     };
     QObject::connect(s, &QTcpSocket::bytesWritten, s, pump);
     pump();
@@ -435,11 +558,8 @@ void WorkerServer::replyFile(QTcpSocket* s, const std::string& path)
 
 void WorkerServer::handle(QTcpSocket* s, Conn& c)
 {
-    std::string pair, err;
-    if (!auth(c, pair, err)) { reply(s, c.retry ? 503 : 403, {{"error", err}}); return; }
-    const QByteArray body = c.buf.left(c.length);
-    const std::string bodySha = c.headers.count("x-rc-body") ? c.headers["x-rc-body"] : "";
-    if (!body.isEmpty() && bodySha != sha256Hex(body)) { reply(s, 400, {{"error", "the body does not match its signature"}}); return; }
+    const std::string pair = c.pair;
+    const QByteArray& body = c.body;
     const json in = body.isEmpty() ? json::object() : json::parse(body.toStdString(), nullptr, false);
     const std::string job = c.query.queryItemValue("job", QUrl::FullyDecoded).toStdString();
     const bool jobOk = safeName(job) && job.find('/') == std::string::npos;
@@ -604,42 +724,95 @@ void WorkerServer::flushWaiters()
 WorkerClient::WorkerClient(Pairing p) : m_p(std::move(p)), m_nam(new QNetworkAccessManager(this)) {}
 WorkerClient::~WorkerClient() { if (m_poll) m_poll->abort(); }
 
+// An upload's body, made as it is read: the sealed envelope, then the file as an encrypted stream
+// bound to the request's nonce.
+class SealedUpload : public QIODevice {
+public:
+    SealedUpload(QByteArray head, QFile* file, const std::string& key, const std::string& ad)
+        : m_pending(std::move(head)), m_file(file), m_w(key, ad)
+    {
+        m_size = m_pending.size() + streamSize(file->size());
+        m_pending += m_w.header();
+        file->setParent(this);
+        QIODevice::open(QIODevice::ReadOnly);
+    }
+    bool isSequential() const override { return true; }
+    qint64 size() const override { return m_size; }
+    qint64 bytesAvailable() const override { return (m_size - m_read) + QIODevice::bytesAvailable(); }
+protected:
+    qint64 readData(char* data, qint64 max) override
+    {
+        while (m_pending.size() < max && !m_done) {
+            const QByteArray chunk = m_file->read(kChunk);
+            m_fed += chunk.size();
+            const bool last = m_fed >= m_file->size() || chunk.isEmpty();
+            m_pending += m_w.push(chunk, last);
+            if (last) m_done = true;
+        }
+        const qint64 n = std::min<qint64>(max, m_pending.size());
+        if (n == 0 && m_done) return -1;
+        std::memcpy(data, m_pending.constData(), (size_t)n);
+        m_pending.remove(0, n);
+        m_read += n;
+        return n;
+    }
+    qint64 writeData(const char*, qint64) override { return -1; }
+private:
+    QByteArray m_pending;
+    QFile* m_file;
+    StreamWriter m_w;
+    qint64 m_size = 0, m_read = 0, m_fed = 0;
+    bool m_done = false;
+};
+
 QNetworkReply* WorkerClient::request(const std::string& method, const std::string& pathQuery, const QByteArray& body,
                                      QIODevice* bodyDevice)
 {
     const std::string base = m_p.url.empty() ? (m_p.urls.empty() ? "" : m_p.urls[0]) : m_p.url;
-    QNetworkRequest rq(QUrl(QString::fromStdString(base + pathQuery)));
-    const std::string ts = std::to_string(nowMs());
-    const std::string bodySha = body.isEmpty() ? "" : sha256Hex(body);
-    // sign what the server will see: the path and the query as sent
-    const QUrl u = rq.url();
-    QString pq = u.path(QUrl::FullyEncoded);
-    if (u.hasQuery()) pq += "?" + u.query(QUrl::FullyEncoded);
+    QNetworkRequest rq(QUrl(QString::fromStdString(base + "/v2")));
+    std::string nonce;
+    const json env = {{"m", method}, {"p", pathQuery}, {"t", nowMs()}, {"b", body.toStdString()}};
+    const QByteArray head = seal(m_p.key, "req|" + m_p.id, env.dump(), &nonce);
     rq.setRawHeader("X-Rc-Pair", QByteArray::fromStdString(m_p.id));
-    rq.setRawHeader("X-Rc-Ts", QByteArray::fromStdString(ts));
-    rq.setRawHeader("X-Rc-Body", QByteArray::fromStdString(bodySha));
-    rq.setRawHeader("X-Rc-Sig", QByteArray::fromStdString(sign(m_p.key, method, pq.toStdString(), ts, bodySha)));
-    if (!body.isEmpty()) rq.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-    if (bodyDevice) {
-        rq.setHeader(QNetworkRequest::ContentLengthHeader, bodyDevice->size());
-        return m_nam->sendCustomRequest(rq, QByteArray::fromStdString(method), bodyDevice);
+    rq.setHeader(QNetworkRequest::ContentTypeHeader, "application/octet-stream");
+    QNetworkReply* r = nullptr;
+    if (auto* f = qobject_cast<QFile*>(bodyDevice)) {
+        auto* up = new SealedUpload(head, f, m_p.key, nonce);
+        rq.setHeader(QNetworkRequest::ContentLengthHeader, up->size());
+        r = m_nam->post(rq, up);
+        up->setParent(r);
+    } else {
+        r = m_nam->post(rq, head);
     }
-    if (method == "GET") return m_nam->get(rq);
-    if (method == "DELETE") return m_nam->deleteResource(rq);
-    return m_nam->sendCustomRequest(rq, QByteArray::fromStdString(method), body);
+    // what opening the reply needs: the key, and what it's bound to (this request's nonce)
+    r->setProperty("rcKey", QByteArray::fromStdString(m_p.key));
+    r->setProperty("rcAd", QByteArray::fromStdString("rep|" + m_p.id + "|" + nonce));
+    return r;
 }
 
+// A sealed reply: {code, body}. ok = the request worked (code 200). rcCode is set on the reply.
 static json replyJson(QNetworkReply* r, bool& ok)
 {
-    const int code = r->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-    const QByteArray b = r->readAll();
-    json j = json::parse(b.toStdString(), nullptr, false);
-    ok = r->error() == QNetworkReply::NoError && code == 200 && j.is_object();
-    if (!ok) {
-        std::string e = j.is_object() && j.contains("error") && j["error"].is_string() ? j["error"].get<std::string>()
-                                                                                         : r->errorString().toStdString();
-        j = {{"error", e}};
+    QByteArray b = r->readAll();
+    const std::string key = r->property("rcKey").toByteArray().toStdString(), ad = r->property("rcAd").toByteArray().toStdString();
+    std::string plain;
+    ok = false;
+    int code = r->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+    json j;
+    if (r->error() == QNetworkReply::NoError && code == 200 && openFrame(key, ad, b, plain) == 1) {
+        const json env = json::parse(plain, nullptr, false);
+        code = env.is_object() ? env.value("code", 500) : 500;
+        j = env.is_object() && env.contains("body") ? env["body"] : json::object();
+        ok = code == 200 && j.is_object();
+    } else {
+        // refused before opening (unknown pairing, a lease being checked) or no answer: a plain message
+        const json e = json::parse(b.toStdString(), nullptr, false);
+        if (e.is_object() && e.contains("error") && e["error"].is_string()) j = {{"error", e["error"].get<std::string>()}};
+        else if (code == 200) j = {{"error", "a reply this pairing can't open"}};
+        else j = {{"error", r->errorString().toStdString()}};
     }
+    r->setProperty("rcCode", code);
+    if (!ok && (!j.is_object() || !j.contains("error"))) j = {{"error", "refused (" + std::to_string(code) + ")"}};
     return j;
 }
 
@@ -671,8 +844,8 @@ void WorkerClient::hello(std::function<void(bool, const json&)> cb)
             if (ok) { m_hello = j; m_failures = 0; noteBoot(j.value("boot", std::string()), j["tasks"]); setOnline(true, ""); cb(true, j); return; }
             const std::string e = j.value("error", std::string("no answer"));
             // a worker that answered but refused (not paired, clock): no use trying the other addresses
-            const int code = r->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-            if (code == 403) { setOnline(false, e); cb(false, j); return; }
+            const int code = r->property("rcCode").toInt();
+            if (code == 403 || code == 402 || code == 503) { setOnline(false, e); cb(false, j); return; }
             (*tryAt)(i + 1, m_p.url + ": " + e);
         });
     };
@@ -707,15 +880,41 @@ void WorkerClient::download(const std::string& job, const std::string& name, con
     auto f = std::make_shared<QFile>(QString::fromStdString(path + ".download"));
     if (!f->open(QIODevice::WriteOnly | QIODevice::Truncate)) { cb(false, "can't write " + path); return; }
     QNetworkReply* r = request("GET", "/v1/file?job=" + q(job) + "&name=" + q(name), QByteArray());
-    QObject::connect(r, &QNetworkReply::readyRead, this, [r, f] { f->write(r->readAll()); });
-    QObject::connect(r, &QNetworkReply::finished, this, [r, f, path, cb] {
+    // the sealed head ({code}), then the file as an encrypted stream bound to this request
+    struct St { QByteArray buf; bool headDone = false; int code = 0; std::string error; std::unique_ptr<StreamReader> rd; bool bad = false; };
+    auto st = std::make_shared<St>();
+    const std::string key = r->property("rcKey").toByteArray().toStdString(), ad = r->property("rcAd").toByteArray().toStdString();
+    auto eat = [r, f, st, key, ad] {
+        if (st->bad) return;
+        st->buf += r->readAll();
+        if (!st->headDone) {
+            std::string plain;
+            const int o = openFrame(key, ad, st->buf, plain);
+            if (o == 0) return;
+            if (o < 0) { st->bad = true; st->error = "a reply this pairing can't open"; return; }
+            const json env = json::parse(plain, nullptr, false);
+            st->code = env.is_object() ? env.value("code", 500) : 500;
+            if (st->code != 200) {
+                st->bad = true;
+                st->error = env.is_object() && env.contains("body") ? env["body"].value("error", std::string("refused")) : "refused";
+                return;
+            }
+            st->headDone = true;
+            st->rd = std::make_unique<StreamReader>(key, ad);
+        }
+        QByteArray plain;
+        if (!st->rd->feed(st->buf, plain)) { st->bad = true; st->error = "the file arrived damaged"; return; }
+        if (!plain.isEmpty()) f->write(plain);
+    };
+    QObject::connect(r, &QNetworkReply::readyRead, this, eat);
+    QObject::connect(r, &QNetworkReply::finished, this, [r, f, path, cb, st, eat] {
         r->deleteLater();
-        f->write(r->readAll());
+        eat();
         f->close();
-        const int code = r->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-        if (r->error() != QNetworkReply::NoError || code != 200) {
+        const bool ok = r->error() == QNetworkReply::NoError && !st->bad && st->rd && st->rd->done();
+        if (!ok) {
             QFile::remove(f->fileName());
-            cb(false, r->errorString().toStdString());
+            cb(false, !st->error.empty() ? st->error : r->error() != QNetworkReply::NoError ? r->errorString().toStdString() : "the file was cut short");
             return;
         }
         std::error_code ec;

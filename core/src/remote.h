@@ -4,9 +4,13 @@
 // you own, a *worker*. Basecamp keeps the jobs and the screens; the worker runs reelcut commands from a
 // fixed list in a folder per job and hands the files back.
 //
-// Step 1's link is HTTP over the LAN or the mesh: the worker listens (WorkerServer), Basecamp calls it
-// (WorkerClient). Every request is signed with the pairing key (HMAC-SHA256); the worker serves only
-// paired clients. The messages are the ones a Logos Delivery link will carry for step 2.
+// Step 1's link is HTTP over the LAN, the mesh or the internet, ENCRYPTED END TO END with the pairing's
+// key (a pairing code's random key, or for a market worker the X25519 shared secret of the two keys).
+// The worker serves only paired clients and paid-up market clients. Every request is POST /v2 with the
+// pairing id in X-Rc-Pair; its body is a sealed envelope {m: method, p: path, t: time, b: body}; a reply is
+// sealed and bound to the request's nonce; files travel as encrypted streams (see "sealing" below).
+// An observer sees which pairing talks to which worker and how much, not jobs, names or content.
+// The calls inside the envelope:
 //
 //   GET  /v1/hello                       name, version, cores, what runs
 //   POST /v1/task      {id, job, argv}   run `reelcut argv…` in the job's folder (argv checked); the same
@@ -68,10 +72,39 @@ bool isMedia(const std::string& name);
 // A name inside a job's folder: relative, no "..", no leading dot directories beyond ".size".
 bool safeName(const std::string& name);
 
-// ── signing ──────────────────────────────────────────────────────────────────────────────────
-std::string sign(const std::string& key, const std::string& method, const std::string& pathQuery,
-                 const std::string& ts, const std::string& bodySha);
+// ── sealing (the link is end-to-end encrypted with the pairing's key) ─────────────────────────
+// A request: POST /v2, header X-Rc-Pair, body = sealed envelope {m, p, t, b} [+ an upload's stream].
+// A reply: HTTP 200, body = sealed {code, body} bound to the request's nonce [+ a download's stream].
+// Sealed frame = u32 length (big endian) ‖ 24-byte nonce ‖ XChaCha20-Poly1305 ciphertext.
+// File stream = secretstream header (24) ‖ { u32 length ‖ chunk } … (64 KiB plaintext chunks, last tagged FINAL),
+// every chunk bound to the request's nonce.
 std::string sha256Hex(const QByteArray& b);
+std::string subKey(const std::string& key, const char* label);
+QByteArray seal(const std::string& key, const std::string& ad, const std::string& plain, std::string* nonceOut = nullptr);
+// Opens one frame at the start of `buf` (needs the whole frame): 1 done (frame consumed), 0 need more, -1 bad.
+int openFrame(const std::string& key, const std::string& ad, QByteArray& buf, std::string& plain, std::string* nonceOut = nullptr);
+qint64 streamSize(qint64 plainSize);   // a file's encrypted stream length
+
+class StreamWriter {   // encrypts a file chunk by chunk
+public:
+    StreamWriter(const std::string& key, const std::string& ad);
+    QByteArray header() const { return m_header; }
+    QByteArray push(const QByteArray& plain, bool last);
+private:
+    unsigned char m_state[64 * 8];
+    QByteArray m_header;
+    std::string m_ad;
+};
+class StreamReader {   // and decrypts: feed bytes, get plaintext; done() after the FINAL chunk
+public:
+    StreamReader(const std::string& key, const std::string& ad) : m_key(key), m_ad(ad) {}
+    bool feed(QByteArray& buf, QByteArray& plainOut);   // false: damaged
+    bool done() const { return m_done; }
+private:
+    std::string m_key, m_ad;
+    unsigned char m_state[64 * 8];
+    bool m_started = false, m_done = false;
+};
 
 // ── the worker ───────────────────────────────────────────────────────────────────────────────
 // How the worker runs a command: the module's container runner. Returns a stop function.
@@ -118,7 +151,7 @@ private:
     void handle(QTcpSocket* s, Conn& c);
     void reply(QTcpSocket* s, int code, const json& body);
     void replyFile(QTcpSocket* s, const std::string& path);
-    bool auth(Conn& c, std::string& pair, std::string& error);
+    int open(Conn& c, std::string& error);
     std::string jobDir(const std::string& pair, const std::string& job) const;
     void push(const std::string& pair, json ev);
     void flushWaiters();
@@ -135,7 +168,7 @@ private:
     bool m_flushArmed = false;
     std::map<QTcpSocket*, std::unique_ptr<Conn>> m_conns;
     std::map<std::string, long long> m_seen;  // pair -> last request (ms)
-    std::set<std::string> m_sigs;             // signatures seen lately (replay)
+    std::map<std::string, long long> m_nonces; // request nonces seen lately (replay)
     json m_info = json::object();
     QTimer* m_tick = nullptr;
     std::string m_boot;

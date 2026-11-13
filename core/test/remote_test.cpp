@@ -149,6 +149,36 @@ int main(int argc, char** argv)
     waitFor([&] { return dlDone; }, 10000);
     check(dl && fs::file_size(dst) == 3u * 1024 * 1024, "a 3 MB reel comes back whole");
 
+    // an empty file both ways, and what travels is not the plaintext
+    const std::string empty = local.path().toStdString() + "/empty.txt";
+    std::ofstream(empty) << "";
+    bool eu = false, euDone = false;
+    cl.upload("job1", "empty.txt", empty, [&](bool ok, const std::string&) { eu = ok; euDone = true; });
+    waitFor([&] { return euDone; });
+    bool ed = false, edDone = false;
+    cl.download("job1", "empty.txt", local.path().toStdString() + "/back.txt", [&](bool ok, const std::string&) { ed = ok; edDone = true; });
+    waitFor([&] { return edDone; });
+    check(eu && ed && fs::file_size(local.path().toStdString() + "/back.txt") == 0, "an empty file goes up and comes back");
+    {
+        std::string n1;
+        const QByteArray f = seal(key, "req|" + cp.id, "{\"m\":\"GET\",\"p\":\"/v1/hello\",\"t\":1}", &n1);
+        check(!f.contains("hello") && !f.contains("/v1/"), "a sealed request doesn't show its path");
+        QByteArray buf = f; std::string plain;
+        check(openFrame(key, "req|" + cp.id, buf, plain) == 1 && plain.find("/v1/hello") != std::string::npos, "and opens with the key");
+        QByteArray b2 = f; std::string p2;
+        check(openFrame(newKey(), "req|" + cp.id, b2, p2) == -1, "not with another key");
+        StreamWriter w(key, "ad"); QByteArray st = w.header() + w.push("secret reel bytes", true);
+        check(!st.contains("secret reel"), "a file stream doesn't show its bytes");
+        StreamReader rd(key, "ad"); QByteArray out;
+        check(rd.feed(st, out) && rd.done() && out == "secret reel bytes", "and decrypts whole");
+        StreamWriter w2(key, "ad"); QByteArray st2 = w2.header() + w2.push("x", true); st2[st2.size() - 3] ^= 1;
+        StreamReader rd2(key, "ad"); QByteArray out2;
+        check(!rd2.feed(st2, out2), "a changed byte is caught");
+        StreamWriter w3(key, "ad-a"); QByteArray st3 = w3.header() + w3.push("x", true);
+        StreamReader rd3(key, "ad-b"); QByteArray out3;
+        check(!rd3.feed(st3, out3), "a stream for another request is refused");
+    }
+
     // cancel
     cl.submit({{"id", "t4"}, {"job", "job1"}, {"argv", {"diarize", "/work"}}}, [](bool, const json&) {});
     waitFor([&] { return runs >= 3; });

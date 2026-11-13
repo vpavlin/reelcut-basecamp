@@ -145,7 +145,8 @@ public:
     std::string openUrl(const std::string& url);
 
     // ── remote execution (docs/remote-execution.md): the heavy steps on another computer you own.
-    // This computer as a worker for others: optionsJson {"enabled": bool, "port": 7471, "name": "studio-box"}.
+    // This computer as a worker for others: optionsJson {"enabled": bool, "port": 7471, "name": "studio-box",
+    // "market": {"enabled": bool, "sequencer": url, "program": base58, "account": base58 (its offer's account)}}.
     std::string setWorker(const std::string& optionsJson);
 
     // A pairing code for one more Basecamp (label: whose it is), to paste into that Basecamp's
@@ -161,6 +162,11 @@ public:
 
     // Forget a worker (its jobs stay, and say so until it is paired again).
     std::string removeWorker(const std::string& id);
+
+    // A worker from the market, by its offer: {"name", "urls": [...], "key": its public key (hex), "account",
+    // "program", "sequencer"}. It serves this Basecamp while this Basecamp's key (snapshot().marketKey) has a
+    // paid lease there (lez/reelcut_lease).
+    std::string addMarketWorker(const std::string& offerJson);
 
     void onContextReady() override;
 

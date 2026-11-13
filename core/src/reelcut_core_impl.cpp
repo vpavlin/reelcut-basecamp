@@ -2,6 +2,10 @@
 #include "logos_sdk.h"
 #include "forum_post.h"
 #include "remote.h"
+#include "lez_lease.h"
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
 #include <QMetaObject>
 
 #include <QDateTime>
@@ -599,6 +603,17 @@ struct ReelcutCorePrivate {
                    std::shared_ptr<std::string> out; bool heavy = false; bool ending = false; };
     std::map<std::string, RTask> rtasks;                     // "<pair>/<task>"
     std::set<std::string> fetchWatch;                        // jobs whose download is watched on the worker
+    // ── the market (lez/reelcut_lease on LEZ v0.4): rent workers you don't own, by the period.
+    // Each side has an X25519 key (market.key): a client's lease is for its public key, and the two
+    // keys' shared secret signs the requests, so no pairing code is needed.
+    std::string mkSecret, mkPublic;
+    // worker side: offered on the market? and where its lease program lives
+    bool marketOn = false;
+    std::string mkSequencer = "http://127.0.0.1:3040", mkProgram, mkAccount;   // program/account: base58
+    struct LeaseSeen { long long paidThrough = 0, checked = 0; bool checking = false; std::string error; };
+    std::map<std::string, LeaseSeen> leases;                 // client public key (raw) -> what the chain said
+    QNetworkAccessManager* mkNam = nullptr;
+    static constexpr long long kResultsGraceMs = 3600LL * 1000;   // a lapsed client may still collect results
     static int allCores() { return std::max(1, (int)std::thread::hardware_concurrency()); }
     int useCores() const { return cores > 0 ? std::min(cores, allCores()) : allCores(); }
 
@@ -923,6 +938,7 @@ struct ReelcutCorePrivate {
             {"delivery", {{"state", dlState}, {"error", dlError}}},
             {"forumKey", fkey.ok() ? hexBytes(fkey.pk).substr(0, 16) : ""},
             {"workers", workersJson()},
+            {"marketKey", reelcut::lease::toHex(mkPublic)},
             {"worker", workerJson()},
         };
     }
@@ -1063,18 +1079,19 @@ struct ReelcutCorePrivate {
             return;
         }
         const std::string tid = taskId(b, argv);
-        const std::string key = c->pairing().id + "/" + tid;
+        const std::string where = b.where;   // the local id of the worker (a market worker's differs from its pairing id)
+        const std::string key = where + "/" + tid;
         procs[slot] = Running{nullptr, id, container, false, key};
         if (slot.rfind("scenes/", 0) != 0) { b.status = "running"; b.error.clear(); }
         rtasks[key] = RTask{id, slot, std::move(done), std::make_shared<std::string>(), slot == "heavy", false};
         json a = json::array();
         for (auto& x : argv) a.push_back(x.toStdString());
-        pushFiles(b, c, [this, c, key, tid, id, a](const std::string& err) {
+        pushFiles(b, c, [this, c, key, tid, id, a, where](const std::string& err) {
             if (!rtasks.count(key)) return;    // cancelled meanwhile
             if (!err.empty()) { if (Job* j = find(id)) logLine(*j, "Could not send the files to " + c->pairing().name + ": " + err); remoteEnded(key, false); return; }
-            c->submit({{"id", tid}, {"job", id}, {"argv", a}}, [this, key, id, c, tid](bool ok, const json& r) {
+            c->submit({{"id", tid}, {"job", id}, {"argv", a}}, [this, key, id, c, tid, where](bool ok, const json& r) {
                 // done already (while this Basecamp was closed): take its files
-                if (ok && jbool(r, "finished", false)) { onWorkerEvent(c->pairing().id, {{"task", tid}, {"kind", "done"}, {"ok", jbool(r, "result", false)}}); return; }
+                if (ok && jbool(r, "finished", false)) { onWorkerEvent(where, {{"task", tid}, {"kind", "done"}, {"ok", jbool(r, "result", false)}}); return; }
                 if (ok) return;
                 if (Job* j = find(id)) logLine(*j, c->pairing().name + " refused the step: " + jstr(r, "error", "no answer"));
                 remoteEnded(key, false);
@@ -1262,23 +1279,127 @@ struct ReelcutCorePrivate {
             workerPort = (int)std::clamp<int64_t>(jnum(me, "port", 7471), 1, 65535);
             workerName = jstr(me, "name", "");
             for (auto& c : me.value("clients", json::array())) { reelcut::remote::Pairing p; if (reelcut::remote::pairingFrom(c, p)) workerClients.push_back(p); }
+            const json mk = me.value("market", json::object());
+            marketOn = jbool(mk, "enabled", false);
+            mkSequencer = jstr(mk, "sequencer", mkSequencer);
+            mkProgram = jstr(mk, "program", "");
+            mkAccount = jstr(mk, "account", "");
         }
+        // market workers this Basecamp rented (by their offer)
+        if (j.is_object() && j.contains("market") && j["market"].is_array())
+            for (auto& o : j["market"]) addMarketClient(o);
+        loadMarketKey();
     }
     void saveWorkers()
     {
         json ws = json::array(), cs = json::array();
-        for (auto& [id, c] : workers) ws.push_back(reelcut::remote::pairingJson(c->pairing(), true));
+        for (auto& [id, c] : workers) if (id.rfind("m-", 0) != 0) ws.push_back(reelcut::remote::pairingJson(c->pairing(), true));
         for (auto& p : workerClients) cs.push_back(reelcut::remote::pairingJson(p, true));
-        json j = {{"workers", ws}, {"worker", {{"enabled", workerOn}, {"port", workerPort}, {"name", workerName}, {"clients", cs}}}};
+        json mws = json::array();
+        for (auto& [id, o] : marketOffers) mws.push_back(o);
+        json j = {{"workers", ws}, {"market", mws},
+                  {"worker", {{"enabled", workerOn}, {"port", workerPort}, {"name", workerName}, {"clients", cs},
+                              {"market", {{"enabled", marketOn}, {"sequencer", mkSequencer}, {"program", mkProgram}, {"account", mkAccount}}}}}};
         std::error_code ec;
         fs::create_directories(rootDir(), ec);
         writeFile(workersFile(), j.dump(2));
         fs::permissions(workersFile(), fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, ec);
     }
-    void addClient(const reelcut::remote::Pairing& p)
+    std::map<std::string, json> marketOffers;                // pairing id ("m-…") -> the worker's offer
+    void loadMarketKey()
+    {
+        const std::string path = rootDir() + "/market.key";
+        json k = json::parse(readFile(path), nullptr, false);
+        std::string sec, pub;
+        if (k.is_object()) {
+            sec = QByteArray::fromHex(QByteArray::fromStdString(jstr(k, "secret", ""))).toStdString();
+            pub = QByteArray::fromHex(QByteArray::fromStdString(jstr(k, "public", ""))).toStdString();
+        }
+        if (sec.size() != 32 || pub.size() != 32) {
+            if (!reelcut::lease::newKeypair(sec, pub)) return;
+            std::error_code ec;
+            fs::create_directories(rootDir(), ec);
+            writeFile(path, json({{"secret", reelcut::lease::toHex(sec)}, {"public", reelcut::lease::toHex(pub)}}).dump());
+            fs::permissions(path, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, ec);
+        }
+        mkSecret = sec; mkPublic = pub;
+    }
+    // A worker found on the market (its offer): talk to it with the key derived from both public keys.
+    // Serving needs a paid lease for this Basecamp's key at that worker (rentWorker, or the lease tool).
+    bool addMarketClient(const json& offer)
+    {
+        if (mkPublic.empty()) loadMarketKey();
+        const std::string wk = QByteArray::fromHex(QByteArray::fromStdString(jstr(offer, "key", ""))).toStdString();
+        if (wk.size() != 32 || mkSecret.empty()) return false;
+        reelcut::remote::Pairing p;
+        p.id = "m-" + reelcut::lease::toHex(mkPublic);
+        p.key = reelcut::lease::sharedKey(mkSecret, mkPublic, wk);
+        if (p.key.empty()) return false;
+        p.name = jstr(offer, "name", "market worker");
+        for (auto& u : offer.value("urls", json::array())) if (u.is_string()) p.urls.push_back(u.get<std::string>());
+        if (p.urls.empty()) return false;
+        // one Basecamp key, many workers: the local id must differ per worker
+        const std::string localId = "m-" + reelcut::lease::toHex(wk).substr(0, 16);
+        marketOffers[localId] = offer;
+        workers.erase(localId);
+        addClient(p, localId);
+        return true;
+    }
+
+    // Worker side: may this market client be served? 1 yes (out filled), 0 checking, -1 no.
+    int resolveMarket(const std::string& pairId, reelcut::remote::Pairing& out, std::string& why)
+    {
+        if (!marketOn || mkProgram.empty() || mkAccount.empty()) { why = "this worker isn't on the market"; return -1; }
+        const std::string cpk = QByteArray::fromHex(QByteArray::fromStdString(pairId.substr(2))).toStdString();
+        if (cpk.size() != 32 || pairId.size() != 66) { why = "not a market client"; return -1; }
+        const long long now = QDateTime::currentMSecsSinceEpoch();
+        LeaseSeen& l = leases[cpk];
+        // read the chain again: every minute, every 15 s near the end, at once when nothing is known
+        const bool stale = l.checked == 0 || now - l.checked > 60000 || (l.paidThrough > 0 && l.paidThrough - now < 120000 && now - l.checked > 15000);
+        if (stale && !l.checking) checkLease(cpk);
+        if (l.paidThrough == 0) { if (l.checked == 0 || l.checking) return 0; why = l.error.empty() ? "no paid rental for your key at this worker" : l.error; return -1; }
+        if (now > l.paidThrough + kResultsGraceMs) { why = "your rental ended: renew it"; return -1; }
+        out.id = pairId;
+        out.key = reelcut::lease::sharedKey(mkSecret, mkPublic, cpk);
+        out.name = "market " + pairId.substr(2, 8);
+        out.tasksUntil = l.paidThrough;
+        return out.key.empty() ? -1 : 1;
+    }
+    void checkLease(const std::string& cpk)
+    {
+        std::string prog, worker;
+        if (!reelcut::lease::unbase58(mkProgram, prog) || !reelcut::lease::unbase58(mkAccount, worker)) return;
+        if (!mkNam) mkNam = new QNetworkAccessManager(loop);
+        leases[cpk].checking = true;
+        const std::string lease = reelcut::lease::base58(reelcut::lease::leaseAccount(prog, worker, cpk));
+        QNetworkRequest rq(QUrl(QString::fromStdString(mkSequencer)));
+        rq.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+        const json body = {{"jsonrpc", "2.0"}, {"id", 1}, {"method", "getAccountView"},
+                           {"params", json::array({{{"account_id", lease}, {"program_account_id", mkProgram}}})}};
+        QNetworkReply* r = mkNam->post(rq, QByteArray::fromStdString(body.dump()));
+        QTimer::singleShot(15000, r, [r] { if (r->isRunning()) r->abort(); });
+        QObject::connect(r, &QNetworkReply::finished, loop, guarded("lease check", [this, r, cpk, worker] {
+            r->deleteLater();
+            LeaseSeen& l = leases[cpk];
+            l.checking = false;
+            l.checked = QDateTime::currentMSecsSinceEpoch();
+            json j = json::parse(r->readAll().toStdString(), nullptr, false);
+            if (r->error() != QNetworkReply::NoError || !j.is_object()) { l.error = "the chain didn't answer: " + r->errorString().toStdString(); return; }
+            const json st = j.value("result", json()).is_object() ? j["result"].value("data", json::object()).value("actor_states", json::object()) : json::object();
+            std::string bytes;
+            if (st.contains(mkProgram) && st[mkProgram].is_array()) for (auto& b : st[mkProgram]) bytes.push_back((char)b.get<int>());
+            auto lease = reelcut::lease::parseLease(bytes);
+            if (!lease || lease->clientKey != cpk || lease->worker != worker) { l.paidThrough = 0; l.error = "no paid rental for your key at this worker"; return; }
+            l.paidThrough = (long long)lease->paidThroughMs;
+            l.error.clear();
+            changed();
+        }));
+    }
+
+    void addClient(const reelcut::remote::Pairing& p, const std::string& localIdIn = "")
     {
         auto c = std::make_unique<reelcut::remote::WorkerClient>(p);
-        const std::string id = p.id;
+        const std::string id = localIdIn.empty() ? p.id : localIdIn;
         c->onEvent = [this, id](const json& ev) { onWorkerEvent(id, ev); };
         c->onOnline = [this, id](bool on, const std::string& why) {
             workerSeen[id]["online"] = on;
@@ -1302,7 +1423,8 @@ struct ReelcutCorePrivate {
         for (auto& p : workerClients) cl.push_back({{"id", p.id}, {"name", p.name}, {"seen", jnum(seen, p.name.c_str(), 0)}});
         return {{"enabled", workerOn}, {"port", workerPort}, {"name", workerName.empty() ? QSysInfo::machineHostName().toStdString() : workerName},
                 {"listening", server && server->listening()}, {"error", workerError}, {"clients", cl},
-                {"tasks", st.value("tasks", json::array())}};
+                {"tasks", st.value("tasks", json::array())}, {"key", reelcut::lease::toHex(mkPublic)},
+                {"market", {{"enabled", marketOn}, {"sequencer", mkSequencer}, {"program", mkProgram}, {"account", mkAccount}}}};
     }
     json workersJson() const
     {
@@ -1313,6 +1435,7 @@ struct ReelcutCorePrivate {
             a.push_back({{"id", id}, {"name", c->pairing().name}, {"online", c->online()}, {"error", jstr(seen, "error", "")},
                          {"url", c->pairing().url}, {"urls", c->pairing().urls}, {"cores", jnum(h, "cores", 0)},
                          {"version", jstr(h, "version", "")}, {"runner", jstr(h, "runner", "")},
+                         {"market", id.rfind("m-", 0) == 0},
                          {"tasks", h.value("tasks", json::array())}, {"boot", c->boot()}, {"restarts", jnum(seen, "restarts", 0)},
                          {"waiting", [&] { int n = 0; for (auto& [k, t] : rtasks) if (k.rfind(id + "/", 0) == 0) ++n; return n; }()}});
         }
@@ -1332,11 +1455,14 @@ struct ReelcutCorePrivate {
                 return runForClient(dir, argv, name, std::move(h));
             });
             server->onChange = [this] { changed(); };
+            server->resolve = [this](const std::string& pid, reelcut::remote::Pairing& out, std::string& why) { return resolveMarket(pid, out, why); };
         }
         server->setPairings(workerClients);
+        if (mkPublic.empty()) loadMarketKey();
         server->setInfo({{"name", workerName.empty() ? QSysInfo::machineHostName().toStdString() : workerName},
                          {"version", kVersion}, {"cores", useCores()}, {"allCores", allCores()}, {"runner", runner},
-                         {"image", kImage}});
+                         {"image", kImage}, {"key", reelcut::lease::toHex(mkPublic)},
+                         {"market", {{"enabled", marketOn}, {"sequencer", mkSequencer}, {"program", mkProgram}, {"account", mkAccount}}}});
         if (!server->listening() || server->port() != workerPort) workerError = server->listen(workerPort);
     }
     // A paired client's command. The image first, if it's more than a day old (once at a time; the
@@ -4069,6 +4195,19 @@ std::string ReelcutCoreImpl::setWorker(const std::string& optionsJson)
     if (o.contains("enabled") && o["enabled"].is_boolean()) d->workerOn = o["enabled"].get<bool>();
     if (o.contains("port")) d->workerPort = (int)std::clamp<int64_t>(jnum(o, "port", d->workerPort), 1024, 65535);
     if (o.contains("name") && o["name"].is_string()) d->workerName = trim(o["name"].get<std::string>()).substr(0, 40);
+    if (o.contains("market") && o["market"].is_object()) {
+        const json& m = o["market"];
+        std::string raw;
+        if (m.contains("enabled") && m["enabled"].is_boolean()) d->marketOn = m["enabled"].get<bool>();
+        if (m.contains("sequencer") && m["sequencer"].is_string()) d->mkSequencer = trim(m["sequencer"].get<std::string>());
+        for (auto [k, v] : {std::pair<const char*, std::string*>{"program", &d->mkProgram}, {"account", &d->mkAccount}})
+            if (m.contains(k) && m[k].is_string()) {
+                const std::string x = trim(m[k].get<std::string>());
+                if (!x.empty() && !reelcut::lease::unbase58(x, raw)) return json({{"ok", false}, {"error", std::string("Not a LEZ account id: ") + k}}).dump();
+                *v = x;
+            }
+        d->leases.clear();
+    }
     d->saveWorkers();
     d->applyWorker();
     d->changed();
@@ -4125,6 +4264,15 @@ std::string ReelcutCoreImpl::removeWorker(const std::string& id)
     if (d->runOn == id) d->runOn.clear();
     d->saveWorkers();
     d->save();
+    d->changed();
+    return d->state().dump();
+}
+
+std::string ReelcutCoreImpl::addMarketWorker(const std::string& offerJson)
+{
+    json o = json::parse(offerJson, nullptr, false);
+    if (!o.is_object() || !d->addMarketClient(o)) return json({{"ok", false}, {"error", "Not a worker offer (name, urls, key)."}}).dump();
+    d->saveWorkers();
     d->changed();
     return d->state().dump();
 }

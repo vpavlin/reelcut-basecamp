@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
                 AccountIdentity::PublicNoSign(worker).select_program_actor_state(program),
                 AccountIdentity::Public(payer).select_program_actor_state(NATIVE_TOKEN_PROGRAM_ID),
                 AccountIdentity::PublicNoSign(offer.offer.treasury).select_program_actor_state(NATIVE_TOKEN_PROGRAM_ID),
-                AccountIdentity::PublicPda { program, seed: lease_seed(&worker, &ck) }.select_program_actor_state(program),
+                AccountIdentity::PublicNoSign(lease_account(&program, &worker, &ck)).select_program_actor_state(program),   // as lez_core declares it
             ];
             let h = w.send_pub_tx_paid_by(accounts, 0, ser(&m).into(), Some(payer)).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
             println!("{}", hex::encode(h.as_ref()));

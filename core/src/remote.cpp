@@ -228,6 +228,7 @@ struct WorkerServer::Conn {
     QCryptographicHash hash{QCryptographicHash::Sha256};
     // GET /v1/file streams from one
     std::unique_ptr<QFile> source;
+    bool retry = false;   // 503 instead of 403: a market client's lease is being checked
     // a long poll
     bool waiting = false;
     std::string waitPair;
@@ -377,6 +378,15 @@ bool WorkerServer::auth(Conn& c, std::string& pair, std::string& error)
 {
     pair = c.headers.count("x-rc-pair") ? c.headers["x-rc-pair"] : "";
     auto p = m_pairs.find(pair);
+    Pairing market;
+    // a market client is asked about on every request: its lease can run out (resolve() caches the chain)
+    if (resolve && pair.rfind("m-", 0) == 0) {
+        std::string why;
+        const int r = resolve(pair, market, why);
+        if (r <= 0) { error = r == 0 ? "checking your lease, try again in a moment" : why; c.retry = r == 0; return false; }
+        m_pairs[pair] = market;
+        p = m_pairs.find(pair);
+    }
     if (p == m_pairs.end()) { error = "not paired with this worker"; return false; }
     const std::string ts = c.headers.count("x-rc-ts") ? c.headers["x-rc-ts"] : "";
     const std::string sig = c.headers.count("x-rc-sig") ? c.headers["x-rc-sig"] : "";
@@ -398,7 +408,8 @@ std::string WorkerServer::jobDir(const std::string& pair, const std::string& job
 void WorkerServer::reply(QTcpSocket* s, int code, const json& body)
 {
     const QByteArray b = QByteArray::fromStdString(body.dump());
-    const char* text = code == 200 ? "OK" : code == 400 ? "Bad Request" : code == 403 ? "Forbidden" : code == 404 ? "Not Found" : "Error";
+    const char* text = code == 200 ? "OK" : code == 400 ? "Bad Request" : code == 403 ? "Forbidden" : code == 404 ? "Not Found"
+                     : code == 402 ? "Payment Required" : code == 503 ? "Service Unavailable" : "Error";
     QByteArray h = "HTTP/1.1 " + QByteArray::number(code) + " " + text + "\r\nContent-Type: application/json\r\nContent-Length: " +
                    QByteArray::number(b.size()) + "\r\nConnection: close\r\n\r\n";
     s->write(h + b);
@@ -425,7 +436,7 @@ void WorkerServer::replyFile(QTcpSocket* s, const std::string& path)
 void WorkerServer::handle(QTcpSocket* s, Conn& c)
 {
     std::string pair, err;
-    if (!auth(c, pair, err)) { reply(s, 403, {{"error", err}}); return; }
+    if (!auth(c, pair, err)) { reply(s, c.retry ? 503 : 403, {{"error", err}}); return; }
     const QByteArray body = c.buf.left(c.length);
     const std::string bodySha = c.headers.count("x-rc-body") ? c.headers["x-rc-body"] : "";
     if (!body.isEmpty() && bodySha != sha256Hex(body)) { reply(s, 400, {{"error", "the body does not match its signature"}}); return; }
@@ -451,6 +462,8 @@ void WorkerServer::handle(QTcpSocket* s, Conn& c)
         for (auto& a : in["argv"]) { if (!a.is_string()) { reply(s, 400, {{"error", "argv holds strings"}}); return; } argv << QString::fromStdString(a.get<std::string>()); }
         std::string why;
         if (!checkArgv(argv, why)) { reply(s, 400, {{"error", why}}); return; }
+        const long long until = m_pairs[pair].tasksUntil;
+        if (until > 0 && nowMs() > until) { reply(s, 402, {{"error", "your rental has ended: renew it to start new steps"}}); return; }
         const std::string tid = pair + "/" + id;
         auto existing = m_tasks.find(tid);
         if (existing != m_tasks.end() && existing->second.running) { reply(s, 200, {{"ok", true}, {"attached", true}}); return; }

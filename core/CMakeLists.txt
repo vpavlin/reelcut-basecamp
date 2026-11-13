@@ -21,6 +21,8 @@ logos_module(
         src/forum_post.cpp
         src/remote.h
         src/remote.cpp
+        src/lez_lease.h
+        src/lez_lease.cpp
     INCLUDE_DIRS src
 )
 

@@ -48,6 +48,7 @@ struct Pairing {
     std::string key;                // 32 raw bytes
     std::vector<std::string> urls;  // client side: where the worker may be reached ("http://host:port")
     std::string url;                // client side: the one that answered last
+    long long tasksUntil = 0;       // worker side, a market client: no new steps after this (ms; 0 = no limit)
 };
 std::string newKey();                                   // 32 random bytes
 std::string pairId(const std::string& key);
@@ -95,6 +96,10 @@ public:
     void setInfo(const json& info) { m_info = info; }   // name, version, cores: what /v1/hello says
     json status() const;                                // for the snapshot: tasks running, clients seen
     std::function<void()> onChange;
+    // A client that isn't paired: a market client ("m-" + its public key in hex). Fill `out` (id, key,
+    // name) and return 1 to serve it, 0 when its lease is being checked (asked to try again in a moment),
+    // -1 to refuse it (`why`).
+    std::function<int(const std::string& pairId, Pairing& out, std::string& why)> resolve;
 
 private:
     struct Conn;

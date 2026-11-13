@@ -155,6 +155,34 @@ Risks: testnet resets (program ids change; keep them in config, not code), no fa
 minutes-long confirmations (a worker starts on "locked, pending" for small amounts, waits for confirmation for big
 ones).
 
+### Reputation (open: options to choose from)
+
+What a client should be able to trust: the worker's record comes from real paying clients, the worker
+can't forge it, and can't hide the bad parts. Options, from the lightest:
+
+1. **Repeat business** (no reviews): the lease program counts per worker how many clients came back and
+   rented again. No extra transaction or effort for anyone, the worker can't hide it. Gameable only by
+   renting yourself (real money, minus what goes back to your own treasury).
+2. **Signed reviews**: stars (+ text) signed by the account that paid the lease, served by the worker
+   and mirrored on a public Logos Messaging topic. **Completeness on chain**: per worker the lease
+   program keeps `reviews` (a count) and `head` (a hash chain over every review). A worker serving a
+   list whose hash chain doesn't match `head` is provably hiding or changing reviews; it can't pad the
+   list either. Cost: one transaction per review, so…
+3. **…a review deposit**: a little more than a fee, paid with the rent, refunded by reviewing in the same
+   transaction. Reviewing costs nothing and is worth something. Unclaimed after N days it goes somewhere
+   neutral (not to the worker, or it would discourage reviews).
+4. **Anonymous reviews**: the same, with a ZK proof instead of the payer's signature: "I hold one of the
+   paid-lease commitments for this worker" + a nullifier (one review per lease). The rent then appends a
+   commitment (hash of a client secret, worker, amount) instead of naming the client. Needs the proof
+   verified on chain to update `head`, so a third party can submit it; RISC Zero can verify a proof inside
+   a guest. About a week of work.
+
+Common weakness: self-dealing. Only cost helps (weight by amount paid; a share of each rental to an
+account the worker doesn't control). Paying itself stays visible on chain unless the rent uses LEZ
+private transactions.
+
+Status: the lease program ships without reviews (rentals and periods sold only); decide later.
+
 ### Trust
 
 - The worker sees the inputs. A URL job reveals only the URL; an imported private video is visible to whoever runs it.

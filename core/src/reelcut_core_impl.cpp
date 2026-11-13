@@ -1379,7 +1379,11 @@ struct ReelcutCorePrivate {
                 if (!err2.empty()) { r.error = err2; changed(); return; }
                 auto l = reelcut::lease::parseLease(actorState(res2, jstr(marketOffers[id], "program", "")));
                 r.paidThrough = l && l->clientKey == mkPublic ? (long long)l->paidThroughMs : 0;
-                if (r.state == "confirming" && r.paidThrough > r.wantAbove) { r.state = "paid"; r.error.clear(); }
+                if (r.state == "confirming" && r.paidThrough > r.wantAbove) {
+                    r.state = "paid"; r.error.clear();
+                    // paid: talk to the worker now rather than at the next retry
+                    if (auto* c = clientFor(id)) c->hello([this, id](bool, const json&) { if (auto* c = clientFor(id)) { workerSeen[id]["hello"] = c->lastHello(); c->listen(); } changed(); });
+                }
                 if (then) then();
                 changed();
             });
@@ -1433,7 +1437,8 @@ struct ReelcutCorePrivate {
         };
         lez->invokeAsyncResult("list_accounts", json::array(), [this, id, send](nlohmann::json v, const logos::CallError&) {
             onLoop([this, id, v, send] {
-                if (v.is_array()) { send(); return; }
+                // lez_core answers [] when no wallet is open: only accounts mean an open wallet
+                if (v.is_array() && !v.empty()) { send(); return; }
                 lez->invokeAsyncResult("open", json::array({lezConfig, lezStorage, lezPassword, true}), [this, id, send](nlohmann::json ov, const logos::CallError& e) {
                     onLoop([this, id, ov, send, code = e.code] {
                         if (!ov.is_number() || ov.get<long long>() != 0) {
@@ -1605,7 +1610,9 @@ struct ReelcutCorePrivate {
         const long long now = QDateTime::currentMSecsSinceEpoch();
         LeaseSeen& l = leases[cpk];
         // read the chain again: every minute, every 15 s near the end, at once when nothing is known
-        const bool stale = l.checked == 0 || now - l.checked > 60000 || (l.paidThrough > 0 && l.paidThrough - now < 120000 && now - l.checked > 15000);
+        // (a client without a lease is asked about again after 10 s: it may have just paid)
+        const bool stale = l.checked == 0 || now - l.checked > 60000 || (l.paidThrough > 0 && l.paidThrough - now < 120000 && now - l.checked > 15000)
+                           || (l.paidThrough == 0 && now - l.checked > 10000);
         if (stale && !l.checking) checkLease(cpk);
         if (l.paidThrough == 0) { if (l.checked == 0 || l.checking) return 0; why = l.error.empty() ? "no paid rental for your key at this worker" : l.error; return -1; }
         const long long seen = server ? server->lastSeen(pairId) : 0;

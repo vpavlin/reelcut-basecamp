@@ -9,7 +9,8 @@
 // paired clients. The messages are the ones a Logos Delivery link will carry for step 2.
 //
 //   GET  /v1/hello                       name, version, cores, what runs
-//   POST /v1/task      {id, job, argv}   run `reelcut argv…` in the job's folder (argv checked)
+//   POST /v1/task      {id, job, argv}   run `reelcut argv…` in the job's folder (argv checked); the same
+//                                        id again: attaches, or {finished} when it already ended well
 //   GET  /v1/events?since=N&wait=S       what the tasks printed, and how they ended (long poll)
 //   POST /v1/cancel    {id}
 //   GET  /v1/files?job=J                 the job folder: [{name, size, mtime}]
@@ -102,7 +103,7 @@ private:
         QStringList argv;
         bool running = true, ok = false;
         std::function<void()> stop;
-        long long started = 0;
+        long long started = 0, ended = 0;
     };
     struct Event { long long seq; std::string pair; json body; };
 
@@ -131,6 +132,7 @@ private:
     std::set<std::string> m_sigs;             // signatures seen lately (replay)
     json m_info = json::object();
     QTimer* m_tick = nullptr;
+    std::string m_boot;
 };
 
 // ── the client ───────────────────────────────────────────────────────────────────────────────
@@ -161,11 +163,13 @@ public:
     std::function<void(bool online, const std::string& why)> onOnline;
     bool online() const { return m_online; }
     json lastHello() const { return m_hello; }
+    std::string boot() const { return m_boot; }
 
 private:
     QNetworkReply* request(const std::string& method, const std::string& pathQuery, const QByteArray& body,
                            QIODevice* bodyDevice = nullptr);
     void poll();
+    bool noteBoot(const std::string& boot, const json& tasks);   // true: the worker restarted
     void setOnline(bool on, const std::string& why);
 
     Pairing m_p;
@@ -175,6 +179,7 @@ private:
     QPointer<QNetworkReply> m_poll;
     json m_hello = json::object();
     int m_failures = 0;
+    std::string m_boot;   // the worker's run we follow
 };
 
 } // namespace reelcut::remote

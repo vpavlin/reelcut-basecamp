@@ -1035,9 +1035,21 @@ struct ReelcutCorePrivate {
     }
     // The name of a task: the same command for the same job is the same task, so a Basecamp that
     // closed and opened again finds its step still running on the worker instead of starting it twice.
-    static std::string taskId(const std::string& job, const QStringList& argv)
+    // ...and its inputs: the files Basecamp has for the job (a new clip list makes a new cut).
+    std::string taskId(const Job& b, const QStringList& argv) const
     {
-        return reelcut::remote::sha256Hex(QByteArray::fromStdString(job + "\x1f") + argv.join("\x1f").toUtf8()).substr(0, 16);
+        std::vector<std::string> files;
+        std::error_code ec;
+        for (auto it = fs::recursive_directory_iterator(b.dir, ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+            if (!it->is_regular_file(ec)) continue;
+            const std::string rel = fs::relative(it->path(), b.dir, ec).string();
+            if (rel.empty() || rel[0] == '.' || reelcut::remote::isMedia(rel)) continue;
+            files.push_back(rel + "=" + fileStat(it->path().string()));
+        }
+        std::sort(files.begin(), files.end());
+        QByteArray in = QByteArray::fromStdString(b.id + "\x1f") + argv.join("\x1f").toUtf8();
+        for (auto& f : files) in += QByteArray::fromStdString("\x1e" + f);
+        return reelcut::remote::sha256Hex(in).substr(0, 16);
     }
 
     void remoteLaunch(Job& b, const std::string& slot, const QStringList& argv, const std::string& container,
@@ -1050,7 +1062,7 @@ struct ReelcutCorePrivate {
             QTimer::singleShot(0, guarded("remote missing", [done] { done(false, ""); }));
             return;
         }
-        const std::string tid = taskId(b.id, argv);
+        const std::string tid = taskId(b, argv);
         const std::string key = c->pairing().id + "/" + tid;
         procs[slot] = Running{nullptr, id, container, false, key};
         if (slot.rfind("scenes/", 0) != 0) { b.status = "running"; b.error.clear(); }
@@ -1060,7 +1072,9 @@ struct ReelcutCorePrivate {
         pushFiles(b, c, [this, c, key, tid, id, a](const std::string& err) {
             if (!rtasks.count(key)) return;    // cancelled meanwhile
             if (!err.empty()) { if (Job* j = find(id)) logLine(*j, "Could not send the files to " + c->pairing().name + ": " + err); remoteEnded(key, false); return; }
-            c->submit({{"id", tid}, {"job", id}, {"argv", a}}, [this, key, id, c](bool ok, const json& r) {
+            c->submit({{"id", tid}, {"job", id}, {"argv", a}}, [this, key, id, c, tid](bool ok, const json& r) {
+                // done already (while this Basecamp was closed): take its files
+                if (ok && jbool(r, "finished", false)) { onWorkerEvent(c->pairing().id, {{"task", tid}, {"kind", "done"}, {"ok", jbool(r, "result", false)}}); return; }
                 if (ok) return;
                 if (Job* j = find(id)) logLine(*j, c->pairing().name + " refused the step: " + jstr(r, "error", "no answer"));
                 remoteEnded(key, false);
@@ -1181,6 +1195,7 @@ struct ReelcutCorePrivate {
             const json tasks = ev.value("tasks", json::array());
             if (h.value("tasks", json::array()) != tasks) { h["tasks"] = tasks; changed(); }
             if (kind != "resync") return;
+            workerSeen[pair]["restarts"] = jnum(workerSeen[pair], "restarts", 0) + 1;
             // The worker restarted (or lost track): a step it no longer runs has ended.
             std::set<std::string> running;
             for (auto& t : ev.value("tasks", json::array())) running.insert(pair + "/" + jstr(t, "id", ""));
@@ -1298,7 +1313,8 @@ struct ReelcutCorePrivate {
             a.push_back({{"id", id}, {"name", c->pairing().name}, {"online", c->online()}, {"error", jstr(seen, "error", "")},
                          {"url", c->pairing().url}, {"urls", c->pairing().urls}, {"cores", jnum(h, "cores", 0)},
                          {"version", jstr(h, "version", "")}, {"runner", jstr(h, "runner", "")},
-                         {"tasks", h.value("tasks", json::array())}});
+                         {"tasks", h.value("tasks", json::array())}, {"boot", c->boot()}, {"restarts", jnum(seen, "restarts", 0)},
+                         {"waiting", [&] { int n = 0; for (auto& [k, t] : rtasks) if (k.rfind(id + "/", 0) == 0) ++n; return n; }()}});
         }
         return a;
     }

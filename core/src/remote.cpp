@@ -236,6 +236,10 @@ struct WorkerServer::Conn {
 
 WorkerServer::WorkerServer(std::string root, RunFn run) : m_root(std::move(root)), m_run(std::move(run))
 {
+    // A new id at every start: a client that sees it change knows the tasks it waits for are gone.
+    unsigned char b[8];
+    randombytes_buf(b, sizeof b);
+    m_boot = hex(b, sizeof b);
     m_tick = new QTimer(this);
     m_tick->setInterval(1000);
     QObject::connect(m_tick, &QTimer::timeout, this, [this] { flushWaiters(); });
@@ -433,6 +437,7 @@ void WorkerServer::handle(QTcpSocket* s, Conn& c)
         json h = m_info;
         h["tasks"] = tasksJson(pair);
         h["client"] = m_pairs[pair].name;
+        h["boot"] = m_boot;
         reply(s, 200, h);
         return;
     }
@@ -449,6 +454,15 @@ void WorkerServer::handle(QTcpSocket* s, Conn& c)
         const std::string tid = pair + "/" + id;
         auto existing = m_tasks.find(tid);
         if (existing != m_tasks.end() && existing->second.running) { reply(s, 200, {{"ok", true}, {"attached", true}}); return; }
+        // The same task (same job, command and inputs) finished well while the client was away: its
+        // result is in the folder already.
+        if (existing != m_tasks.end() && existing->second.ok && nowMs() - existing->second.ended < 24LL * 3600 * 1000) {
+            reply(s, 200, {{"ok", true}, {"finished", true}, {"result", true}});
+            return;
+        }
+        // forget tasks that ended more than a day ago
+        for (auto it = m_tasks.begin(); it != m_tasks.end();)
+            it = (!it->second.running && nowMs() - it->second.ended > 24LL * 3600 * 1000) ? m_tasks.erase(it) : std::next(it);
         Task t;
         t.id = id; t.pair = pair; t.job = tjob; t.dir = jobDir(pair, tjob); t.argv = argv; t.started = nowMs();
         std::error_code ec;
@@ -459,7 +473,7 @@ void WorkerServer::handle(QTcpSocket* s, Conn& c)
         h.err = [this, pair, id](const std::string& chunk) { push(pair, {{"task", id}, {"kind", "err"}, {"text", chunk}}); };
         h.done = [this, pair, id, tid](bool ok) {
             auto it = m_tasks.find(tid);
-            if (it != m_tasks.end()) { it->second.running = false; it->second.ok = ok; }
+            if (it != m_tasks.end()) { it->second.running = false; it->second.ok = ok; it->second.ended = nowMs(); }
             push(pair, {{"task", id}, {"kind", "done"}, {"ok", ok}});
             if (onChange) onChange();
         };
@@ -565,10 +579,9 @@ void WorkerServer::flushWaiters()
         if (evs.empty() && now < c->waitUntil) continue;
         c->waiting = false;
         if (!m_events.empty()) m_lastFlushed = m_events.back().seq;
-        json h = {{"events", evs}, {"seq", m_seq}, {"tasks", tasksJson(c->waitPair)}};
+        json h = {{"events", evs}, {"seq", m_seq}, {"tasks", tasksJson(c->waitPair)}, {"boot", m_boot}};
         // events trimmed away (or a restarted worker): say so, the client re-syncs
         if (!m_events.empty() && c->since > 0 && c->since < m_events.front().seq - 1) h["gap"] = true;
-        if (c->since > m_seq) h["restarted"] = true;
         done.push_back(s);
         reply(s, 200, h);
     }
@@ -642,7 +655,7 @@ void WorkerClient::hello(std::function<void(bool, const json&)> cb)
             r->deleteLater();
             bool ok = false;
             json j = replyJson(r, ok);
-            if (ok) { m_hello = j; m_failures = 0; setOnline(true, ""); cb(true, j); return; }
+            if (ok) { m_hello = j; m_failures = 0; noteBoot(j.value("boot", std::string()), j["tasks"]); setOnline(true, ""); cb(true, j); return; }
             const std::string e = j.value("error", std::string("no answer"));
             // a worker that answered but refused (not paired, clock): no use trying the other addresses
             const int code = r->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
@@ -772,6 +785,17 @@ std::string WorkerClient::runSync(const std::string& job, const QStringList& arg
     return ok ? out : std::string();
 }
 
+bool WorkerClient::noteBoot(const std::string& boot, const json& tasks)
+{
+    if (boot.empty() || boot == m_boot) return false;
+    const bool restarted = !m_boot.empty();
+    m_boot = boot;
+    if (!restarted) return false;
+    m_since = 0;
+    if (onEvent) onEvent({{"kind", "resync"}, {"tasks", tasks.is_array() ? tasks : json::array()}});
+    return true;
+}
+
 void WorkerClient::listen()
 {
     if (m_listening) return;
@@ -799,10 +823,11 @@ void WorkerClient::poll()
         }
         m_failures = 0;
         setOnline(true, "");
-        if (j.value("restarted", false)) m_since = 0;
+        // a worker that started again (another boot id) numbers its events from 1 again
+        if (noteBoot(j.value("boot", std::string()), j["tasks"])) { poll(); return; }
         const long long seq = j.value("seq", m_since);
         if (onEvent) {
-            if (j.value("restarted", false) || j.value("gap", false)) onEvent({{"kind", "resync"}, {"tasks", j["tasks"]}});
+            if (j.value("gap", false)) onEvent({{"kind", "resync"}, {"tasks", j["tasks"]}});
             for (auto& e : j["events"]) onEvent(e);
             onEvent({{"kind", "tasks"}, {"tasks", j["tasks"]}});
         }

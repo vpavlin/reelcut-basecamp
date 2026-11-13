@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 
 using namespace reelcut::remote;
 namespace fs = std::filesystem;
@@ -123,6 +124,11 @@ int main(int argc, char** argv)
     for (auto& e : evs) if (e.value("task", std::string()) == "t1" && e.value("kind", std::string()) == "err" && e.value("text", std::string()).find("2/2") != std::string::npos) sawProgress = true;
     check(doneOf("t1") && sawProgress, "events: progress and the end");
 
+    json again; bool againDone = false;
+    cl.submit({{"id", "t1"}, {"job", "job1"}, {"argv", {"transcribe", "/work"}}}, [&](bool ok, const json& j) { if (ok) again = j; againDone = true; });
+    waitFor([&] { return againDone; });
+    check(again.value("finished", false) && runs == 1, "the same task again: its result, not a second run");
+
     bool refusedTask = false, rtDone = false;
     cl.submit({{"id", "t2"}, {"job", "job1"}, {"argv", {"sh", "-c", "id"}}}, [&](bool ok, const json&) { refusedTask = !ok; rtDone = true; });
     waitFor([&] { return rtDone; });
@@ -145,7 +151,7 @@ int main(int argc, char** argv)
 
     // cancel
     cl.submit({{"id", "t4"}, {"job", "job1"}, {"argv", {"diarize", "/work"}}}, [](bool, const json&) {});
-    waitFor([&] { return runs >= 4; });
+    waitFor([&] { return runs >= 3; });
     cl.cancel("t4");
     waitFor([&] { return doneOf("t4"); });
     check(doneOf("t4"), "cancel ends the task");
@@ -159,6 +165,26 @@ int main(int argc, char** argv)
     cl.forget("job1");
     waitFor([&] { gone = !fs::exists(root.path().toStdString() + "/" + cp.id + "/job1"); return gone; });
     check(gone, "forgetting a job removes its folder");
+
+    // the worker starts again (a task of ours running there): the client hears it
+    WorkerClient fresh(cl.pairing());   // a client that has had no event reply yet
+    std::vector<json> fevs;
+    fresh.onEvent = [&](const json& ev) { fevs.push_back(ev); };
+    bool fh = false; fresh.hello([&](bool, const json&) { fh = true; }); waitFor([&] { return fh; });
+    fresh.listen();
+    cl.submit({{"id", "t9"}, {"job", "job2"}, {"argv", {"diarize", "/work"}}}, [](bool, const json&) {});
+    waitFor([&] { return runs >= 5; });
+    const int port = srv.port();
+    auto srv2 = std::make_unique<WorkerServer>(root.path().toStdString(), run);
+    srv.close();
+    waitFor([&] { return srv2->listen(port).empty(); }, 3000);
+    srv2->setPairings({wp});
+    bool resync = false;
+    waitFor([&] { for (auto& e : evs) if (e.value("kind", std::string()) == "resync") resync = true; return resync; }, 45000);
+    check(resync, "a restarted worker is noticed (its boot id changed)");
+    bool fresync = false;
+    waitFor([&] { for (auto& e : fevs) if (e.value("kind", std::string()) == "resync") fresync = true; return fresync; }, 45000);
+    check(fresync, "...also by a client whose first long poll hadn't returned yet");
 
     std::printf(fails ? "REMOTE FAILED (%d)\n" : "REMOTE GREEN\n", fails);
     return fails ? 1 : 0;

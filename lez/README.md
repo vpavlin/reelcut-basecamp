@@ -4,13 +4,18 @@ A LEZ v0.4 program (raw `lee_core` actors, no SPEL): a worker publishes an offer
 period, period length, longest rental); a client rents N periods, which in ONE transaction pays
 `price × N` from the payer's account to the treasury (native token transfer) and extends the lease of
 the client's key at that worker (`paid_through_ms`, from `max(now, paid_through)`). The worker serves a
-client key while its lease is paid. The offer keeps a record only the program writes (rentals, periods
+client key while its lease is paid. Rent carries the terms the payer read (`max_amount`, `treasury`):
+if the worker changed its offer in between, the rental is refused instead of charging more or paying
+elsewhere. Who paid isn't recorded: anyone may pay for any client key's lease. The offer keeps a record only the program writes (rentals, periods
 sold). Reviews / reputation: an open design, see ../docs/remote-execution.md.
 
 - `core/`: messages and states (borsh), shared by the program and clients; the lease account is
   `for_public_pda(program, sha256("reelcut-lease/v1" ‖ worker ‖ client_key))`.
 - `methods/guest/src/bin/reelcut_lease.rs`: the program.
-- `src/main.rs`: `reelcut_lease deploy|offer|rent|show`, a wallet-based tool for tests and ops.
+- `src/main.rs`: `reelcut_lease deploy|offer|rent|show`, a wallet-based tool for tests and ops
+  (`rent --max N --treasury ID` overrides the terms it sends, to test the refusals).
+- `cargo test -p reelcut_lease_core` pins a lease account; core/test/remote_test.cpp checks Reelcut's own
+  computation against the same value.
 
 ## Build and run (no Docker)
 
@@ -46,3 +51,9 @@ wallet account import public --private-key 717940b1cc55e5d6b2066dbf1d9a3f26f212f
   lease paid through now + 2 h, record rentals 1 / periods 2;
 - renew 1 period: +3,600,000 ms from the previous end, not from now;
 - 25 periods (> max 24): refused by the program, nothing moved.
+
+## Tested after the SPEL agent's review (2026-11-15, program HpSbyVRX…)
+
+- rent 2 with `--max 1999999` (offer asks 2,000,000): refused, "the price went up since you read the offer";
+- rent 2 with another treasury: refused; the payer's balance unchanged by both;
+- rent 2 normally: treasury +2,000,000, lease paid through now + 20 min (10-minute periods), record 1 / 2.

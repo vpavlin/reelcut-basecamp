@@ -1,6 +1,7 @@
 // Remote execution: a worker and a client over localhost, with a fake runner (no container).
 //   cmake -S core/test -B /tmp/rt && cmake --build /tmp/rt && /tmp/rt/remote_test
 #include "remote.h"
+#include "lez_lease.h"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -32,6 +33,22 @@ int main(int argc, char** argv)
     QCoreApplication app(argc, argv);
     std::printf("argv checks\n");
     std::string e;
+    {   // the lease program (lez/reelcut_lease): same vector as its Rust test, so a PDA change can't drift
+        namespace L = reelcut::lease;
+        const std::string acc = L::leaseAccount(std::string(32, '\1'), std::string(32, '\2'), std::string(32, '\3'));
+        check(L::toHex(acc) == "d6b54235f1b14e19a5912f69323730fe470996707828dbae0b386e62b27f43cb", "lease account matches lee_core's for_public_pda");
+        uint64_t lo = 0, hi = 0;
+        check(L::mulPrice(~0ull, 0, 3, lo, hi) && lo == ~0ull - 2 && hi == 2, "price × periods carries into the high word");
+        check(!L::mulPrice(0, ~0ull, 2, lo, hi), "price × periods overflow is refused");
+        check(L::setOfferMessage(std::string(32, 't'), 5, 0, 60000, 3, true, "short").empty(), "an offer with a bad key isn't built");
+        const std::string m = L::rentMessage(std::string(32, 'c'), std::string(32, 'p'), 2, 7, 10, 0, std::string(32, 't'));
+        check(m.size() == 1 + 32 + 32 + 4 + 8 + 16 + 32 && m[0] == 1 && m.substr(m.size() - 32) == std::string(32, 't'), "rent carries max amount and treasury");
+        check(L::toHex(L::rentMessage(std::string(32, '\3'), std::string(32, '\4'), 2, 7, 10, 0, std::string(32, '\5'))) ==
+              "01030303030303030303030303030303030303030303030303030303030303030304040404040404040404040404040404040404040404040404040404040404040200000007000000000000000a0000000000000000000000000000000505050505050505050505050505050505050505050505050505050505050505", "rent bytes match the program's borsh");
+        std::string lease(32, 'w'); lease += std::string(32, 'c'); lease += std::string("\x10\x27\0\0\0\0\0\0", 8);
+        auto l = L::parseLease(lease);
+        check(l && l->paidThroughMs == 10000 && l->clientKey == std::string(32, 'c'), "a lease parses (worker, client, paid through)");
+    }
     check(checkArgv({"transcribe", "/work"}, e), "transcribe /work");
     check(checkArgv({"fetch", "https://youtu.be/x", "/work"}, e), "fetch a URL");
     check(!checkArgv({"fetch", "file:///etc/passwd", "/work"}, e), "fetch refuses file:");

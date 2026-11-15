@@ -5,10 +5,13 @@
 //! - **Offer** `Actor(worker, this program)`: the worker's terms (treasury, price per period, period
 //!   length, longest rental), written by the worker (`SetOffer`, signed by the worker's account).
 //! - **Lease** `Actor(lease, this program)`, `lease = for_public_pda(this program, seed(worker, client))`:
-//!   how long a client key is paid for at that worker (`paid_through_ms`), and who paid.
+//!   how long a client key is paid for at that worker (`paid_through_ms`). Anyone may pay for any
+//!   client key's lease: who paid isn't recorded (an unpaid, free extension wouldn't prove it anyway).
 //!
 //! `Rent` goes to the worker's offer. The offer reads its own terms, charges the payer (who signs the
-//! transaction) `price × periods` into the treasury, and tells the lease to extend by `periods` from
+//! transaction) `price × periods` into the treasury, refusing when that's more than the `max_amount` or
+//! another treasury than the payer agreed to (the worker may change its offer between the client's read
+//! and the transaction), and tells the lease to extend by `periods` from
 //! `max(now, paid_through)`. "Now" is the client's claim, held to within `CLOCK_SLACK_MS` of the block
 //! time by the transaction's timestamp window: v0.4 programs don't read a clock.
 //!
@@ -39,19 +42,22 @@ fn handle_message(input: &ReceiveInput, message: Message) -> Response {
             let record = offer_state(input).map(|s| s.record).unwrap_or_default();
             Response::set_state(borsh::to_vec(&OfferState { offer, record }).expect("encode"))
         }
-        Message::Rent { client_key, payer, periods, now_ms } => {
+        Message::Rent { client_key, payer, periods, now_ms, max_amount, treasury } => {
             let mut state = offer_state(input).expect("this worker has no offer");
             let offer = state.offer.clone();
             assert!(offer.open, "this worker takes no new rentals");
             assert!(periods >= 1 && periods <= offer.max_periods, "periods out of range");
             let amount = offer.price_per_period.checked_mul(u128::from(periods)).expect("price overflows");
+            // the terms the payer read: a changed offer refuses the rental instead of charging more
+            assert!(amount <= max_amount, "the price went up since you read the offer");
+            assert_eq!(offer.treasury, treasury, "the offer pays another treasury than you read");
             let worker = input.receiver.account_id;
             let program = input.receiver.program_account_id;
             let seed = lease_seed(&worker, &client_key);
             let lease = AccountId::for_public_pda(&program, &seed);
             let add_ms = offer.period_ms.checked_mul(u64::from(periods)).expect("time overflows");
-            state.record.rentals += 1;
-            state.record.periods_sold += u64::from(periods);
+            state.record.rentals = state.record.rentals.saturating_add(1);
+            state.record.periods_sold = state.record.periods_sold.saturating_add(u64::from(periods));
             let mut r = Response::set_state(borsh::to_vec(&state).expect("encode"));
             if amount > 0 {
                 // The payer signed the transaction, so its native balance may be debited here.
@@ -63,25 +69,24 @@ fn handle_message(input: &ReceiveInput, message: Message) -> Response {
             r.send(
                 SyncMessage::new(
                     Actor::new(lease, program),
-                    &Message::Extend { worker, client_key, payer, add_ms, now_ms },
+                    &Message::Extend { worker, client_key, add_ms, now_ms },
                 )
                 .with_pda_seeds(vec![seed]),
             )
             .try_timestamp_window(now_ms.saturating_sub(CLOCK_SLACK_MS)..now_ms.saturating_add(CLOCK_SLACK_MS))
             .expect("a valid time window")
         }
-        Message::Extend { worker, client_key, payer, add_ms, now_ms } => {
+        Message::Extend { worker, client_key, add_ms, now_ms } => {
             assert!(input.from_own_program() && input.is_authorized, "a lease is extended by its worker's offer only");
             let from = input.from.expect("sender").account_id;
             assert_eq!(from, worker, "a lease belongs to one worker");
             let mut lease = if input.pre_state.as_ref().is_empty() {
-                Lease { worker, client_key, payer, paid_through_ms: 0 }
+                Lease { worker, client_key, paid_through_ms: 0 }
             } else {
                 borsh::from_slice::<Lease>(input.pre_state.as_ref()).expect("lease state")
             };
             assert_eq!(lease.client_key, client_key, "another client's lease");
-            // The first payer owns the lease; others may only extend it.
-            let _ = payer;
+            assert_eq!(lease.worker, worker, "another worker's lease");
             lease.paid_through_ms = lease.paid_through_ms.max(now_ms).saturating_add(add_ms);
             Response::set_state(borsh::to_vec(&lease).expect("encode"))
         }

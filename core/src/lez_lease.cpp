@@ -112,29 +112,49 @@ std::optional<Lease> parseLease(const std::string& st)
 {
     Rd r{st};
     Lease l;
-    l.worker = r.take(32); l.clientKey = r.take(32); l.payer = r.take(32);
+    l.worker = r.take(32); l.clientKey = r.take(32);
     l.paidThroughMs = r.u64();
     if (!r.ok || r.i != st.size()) return std::nullopt;
     return l;
 }
 
-std::string setOfferMessage(const std::string& treasury, uint64_t price, uint64_t periodMs, uint32_t maxPeriods, bool open, const std::string& key)
+std::string setOfferMessage(const std::string& treasury, uint64_t priceLo, uint64_t priceHi, uint64_t periodMs, uint32_t maxPeriods, bool open, const std::string& key)
 {
+    if (treasury.size() != 32 || key.size() != 32) return "";
     std::string m(1, '\0');               // Message::SetOffer
     m += treasury;
-    le(m, price, 8); le(m, 0, 8);         // u128
+    le(m, priceLo, 8); le(m, priceHi, 8); // u128
     le(m, periodMs, 8); le(m, maxPeriods, 4);
     m.push_back(open ? 1 : 0);
-    m += key.size() == 32 ? key : std::string(32, '\0');
+    m += key;
     return m;
 }
 
-std::string rentMessage(const std::string& clientKey, const std::string& payer, uint32_t periods, uint64_t nowMs)
+std::string rentMessage(const std::string& clientKey, const std::string& payer, uint32_t periods, uint64_t nowMs,
+                        uint64_t maxLo, uint64_t maxHi, const std::string& treasury)
 {
+    if (clientKey.size() != 32 || payer.size() != 32 || treasury.size() != 32) return "";
     std::string m(1, '\1');               // Message::Rent
     m += clientKey; m += payer;
     le(m, periods, 4); le(m, nowMs, 8);
+    le(m, maxLo, 8); le(m, maxHi, 8);     // max_amount: u128
+    m += treasury;
     return m;
+}
+
+bool mulPrice(uint64_t lo, uint64_t hi, uint32_t periods, uint64_t& outLo, uint64_t& outHi)
+{
+    // (hi·2^64 + lo) · p, in 32-bit limbs so it's portable
+    const uint64_t p = periods;
+    const uint64_t a0 = (lo & 0xffffffffu) * p, a1 = (lo >> 32) * p, a2 = (hi & 0xffffffffu) * p, a3 = (hi >> 32) * p;
+    uint64_t c = a0 >> 32;
+    const uint64_t w0 = a0 & 0xffffffffu;
+    c += a1; const uint64_t w1 = c & 0xffffffffu; c >>= 32;
+    c += a2; const uint64_t w2 = c & 0xffffffffu; c >>= 32;
+    c += a3; const uint64_t w3 = c & 0xffffffffu; c >>= 32;
+    if (c) return false;
+    outLo = w0 | (w1 << 32); outHi = w2 | (w3 << 32);
+    return true;
 }
 
 std::string sharedKey(const std::string& mySecret, const std::string& myPublic, const std::string& theirPublic)

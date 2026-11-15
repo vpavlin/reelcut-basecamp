@@ -2,7 +2,8 @@
 //!
 //!   reelcut_lease deploy <payer>                                 -> program account id
 //!   reelcut_lease offer  <program> <worker> <treasury> <price> <period_ms> <max_periods> <key_hex> [--closed]
-//!   reelcut_lease rent   <program> <worker> <client_key_hex> <payer> <periods>
+//!   reelcut_lease rent   <program> <worker> <client_key_hex> <payer> <periods> [--max AMOUNT] [--treasury ID]
+//!                        (pay at most AMOUNT, to ID; default: what the offer asks now)
 //!   reelcut_lease show   <program> <worker> [client_key_hex]     -> the offer (and a lease) as JSON
 //!
 //! The wallet comes from the environment like `wallet` itself (LEE_WALLET_HOME_DIR, config).
@@ -25,7 +26,8 @@ enum Cmd {
     Deploy { payer: AccountId },
     Offer { program: AccountId, worker: AccountId, treasury: AccountId, price: u128, period_ms: u64, max_periods: u32,
             key: String, #[arg(long)] closed: bool },
-    Rent { program: AccountId, worker: AccountId, client_key: String, payer: AccountId, periods: u32 },
+    Rent { program: AccountId, worker: AccountId, client_key: String, payer: AccountId, periods: u32,
+           #[arg(long)] max: Option<u128>, #[arg(long)] treasury: Option<AccountId> },
     Show { program: AccountId, worker: AccountId, client_key: Option<String> },
 }
 
@@ -58,10 +60,11 @@ async fn main() -> Result<()> {
             let h = w.send_pub_tx_paid_by(accounts, 0, ser(&m).into(), None).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
             println!("{}", hex::encode(h.as_ref()));
         }
-        Cmd::Rent { program, worker, client_key, payer, periods } => {
+        Cmd::Rent { program, worker, client_key, payer, periods, max, treasury } => {
             let ck = key32(&client_key)?;
             let offer = read_offer(&w, program, worker).await?.context("this worker has no offer")?;
-            let m = Message::Rent { client_key: ck, payer, periods, now_ms: now_ms() };
+            let max_amount = match max { Some(m) => m, None => offer.offer.price_per_period.checked_mul(u128::from(periods)).context("price overflows")? };
+            let m = Message::Rent { client_key: ck, payer, periods, now_ms: now_ms(), max_amount, treasury: treasury.unwrap_or(offer.offer.treasury) };
             let accounts = vec![
                 AccountIdentity::PublicNoSign(worker).select_program_actor_state(program),
                 AccountIdentity::Public(payer).select_program_actor_state(NATIVE_TOKEN_PROGRAM_ID),
@@ -86,7 +89,7 @@ async fn main() -> Result<()> {
                 let st = acc.map(|a| a.data.actor_state(program).as_ref().to_vec()).unwrap_or_default();
                 out += &if st.is_empty() { ",\"lease\":null".to_string() } else {
                     let l: Lease = borsh::from_slice(&st)?;
-                    format!(",\"lease\":{{\"account\":\"{lease}\",\"payer\":\"{}\",\"paidThroughMs\":{},\"nowMs\":{}}}", l.payer, l.paid_through_ms, now_ms())
+                    format!(",\"lease\":{{\"account\":\"{lease}\",\"paidThroughMs\":{},\"nowMs\":{}}}", l.paid_through_ms, now_ms())
                 };
             }
             println!("{out}}}");

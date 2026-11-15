@@ -28,14 +28,20 @@ struct Offer {
     uint64_t rentals = 0, periodsSold = 0;
 };
 struct Lease {
-    std::string worker, clientKey, payer;
+    std::string worker, clientKey;
     uint64_t paidThroughMs = 0;
 };
 std::optional<Offer> parseOffer(const std::string& state);
 std::optional<Lease> parseLease(const std::string& state);
 
-std::string setOfferMessage(const std::string& treasury, uint64_t price, uint64_t periodMs, uint32_t maxPeriods, bool open, const std::string& key);
-std::string rentMessage(const std::string& clientKey, const std::string& payer, uint32_t periods, uint64_t nowMs);
+// "" when an argument is malformed (an id or key that isn't 32 bytes).
+std::string setOfferMessage(const std::string& treasury, uint64_t priceLo, uint64_t priceHi, uint64_t periodMs, uint32_t maxPeriods, bool open, const std::string& key);
+// maxAmount and treasury: the terms the payer read. The program refuses the rental if the offer now
+// charges more than maxAmount or pays another treasury (the worker may change it in between).
+std::string rentMessage(const std::string& clientKey, const std::string& payer, uint32_t periods, uint64_t nowMs,
+                        uint64_t maxLo, uint64_t maxHi, const std::string& treasury);
+// price × periods as u128 (lo, hi); false on overflow.
+bool mulPrice(uint64_t lo, uint64_t hi, uint32_t periods, uint64_t& outLo, uint64_t& outHi);
 
 // The two keys' shared secret as a 32-byte HMAC key for the worker link (X25519, then BLAKE2b with both
 // public keys). "" when the keys are bad.

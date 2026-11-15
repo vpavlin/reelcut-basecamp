@@ -1369,7 +1369,7 @@ struct ReelcutCorePrivate {
             // the key it was offered with must be the one on the chain: else it's someone else's address
             const std::string offeredKey = QByteArray::fromHex(QByteArray::fromStdString(jstr(marketOffers[id], "key", ""))).toStdString();
             if (offer->key != offeredKey) { r.error = "this offer's key isn't the one on the chain: not paying"; r.offer = json(); changed(); return; }
-            r.offer = {{"treasury", reelcut::lease::base58(offer->treasury)}, {"price", offer->priceLo}, {"periodMs", offer->periodMs},
+            r.offer = {{"treasury", reelcut::lease::base58(offer->treasury)}, {"price", offer->priceLo}, {"priceHi", offer->priceHi}, {"periodMs", offer->periodMs},
                        {"maxPeriods", offer->maxPeriods}, {"open", offer->open}, {"rentals", offer->rentals}, {"periodsSold", offer->periodsSold}};
             const std::string lease = reelcut::lease::base58(reelcut::lease::leaseAccount(prog, wk, mkPublic));
             rpc(seq, "getAccountView", json::array({{{"account_id", lease}, {"program_account_id", program}}}),
@@ -1406,11 +1406,16 @@ struct ReelcutCorePrivate {
             !reelcut::lease::unbase58(jstr(r.offer, "treasury", ""), treasury) || !reelcut::lease::unbase58(lezPayer, payer))
             return "The offer or your paying account isn't a LEZ account id.";
         const std::string lease = reelcut::lease::leaseAccount(prog, wk, mkPublic);
-        const std::string msg = reelcut::lease::rentMessage(mkPublic, payer, (uint32_t)periods, (uint64_t)QDateTime::currentMSecsSinceEpoch());
+        // what we read is what we agree to pay: the program refuses the rental if the offer changed since
+        uint64_t maxLo = 0, maxHi = 0;
+        if (!reelcut::lease::mulPrice(r.offer.value("price", uint64_t(0)), r.offer.value("priceHi", uint64_t(0)), (uint32_t)periods, maxLo, maxHi))
+            return "This offer's price is too large.";
+        const std::string msg = reelcut::lease::rentMessage(mkPublic, payer, (uint32_t)periods, (uint64_t)QDateTime::currentMSecsSinceEpoch(), maxLo, maxHi, treasury);
+        if (msg.empty()) return "The offer or your paying account isn't a LEZ account id.";
         json bytes = json::array();
         for (unsigned char c : msg) bytes.push_back((int)c);
         using reelcut::lease::toHex;
-        const std::string native(32, ' ');
+        const std::string native(32, '\0');
         const json args = json::array({json::array({toHex(wk), toHex(payer), toHex(treasury), toHex(lease)}), 0,
                                        json::array({false, true, false, false}), bytes, toHex(payer),
                                        json::array({toHex(prog), toHex(native), toHex(native), toHex(prog)})});

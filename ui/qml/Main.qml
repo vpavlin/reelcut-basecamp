@@ -787,6 +787,8 @@ Item {
             lezConfigField.text = lw.config || ""
             lezStorageField.text = lw.storage || ""
             lezPayerField.text = lw.payer || ""
+            lezSeqField.text = lw.sequencer || ""
+            lezProgramField.text = lw.program || ""
             lezPasswordField.text = ""
             open()
             root.callVia(root.coreName, "listAgents", [], function (raw) { var o = root.parse(raw); if (o && o.jobs) root.apply(o) })
@@ -1159,7 +1161,17 @@ Item {
                     Field { app: root; id: lezPasswordField; Layout.preferredWidth: 140; Layout.preferredHeight: 32; placeholderText: "Password"; echoMode: TextInput.Password }
                     LogosButton { text: "Save wallet"
                         onClicked: root.act("setLezWallet", [JSON.stringify({ config: lezConfigField.text.trim(), storage: lezStorageField.text.trim(),
-                                                                                payer: lezPayerField.text.trim(), password: lezPasswordField.text })], "Wallet saved") }
+                                                                                payer: lezPayerField.text.trim(), password: lezPasswordField.text,
+                                                                                sequencer: lezSeqField.text.trim(), program: lezProgramField.text.trim() })], "Wallet saved") }
+                }
+                RowLayout {
+                    Layout.fillWidth: true; spacing: 8
+                    Field { app: root; id: lezSeqField; Layout.fillWidth: true; Layout.preferredHeight: 32; placeholderText: "Chain: your sequencer (http://…)" }
+                    Field { app: root; id: lezProgramField; Layout.fillWidth: true; Layout.preferredHeight: 32; placeholderText: "Lease program (base58)" }
+                }
+                Text {
+                    Layout.fillWidth: true; wrapMode: Text.WordWrap; textFormat: Text.PlainText; color: root.cFaint; font.pixelSize: 12
+                    text: "Offers are checked on this chain and paid only through this lease program: an offer naming another program or chain is ignored."
                 }
 
                 Check { id: workerBox; text: "Let my other computers use this one as a worker"; Layout.fillWidth: true; Layout.topMargin: 6 }

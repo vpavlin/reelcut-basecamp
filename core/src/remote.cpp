@@ -342,9 +342,25 @@ WorkerServer::WorkerServer(std::string root, RunFn run) : m_root(std::move(root)
     m_boot = hex(b, sizeof b);
     m_tick = new QTimer(this);
     m_tick->setInterval(1000);
-    QObject::connect(m_tick, &QTimer::timeout, this, [this] { flushWaiters(); });
+    QObject::connect(m_tick, &QTimer::timeout, this, [this] { flushWaiters(); stopUnpaid(); });
     m_tick->start();
 }
+// A market client's steps run while its rental does (plus a short grace to renew): a step started just
+// before the end mustn't get hours of unpaid compute.
+void WorkerServer::stopUnpaid()
+{
+    const long long now = nowMs();
+    for (auto& [tid, t] : m_tasks) {
+        if (!t.running || !t.stop) continue;
+        auto p = m_pairs.find(t.pair);
+        if (p == m_pairs.end() || p->second.tasksUntil <= 0 || now <= p->second.tasksUntil + m_grace) continue;
+        push(t.pair, {{"task", t.id}, {"kind", "err"}, {"text", "\nThe rental at this worker ended: the step was stopped. Renew it and run the step again.\n"}});
+        auto stop = t.stop;
+        t.stop = nullptr;   // once
+        stop();
+    }
+}
+
 WorkerServer::~WorkerServer()
 {
     for (auto& [id, t] : m_tasks) if (t.running && t.stop) t.stop();
@@ -467,19 +483,18 @@ int WorkerServer::open(Conn& c, std::string& err)
 {
     const std::string pair = c.headers.count("x-rc-pair") ? c.headers["x-rc-pair"] : "";
     if (c.buf.size() < 4) return 0;
-    auto p = m_pairs.find(pair);
-    Pairing market;
-    // a market client is asked about on every request: its lease can run out (resolve() caches the chain)
-    if (resolve && pair.rfind("m-", 0) == 0) {
-        std::string why;
-        const int r = resolve(pair, market, why);
-        if (r <= 0) { err = r == 0 ? "checking your lease, try again in a moment" : why; c.retry = r == 0; return -1; }
-        m_pairs[pair] = market;
-        p = m_pairs.find(pair);
+    const bool isMarket = marketKey && resolve && pair.rfind("m-", 0) == 0;
+    std::string key;
+    if (isMarket) {
+        key = marketKey(pair);   // derived, no chain: nothing is looked up for a request that doesn't open
+        if (key.empty()) { err = "not a market client's key"; return -1; }
+    } else {
+        auto p = m_pairs.find(pair);
+        if (p == m_pairs.end()) { err = "not paired with this worker"; return -1; }
+        key = p->second.key;
     }
-    if (p == m_pairs.end()) { err = "not paired with this worker"; return -1; }
     std::string plain, nonce;
-    const int r = openFrame(p->second.key, "req|" + pair, c.buf, plain, &nonce);
+    const int r = openFrame(key, "req|" + pair, c.buf, plain, &nonce);
     if (r == 0) return 0;
     if (r < 0) { err = "not sealed with this pairing's key"; return -1; }
     const json env = json::parse(plain, nullptr, false);
@@ -489,7 +504,17 @@ int WorkerServer::open(Conn& c, std::string& err)
     const long long now = nowMs();
     if (m_nonces.size() > 5000) for (auto it = m_nonces.begin(); it != m_nonces.end();) it = now - it->second > 180000 ? m_nonces.erase(it) : std::next(it);
     if (!m_nonces.emplace(nonce, now).second) { err = "replayed request"; return -1; }
-    c.pair = pair; c.key = p->second.key; c.nonce = nonce; c.opened = true;
+    // a market client that proved its key: is it paid? asked on every request, its lease can run out
+    // (resolve() caches what the chain said)
+    if (isMarket) {
+        Pairing market;
+        std::string why;
+        const int rr = resolve(pair, market, why);
+        if (rr <= 0) { err = rr == 0 ? "checking your lease, try again in a moment" : why; c.retry = rr == 0; return -1; }
+        market.key = key;
+        m_pairs[pair] = market;
+    }
+    c.pair = pair; c.key = key; c.nonce = nonce; c.opened = true;
     c.method = QString::fromStdString(env.value("m", std::string()));
     c.target = QString::fromStdString(env.value("p", std::string()));
     const QUrl u(c.target);

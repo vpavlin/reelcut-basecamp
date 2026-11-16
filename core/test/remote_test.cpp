@@ -4,6 +4,7 @@
 #include "lez_lease.h"
 
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QDir>
 #include <QEventLoop>
 #include <QFile>
@@ -232,6 +233,56 @@ int main(int argc, char** argv)
     bool fresync = false;
     waitFor([&] { for (auto& e : fevs) if (e.value("kind", std::string()) == "resync") fresync = true; return fresync; }, 45000);
     check(fresync, "...also by a client whose first long poll hadn't returned yet");
+
+    std::printf("market client\n");
+    {
+        namespace L = reelcut::lease;
+        std::string wsec, wpub, csec, cpub;
+        L::newKeypair(wsec, wpub); L::newKeypair(csec, cpub);
+        const std::string mid = "m-" + L::toHex(cpub);
+        WorkerServer ms(root.path().toStdString() + "/market", run);
+        check(ms.listen(0).empty(), "a market worker listens");
+        ms.setRentalGrace(300);
+        int resolves = 0;
+        long long until = QDateTime::currentMSecsSinceEpoch() + 1500;
+        ms.marketKey = [&](const std::string& pid) {
+            const std::string k = QByteArray::fromHex(QByteArray::fromStdString(pid.substr(2))).toStdString();
+            return pid.size() == 66 && k.size() == 32 ? L::sharedKey(wsec, wpub, k) : std::string();
+        };
+        ms.resolve = [&](const std::string& pid, Pairing& out, std::string&) { ++resolves; out.id = pid; out.name = "m"; out.tasksUntil = until; return 1; };
+        const std::string url = "http://127.0.0.1:" + std::to_string(ms.port());
+
+        Pairing fake; fake.id = mid; fake.key = newKey(); fake.urls = {url};   // claims the key, can't prove it
+        WorkerClient fc(fake);
+        bool fdone = false, fok = true;
+        fc.hello([&](bool ok, const json&) { fok = ok; fdone = true; });
+        waitFor([&] { return fdone; });
+        check(!fok && resolves == 0, "a request that doesn't open asks nothing about the lease");
+
+        Pairing mp; mp.id = mid; mp.key = L::sharedKey(csec, cpub, wpub); mp.urls = {url};
+        WorkerClient mc(mp);
+        bool mdone = false, mok = false;
+        mc.hello([&](bool ok, const json&) { mok = ok; mdone = true; });
+        waitFor([&] { return mdone; });
+        check(mok && resolves >= 1, "a market client with its key is served while paid");
+
+        std::vector<json> mev;
+        mc.onEvent = [&](const json& ev) { mev.push_back(ev); };
+        mc.listen();
+        bool sdone = false, sok = false;
+        mc.submit({{"id", "d1"}, {"job", "j"}, {"argv", {"diarize", "/work"}}}, [&](bool ok, const json&) { sok = ok; sdone = true; });
+        waitFor([&] { return sdone; });
+        check(sok, "a step starts while paid");
+        auto ended = [&] { for (auto& e : mev) if (e.value("task", std::string()) == "d1" && e.value("kind", std::string()) == "done") return true; return false; };
+        waitFor(ended, 8000);
+        bool said = false;
+        for (auto& e : mev) if (e.value("kind", std::string()) == "err" && e.value("text", std::string()).find("rental") != std::string::npos) said = true;
+        check(ended() && said, "a running step stops when the rental ends (after the grace), and says why");
+        bool s2done = false, s2ok = true;
+        mc.submit({{"id", "d2"}, {"job", "j"}, {"argv", {"diarize", "/work"}}}, [&](bool ok, const json&) { s2ok = ok; s2done = true; });
+        waitFor([&] { return s2done; });
+        check(!s2ok, "no new step after the rental ended");
+    }
 
     std::printf(fails ? "REMOTE FAILED (%d)\n" : "REMOTE GREEN\n", fails);
     return fails ? 1 : 0;

@@ -10,6 +10,9 @@
 
 namespace reelcut::lease {
 
+// The native token program's id in LEZ v0.4 (lee_core native_token: 32 zero bytes).
+inline const std::string kNativeTokenProgram(32, '\0');
+
 std::string base58(const std::string& raw32);
 bool unbase58(const std::string& s, std::string& raw32);   // false: not a 32-byte base58 id
 std::string toHex(const std::string& raw);

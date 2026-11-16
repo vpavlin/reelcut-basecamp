@@ -130,10 +130,14 @@ public:
     json status() const;                                // for the snapshot: tasks running, clients seen
     long long lastSeen(const std::string& pair) const { auto it = m_seen.find(pair); return it == m_seen.end() ? 0 : it->second; }
     std::function<void()> onChange;
-    // A client that isn't paired: a market client ("m-" + its public key in hex). Fill `out` (id, key,
-    // name) and return 1 to serve it, 0 when its lease is being checked (asked to try again in a moment),
-    // -1 to refuse it (`why`).
+    // A client that isn't paired: a market client ("m-" + its public key in hex). `marketKey` gives the
+    // link key for it (from the two public keys: no chain, so a request is opened before anything else);
+    // then `resolve`, for requests that opened, fills `out` (id, key, name, tasksUntil) and returns 1 to
+    // serve it, 0 when its lease is being checked (try again in a moment), -1 to refuse it (`why`).
+    std::function<std::string(const std::string& pairId)> marketKey;
     std::function<int(const std::string& pairId, Pairing& out, std::string& why)> resolve;
+    // A market client's running steps stop this long after its rental ends (it may renew meanwhile).
+    void setRentalGrace(long long ms) { m_grace = ms; }
 
 private:
     struct Conn;
@@ -155,6 +159,7 @@ private:
     std::string jobDir(const std::string& pair, const std::string& job) const;
     void push(const std::string& pair, json ev);
     void flushWaiters();
+    void stopUnpaid();
     json tasksJson(const std::string& pair) const;
 
     std::string m_root;
@@ -172,6 +177,7 @@ private:
     json m_info = json::object();
     QTimer* m_tick = nullptr;
     std::string m_boot;
+    long long m_grace = 2 * 60 * 1000;
 };
 
 // ── the client ───────────────────────────────────────────────────────────────────────────────

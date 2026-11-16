@@ -945,7 +945,8 @@ struct ReelcutCorePrivate {
             {"workers", workersJson()},
             {"marketKey", reelcut::lease::toHex(mkPublic)},
             {"market", {{"state", findState}, {"error", findError}, {"found", found}}},
-            {"lezWallet", {{"config", lezConfig}, {"storage", lezStorage}, {"payer", lezPayer}, {"password", !lezPassword.empty()}}},
+            {"lezWallet", {{"config", lezConfig}, {"storage", lezStorage}, {"payer", lezPayer}, {"password", !lezPassword.empty()},
+                           {"sequencer", mkSequencer}, {"program", mkProgram}}},
             {"worker", workerJson()},
         };
     }
@@ -1323,7 +1324,7 @@ struct ReelcutCorePrivate {
     // dependency on LEZ), and the account that pays.
     std::string lezConfig, lezStorage, lezPassword, lezPayer;   // payer: base58
     std::unique_ptr<logos::LpClient> lez;
-    struct Rental { std::string state, error, tx; long long paidThrough = 0, checked = 0, wantAbove = 0; json offer; };
+    struct Rental { std::string state, error, tx; long long paidThrough = 0, checked = 0, wantAbove = 0; json offer; bool unsure = false; };
     std::map<std::string, Rental> rentals;                   // market worker id -> what the chain and the last rent said
 
     // A JSON-RPC call to a sequencer; cb(result or null, error).
@@ -1342,14 +1343,33 @@ struct ReelcutCorePrivate {
             cb(j.value("result", json()), "");
         }));
     }
+    // A JSON array of bytes (0..255) as raw bytes; "" if it's anything else.
+    static std::string byteArray(const json& a)
+    {
+        std::string out;
+        if (!a.is_array()) return out;
+        for (auto& b : a) {
+            if (!b.is_number_integer() || b.get<long long>() < 0 || b.get<long long>() > 255) return "";
+            out.push_back((char)b.get<int>());
+        }
+        return out;
+    }
     // One program's state of an account (raw bytes), from getAccountView.
     static std::string actorState(const json& result, const std::string& program)
     {
         std::string bytes;
         if (!result.is_object()) return bytes;
         const json st = result.value("data", json::object()).value("actor_states", json::object());
-        if (st.contains(program) && st[program].is_array()) for (auto& b : st[program]) bytes.push_back((char)b.get<int>());
+        if (st.contains(program)) return byteArray(st[program]);
         return bytes;
+    }
+    // An offer is only trusted on our own chain and lease program: the payer's signature authorizes any
+    // debit any program in the transaction makes, so a program named by an advert could take anything.
+    std::string offerUntrusted(const json& o) const
+    {
+        if (mkProgram.empty()) return "set the lease program in Settings first";
+        if (jstr(o, "program", "") != mkProgram) return "it names another lease program than yours: ignored";
+        return "";
     }
     // A market worker's terms and this Basecamp's lease there, read from the chain (not from the worker).
     void refreshRental(const std::string& id, std::function<void()> then = nullptr)
@@ -1357,7 +1377,8 @@ struct ReelcutCorePrivate {
         auto it = marketOffers.find(id);
         if (it == marketOffers.end()) return;
         const json o = it->second;
-        const std::string seq = jstr(o, "sequencer", mkSequencer), program = jstr(o, "program", ""), worker = jstr(o, "account", "");
+        if (const std::string bad = offerUntrusted(o); !bad.empty()) { rentals[id].error = "This offer: " + bad; changed(); return; }
+        const std::string seq = mkSequencer, program = mkProgram, worker = jstr(o, "account", "");
         std::string prog, wk;
         if (!reelcut::lease::unbase58(program, prog) || !reelcut::lease::unbase58(worker, wk)) { rentals[id].error = "the offer has no LEZ terms"; return; }
         rpc(seq, "getAccountView", json::array({{{"account_id", worker}, {"program_account_id", program}}}),
@@ -1377,10 +1398,10 @@ struct ReelcutCorePrivate {
                 Rental& r = rentals[id];
                 r.checked = QDateTime::currentMSecsSinceEpoch();
                 if (!err2.empty()) { r.error = err2; changed(); return; }
-                auto l = reelcut::lease::parseLease(actorState(res2, jstr(marketOffers[id], "program", "")));
+                auto l = reelcut::lease::parseLease(actorState(res2, mkProgram));
                 r.paidThrough = l && l->clientKey == mkPublic ? (long long)l->paidThroughMs : 0;
                 if (r.state == "confirming" && r.paidThrough > r.wantAbove) {
-                    r.state = "paid"; r.error.clear();
+                    r.state = "paid"; r.error.clear(); r.unsure = false;
                     // paid: talk to the worker now rather than at the next retry
                     if (auto* c = clientFor(id)) c->hello([this, id](bool, const json&) { if (auto* c = clientFor(id)) { workerSeen[id]["hello"] = c->lastHello(); c->listen(); } changed(); });
                 }
@@ -1401,8 +1422,9 @@ struct ReelcutCorePrivate {
         if (!jbool(r.offer, "open", false)) return "This worker takes no new rentals.";
         if (periods < 1 || periods > (int)jnum(r.offer, "maxPeriods", 1)) return "This worker rents 1 to " + std::to_string(jnum(r.offer, "maxPeriods", 1)) + " periods.";
         const json o = it->second;
+        if (const std::string bad = offerUntrusted(o); !bad.empty()) return "This offer: " + bad;
         std::string prog, wk, treasury, payer;
-        if (!reelcut::lease::unbase58(jstr(o, "program", ""), prog) || !reelcut::lease::unbase58(jstr(o, "account", ""), wk) ||
+        if (!reelcut::lease::unbase58(mkProgram, prog) || !reelcut::lease::unbase58(jstr(o, "account", ""), wk) ||
             !reelcut::lease::unbase58(jstr(r.offer, "treasury", ""), treasury) || !reelcut::lease::unbase58(lezPayer, payer))
             return "The offer or your paying account isn't a LEZ account id.";
         const std::string lease = reelcut::lease::leaseAccount(prog, wk, mkPublic);
@@ -1415,7 +1437,7 @@ struct ReelcutCorePrivate {
         json bytes = json::array();
         for (unsigned char c : msg) bytes.push_back((int)c);
         using reelcut::lease::toHex;
-        const std::string native(32, '\0');
+        const std::string native = reelcut::lease::kNativeTokenProgram;
         const json args = json::array({json::array({toHex(wk), toHex(payer), toHex(treasury), toHex(lease)}), 0,
                                        json::array({false, true, false, false}), bytes, toHex(payer),
                                        json::array({toHex(prog), toHex(native), toHex(native), toHex(prog)})});
@@ -1429,10 +1451,21 @@ struct ReelcutCorePrivate {
                     Rental& r = rentals[id];
                     json res = v.is_string() ? json::parse(v.get<std::string>(), nullptr, false) : v;
                     if (!res.is_object() || !jbool(res, "success", false)) {
-                        r.state = "failed";
-                        r.error = res.is_object() ? jstr(res, "error", "the wallet refused") : "lez_core didn't answer (" + code + "): is it installed?";
-                        changed(); return;
+                        const std::string err = res.is_object() ? jstr(res, "error", "the wallet refused") : "lez_core didn't answer (" + code + ")";
+                        // refused before sending (the program's checks run in the wallet's simulation first):
+                        // nothing was paid. Anything else may have reached the chain: watch the lease before
+                        // letting the person pay again.
+                        if (err.find("SimulatedRevert") != std::string::npos || err.find("Failed to execute program") != std::string::npos) {
+                            r.state = "failed"; r.error = err; changed(); return;
+                        }
+                        r.unsure = true;
+                        r.error = err + ": checking the chain in case it was sent anyway";
+                        r.state = "confirming";
+                        changed();
+                        watchRental(id, 0);
+                        return;
                     }
+                    r.unsure = false;
                     r.tx = jstr(res, "tx_hash", "");
                     r.state = "confirming";
                     changed();
@@ -1536,13 +1569,16 @@ struct ReelcutCorePrivate {
         findState = "checking";
         changed();
         // each against the chain: terms from there, and the key must be the one the chain names
+        size_t asked = 0;
         for (size_t i = 0; i < found.size(); ++i) {
             const json o = found[i]["offer"];
-            rpc(jstr(o, "sequencer", mkSequencer), "getAccountView", json::array({{{"account_id", jstr(o, "account", "")}, {"program_account_id", jstr(o, "program", "")}}}),
+            if (const std::string bad = offerUntrusted(o); !bad.empty()) { found[i]["error"] = bad; continue; }
+            ++asked;
+            rpc(mkSequencer, "getAccountView", json::array({{{"account_id", jstr(o, "account", "")}, {"program_account_id", mkProgram}}}),
                 [this, i, o](const json& res, const std::string& err) {
                 if (i >= found.size()) return;
                 json& f = found[i];
-                auto off = err.empty() ? reelcut::lease::parseOffer(actorState(res, jstr(o, "program", ""))) : std::nullopt;
+                auto off = err.empty() ? reelcut::lease::parseOffer(actorState(res, mkProgram)) : std::nullopt;
                 if (!off) f["error"] = err.empty() ? "no offer on the chain" : err;
                 else if (reelcut::lease::toHex(off->key) != jstr(o, "key", "")) f["error"] = "its key isn't the one on the chain";
                 else f["chain"] = {{"price", off->priceLo}, {"periodMs", off->periodMs}, {"maxPeriods", off->maxPeriods}, {"open", off->open},
@@ -1551,7 +1587,7 @@ struct ReelcutCorePrivate {
                 changed();
             });
         }
-        if (found.empty()) findState = "done";
+        if (asked == 0) findState = "done";
         changed();
     }
 
@@ -1561,7 +1597,13 @@ struct ReelcutCorePrivate {
         QTimer::singleShot(tries == 0 ? 8000 : 15000, loop, guarded("rental", [this, id, tries] {
             Rental& r = rentals[id];
             if (r.state != "confirming") return;
-            if (tries > 60) { r.state = "failed"; r.error = "sent, but not on the chain after 15 minutes (tx " + r.tx.substr(0, 12) + ")"; changed(); return; }
+            // a send that failed may still land: 5 minutes of watching before another payment is allowed
+            if (tries > (r.unsure ? 20 : 60)) {
+                r.state = "failed";
+                r.error = r.unsure ? "the wallet failed and nothing reached the chain in 5 minutes: check your balance before renting again"
+                                   : "sent, but not on the chain after 15 minutes (tx " + r.tx.substr(0, 12) + "): check your balance before renting again";
+                changed(); return;
+            }
             refreshRental(id, [this, id, tries] { if (rentals[id].state == "confirming") watchRental(id, tries + 1); });
         }));
     }
@@ -1606,13 +1648,29 @@ struct ReelcutCorePrivate {
         return true;
     }
 
-    // Worker side: may this market client be served? 1 yes (out filled), 0 checking, -1 no.
+    // Worker side: the link key for a market client ("m-" + its public key): from the two keys alone.
+    std::string marketLinkKey(const std::string& pairId)
+    {
+        if (!marketOn || pairId.size() != 66) return "";
+        const std::string cpk = QByteArray::fromHex(QByteArray::fromStdString(pairId.substr(2))).toStdString();
+        return cpk.size() == 32 ? reelcut::lease::sharedKey(mkSecret, mkPublic, cpk) : "";
+    }
+    // Worker side: may this market client (it opened a sealed request: it holds its key) be served?
+    // 1 yes (out filled), 0 checking, -1 no.
     int resolveMarket(const std::string& pairId, reelcut::remote::Pairing& out, std::string& why)
     {
         if (!marketOn || mkProgram.empty() || mkAccount.empty()) { why = "this worker isn't on the market"; return -1; }
         const std::string cpk = QByteArray::fromHex(QByteArray::fromStdString(pairId.substr(2))).toStdString();
         if (cpk.size() != 32 || pairId.size() != 66) { why = "not a market client"; return -1; }
         const long long now = QDateTime::currentMSecsSinceEpoch();
+        // keys cost nothing to make: keep what the chain said about at most 500, forgetting the oldest read
+        if (!leases.count(cpk) && leases.size() >= 500) {
+            auto oldest = leases.end();
+            for (auto it = leases.begin(); it != leases.end(); ++it)
+                if (!it->second.checking && (oldest == leases.end() || it->second.checked < oldest->second.checked)) oldest = it;
+            if (oldest == leases.end()) { why = "busy, try again in a moment"; return -1; }
+            leases.erase(oldest);
+        }
         LeaseSeen& l = leases[cpk];
         // read the chain again: every minute, every 15 s near the end, at once when nothing is known
         // (a client without a lease is asked about again after 10 s: it may have just paid)
@@ -1650,8 +1708,7 @@ struct ReelcutCorePrivate {
             json j = json::parse(r->readAll().toStdString(), nullptr, false);
             if (r->error() != QNetworkReply::NoError || !j.is_object()) { l.error = "the chain didn't answer: " + r->errorString().toStdString(); return; }
             const json st = j.value("result", json()).is_object() ? j["result"].value("data", json::object()).value("actor_states", json::object()) : json::object();
-            std::string bytes;
-            if (st.contains(mkProgram) && st[mkProgram].is_array()) for (auto& b : st[mkProgram]) bytes.push_back((char)b.get<int>());
+            const std::string bytes = st.contains(mkProgram) ? byteArray(st[mkProgram]) : std::string();
             auto lease = reelcut::lease::parseLease(bytes);
             if (!lease || lease->clientKey != cpk || lease->worker != worker) { l.paidThrough = 0; l.error = "no paid rental for your key at this worker"; return; }
             l.paidThrough = (long long)lease->paidThroughMs;
@@ -1722,6 +1779,7 @@ struct ReelcutCorePrivate {
             });
             server->onChange = [this] { changed(); };
             server->resolve = [this](const std::string& pid, reelcut::remote::Pairing& out, std::string& why) { return resolveMarket(pid, out, why); };
+            server->marketKey = [this](const std::string& pid) { return marketLinkKey(pid); };
         }
         server->setPairings(workerClients);
         if (mkPublic.empty()) loadMarketKey();
@@ -4539,6 +4597,8 @@ std::string ReelcutCoreImpl::removeWorker(const std::string& id)
 std::string ReelcutCoreImpl::addMarketWorker(const std::string& offerJson)
 {
     json o = json::parse(offerJson, nullptr, false);
+    if (o.is_object())
+        if (const std::string bad = d->offerUntrusted(o); !bad.empty()) return json({{"ok", false}, {"error", "This offer: " + bad + "."}}).dump();
     if (!o.is_object() || !d->addMarketClient(o)) return json({{"ok", false}, {"error", "Not a worker offer (name, urls, key)."}}).dump();
     d->saveWorkers();
     d->changed();
@@ -4556,6 +4616,14 @@ std::string ReelcutCoreImpl::setLezWallet(const std::string& walletJson)
     d->lezStorage = localPathFrom(jstr(w, "storage", d->lezStorage));
     if (w.contains("password") && w["password"].is_string()) d->lezPassword = w["password"].get<std::string>();
     d->lezPayer = payer;
+    // the chain and lease program this Basecamp trusts, as a client too (the same settings as the worker's)
+    if (w.contains("sequencer") && w["sequencer"].is_string() && !trim(w["sequencer"].get<std::string>()).empty())
+        d->mkSequencer = trim(w["sequencer"].get<std::string>());
+    if (w.contains("program") && w["program"].is_string()) {
+        const std::string pg = trim(w["program"].get<std::string>());
+        if (!pg.empty() && !reelcut::lease::unbase58(pg, raw)) return json({{"ok", false}, {"error", "The lease program isn't a LEZ account id (base58)."}}).dump();
+        d->mkProgram = pg;
+    }
     d->saveWorkers();
     d->changed();
     return d->state().dump();

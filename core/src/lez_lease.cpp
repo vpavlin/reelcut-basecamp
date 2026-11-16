@@ -101,7 +101,9 @@ std::optional<Offer> parseOffer(const std::string& st)
     o.treasury = r.take(32);
     o.priceLo = r.u64(); o.priceHi = r.u64();
     o.periodMs = r.u64(); o.maxPeriods = r.u32();
-    o.open = r.take(1)[0] != 0;
+    const unsigned char open = (unsigned char)r.take(1)[0];
+    if (open > 1) return std::nullopt;   // a borsh bool is 0 or 1
+    o.open = open == 1;
     o.key = r.take(32);
     o.rentals = r.u64(); o.periodsSold = r.u64();
     if (!r.ok || r.i != st.size()) return std::nullopt;

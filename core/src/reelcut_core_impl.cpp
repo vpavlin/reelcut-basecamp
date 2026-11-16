@@ -1088,6 +1088,15 @@ struct ReelcutCorePrivate {
         }
         const std::string tid = taskId(b, argv);
         const std::string where = b.where;   // the local id of the worker (a market worker's differs from its pairing id)
+        if (rentals.count(where)) {
+            // a rented worker stops a step 2 minutes after the paid time ends: say so before a step starts late
+            const Rental& r = rentals.at(where);
+            const long long left = r.paidThrough - QDateTime::currentMSecsSinceEpoch();
+            if (r.autoLeft <= 0 && left < 10 * 60 * 1000)
+                logLine(b, left > 0 ? "The rental at " + c->pairing().name + " ends in " + std::to_string(left / 60000 + 1)
+                                          + " min and auto-renew is off: a long step may be stopped there. Renew it in Settings."
+                                    : "The rental at " + c->pairing().name + " has ended: renew it in Settings, or turn on auto-renew.");
+        }
         const std::string key = where + "/" + tid;
         procs[slot] = Running{nullptr, id, container, false, key};
         if (slot.rfind("scenes/", 0) != 0) { b.status = "running"; b.error.clear(); }
@@ -1097,17 +1106,46 @@ struct ReelcutCorePrivate {
         pushFiles(b, c, [this, c, key, tid, id, a, where](const std::string& err) {
             if (!rtasks.count(key)) return;    // cancelled meanwhile
             if (!err.empty()) { if (Job* j = find(id)) logLine(*j, "Could not send the files to " + c->pairing().name + ": " + err); remoteEnded(key, false); return; }
-            c->submit({{"id", tid}, {"job", id}, {"argv", a}}, [this, key, id, c, tid, where](bool ok, const json& r) {
-                // done already (while this Basecamp was closed): take its files
-                if (ok && jbool(r, "finished", false)) { onWorkerEvent(where, {{"task", tid}, {"kind", "done"}, {"ok", jbool(r, "result", false)}}); return; }
-                if (ok) return;
-                if (Job* j = find(id)) logLine(*j, c->pairing().name + " refused the step: " + jstr(r, "error", "no answer"));
-                remoteEnded(key, false);
-            });
+            submitRemote(key, tid, id, a, where, 0);
         });
         // A download: watch the worker's folder, so transcribing starts as soon as the audio is there.
         if (slot.rfind("fetch/", 0) == 0) watchFetch(id);
         changed();
+    }
+
+    // Send a step to its worker. At a rented worker, be paid first: with auto-renew on, a lease that has
+    // ended (or ends within 30 s) is renewed and the step waits for the chain; just after a renewal the
+    // worker may still go by what it read before, so a "rental has ended" is tried again a few times.
+    void submitRemote(const std::string& key, const std::string& tid, const std::string& id, const json& a,
+                      const std::string& where, int attempt)
+    {
+        if (!rtasks.count(key)) return;    // cancelled meanwhile
+        auto* c = clientFor(where);
+        if (!c) { remoteEnded(key, false); return; }
+        auto again = [this, key, tid, id, a, where, attempt](int ms) {
+            QTimer::singleShot(ms, loop, guarded("remote submit", [this, key, tid, id, a, where, attempt] { submitRemote(key, tid, id, a, where, attempt + 1); }));
+        };
+        const long long now = QDateTime::currentMSecsSinceEpoch();
+        if (rentals.count(where) && attempt < 60) {
+            Rental& r = rentals[where];
+            if (r.paidThrough < now + 30000) {
+                if (r.state == "paying" || r.state == "confirming") { again(5000); return; }   // a payment is on its way
+                if (r.autoLeft > 0 && attempt == 0) {
+                    const std::string err = autoRenewOne(where, r);
+                    if (err.empty()) { again(5000); return; }
+                }
+            }
+        }
+        c->submit({{"id", tid}, {"job", id}, {"argv", a}}, [this, key, id, c, tid, where, attempt, again](bool ok, const json& r) {
+            // done already (while this Basecamp was closed): take its files
+            if (ok && jbool(r, "finished", false)) { onWorkerEvent(where, {{"task", tid}, {"kind", "done"}, {"ok", jbool(r, "result", false)}}); return; }
+            if (ok) return;
+            const std::string err = jstr(r, "error", "no answer");
+            if (err.find("rental has ended") != std::string::npos && rentals.count(where) && attempt < 60
+                && rentals[where].paidThrough > QDateTime::currentMSecsSinceEpoch() + 10000) { again(8000); return; }
+            if (Job* j = find(id)) logLine(*j, c->pairing().name + " refused the step: " + err);
+            remoteEnded(key, false);
+        });
     }
 
     void watchFetch(const std::string& id)
@@ -1301,6 +1339,9 @@ struct ReelcutCorePrivate {
         // market workers this Basecamp rented (by their offer)
         if (j.is_object() && j.contains("market") && j["market"].is_array())
             for (auto& o : j["market"]) addMarketClient(o);
+        if (j.is_object() && j.contains("autoRenew") && j["autoRenew"].is_object())
+            for (auto& [id, n] : j["autoRenew"].items())
+                if (marketOffers.count(id) && n.is_number_integer()) rentals[id].autoLeft = (int)std::clamp<long long>(n.get<long long>(), 0, 1000);
         loadMarketKey();
     }
     void saveWorkers()
@@ -1310,7 +1351,9 @@ struct ReelcutCorePrivate {
         for (auto& p : workerClients) cs.push_back(reelcut::remote::pairingJson(p, true));
         json mws = json::array();
         for (auto& [id, o] : marketOffers) mws.push_back(o);
-        json j = {{"workers", ws}, {"market", mws},
+        json autoRenew = json::object();
+        for (auto& [id, r] : rentals) if (r.autoLeft > 0) autoRenew[id] = r.autoLeft;
+        json j = {{"workers", ws}, {"market", mws}, {"autoRenew", autoRenew},
                   {"lez", {{"config", lezConfig}, {"storage", lezStorage}, {"password", lezPassword}, {"payer", lezPayer}}},
                   {"worker", {{"enabled", workerOn}, {"port", workerPort}, {"name", workerName}, {"clients", cs},
                               {"market", {{"enabled", marketOn}, {"sequencer", mkSequencer}, {"program", mkProgram}, {"account", mkAccount}, {"keepHours", mkKeepMs / 3600000}}}}}};
@@ -1324,7 +1367,8 @@ struct ReelcutCorePrivate {
     // dependency on LEZ), and the account that pays.
     std::string lezConfig, lezStorage, lezPassword, lezPayer;   // payer: base58
     std::unique_ptr<logos::LpClient> lez;
-    struct Rental { std::string state, error, tx; long long paidThrough = 0, checked = 0, wantAbove = 0; json offer; bool unsure = false; };
+    struct Rental { std::string state, error, tx; long long paidThrough = 0, checked = 0, wantAbove = 0; json offer; bool unsure = false;
+                    int autoLeft = 0; long long autoTried = 0; };   // auto-renew: periods it may still pay for
     std::map<std::string, Rental> rentals;                   // market worker id -> what the chain and the last rent said
 
     // A JSON-RPC call to a sequencer; cb(result or null, error).
@@ -1592,6 +1636,61 @@ struct ReelcutCorePrivate {
         changed();
     }
 
+    // ── auto-renew: while this Basecamp's jobs run at a rented worker, pay one more period shortly before
+    // the paid time ends, as long as the person's budget (periods) lasts. Nothing is paid for an idle worker.
+    bool autoArmed = false;
+    bool busyAt(const std::string& id) const
+    {
+        for (auto& j : jobs) if (j.where == id && (j.status == "queued" || j.status == "running")) return true;
+        for (auto& [k, t] : rtasks) if (k.rfind(id + "/", 0) == 0) return true;
+        return false;
+    }
+    void armAutoRenew()
+    {
+        if (autoArmed) return;
+        autoArmed = true;
+        QTimer::singleShot(30000, loop, guarded("auto-renew", [this] { autoArmed = false; autoRenewTick(); armAutoRenew(); }));
+    }
+    void autoRenewTick()
+    {
+        const long long now = QDateTime::currentMSecsSinceEpoch();
+        for (auto& [id, r] : rentals) {
+            if (r.autoLeft <= 0 || r.paidThrough <= 0 || r.state == "paying" || r.state == "confirming") continue;
+            if (r.state == "failed" && r.autoTried > 0 && now - r.autoTried < 5 * 60 * 1000) continue;   // after a failure: once per 5 minutes
+            const long long period = r.offer.is_object() ? (long long)jnum(r.offer, "periodMs", 0) : 0;
+            const long long lead = std::max<long long>(3 * 60 * 1000, period / 4);
+            if (r.paidThrough - now > lead || !busyAt(id)) continue;
+            autoRenewOne(id, r);
+        }
+    }
+    // Pay one more period from the auto-renew budget; "" when the payment went out.
+    std::string autoRenewOne(const std::string& id, Rental& r)
+    {
+        r.autoTried = QDateTime::currentMSecsSinceEpoch();
+        const std::string name = workers.count(id) ? workers.at(id)->pairing().name : id;
+        const std::string err = rent(id, 1);
+        if (!err.empty()) { r.error = "Auto-renew: " + err; changed(); return err; }
+        r.autoLeft -= 1;
+        for (auto& j : jobs)
+            if (j.where == id && (j.status == "queued" || j.status == "running"))
+                logLine(j, "Renewing the rental at " + name + " for one more period (auto-renew: " + std::to_string(r.autoLeft) + " left).");
+        saveWorkers();
+        changed();
+        return "";
+    }
+    std::string setAutoRenew(const std::string& id, int periods)
+    {
+        if (!marketOffers.count(id)) return "Not a market worker.";
+        Rental& r = rentals[id];
+        r.autoLeft = std::clamp(periods, 0, 1000);
+        r.autoTried = 0;
+        if (r.error.rfind("Auto-renew: ", 0) == 0) r.error.clear();
+        saveWorkers();
+        armAutoRenew();
+        changed();
+        return "";
+    }
+
     // After sending: read the lease until it's extended (blocks are seconds to minutes apart).
     void watchRental(const std::string& id, int tries)
     {
@@ -1646,6 +1745,7 @@ struct ReelcutCorePrivate {
         workers.erase(localId);
         addClient(p, localId);
         QTimer::singleShot(0, loop, guarded("rental", [this, localId] { refreshRental(localId); }));
+        armAutoRenew();
         return true;
     }
 
@@ -1759,7 +1859,8 @@ struct ReelcutCorePrivate {
                          {"version", jstr(h, "version", "")}, {"runner", jstr(h, "runner", "")},
                          {"market", id.rfind("m-", 0) == 0},
                          {"rental", rentals.count(id) ? json({{"state", rentals.at(id).state}, {"error", rentals.at(id).error}, {"tx", rentals.at(id).tx},
-                                                              {"paidThrough", rentals.at(id).paidThrough}, {"offer", rentals.at(id).offer}}) : json(nullptr)},
+                                                              {"paidThrough", rentals.at(id).paidThrough}, {"offer", rentals.at(id).offer},
+                                                              {"autoLeft", rentals.at(id).autoLeft}}) : json(nullptr)},
                          {"tasks", h.value("tasks", json::array())}, {"boot", c->boot()}, {"restarts", jnum(seen, "restarts", 0)},
                          {"waiting", [&] { int n = 0; for (auto& [k, t] : rtasks) if (k.rfind(id + "/", 0) == 0) ++n; return n; }()}});
         }
@@ -4633,6 +4734,13 @@ std::string ReelcutCoreImpl::setLezWallet(const std::string& walletJson)
 std::string ReelcutCoreImpl::rentWorker(const std::string& workerId, int64_t periods)
 {
     const std::string err = d->rent(workerId, (int)std::clamp<int64_t>(periods, 0, 10000));
+    if (!err.empty()) return json({{"ok", false}, {"error", err}}).dump();
+    return d->state().dump();
+}
+
+std::string ReelcutCoreImpl::setAutoRenew(const std::string& workerId, int64_t periods)
+{
+    const std::string err = d->setAutoRenew(workerId, (int)std::clamp<int64_t>(periods, 0, 1000));
     if (!err.empty()) return json({{"ok", false}, {"error", err}}).dump();
     return d->state().dump();
 }

@@ -1119,6 +1119,8 @@ Item {
                                 if (rent.state === "paying") t += " Paying…"
                                 if (rent.state === "confirming") t += " Waiting for the chain…"
                                 if (rent.state === "failed") t += " " + (rent.error || "The payment failed.")
+                                else if (rent.error) t += " " + rent.error
+                                if (rent.autoLeft > 0) t += " Auto-renew: up to " + rent.autoLeft + " more period" + (rent.autoLeft === 1 ? "" : "s") + "."
                                 return t
                             }
                         }
@@ -1127,6 +1129,14 @@ Item {
                             SpinBox { id: periodsBox; from: 1; to: offer.maxPeriods || 24; value: 1; editable: true }
                             LogosButton { text: "Rent"; enabled: rent.state !== "paying" && rent.state !== "confirming"
                                 onClicked: root.act("rentWorker", [modelData.id, periodsBox.value], "Paying " + modelData.name) }
+                        }
+                        RowLayout {
+                            spacing: 8
+                            Text { text: "Renew while my jobs run there, up to"; color: root.cText; font.pixelSize: 13; textFormat: Text.PlainText }
+                            SpinBox { id: autoBox; from: 0; to: 1000; value: rent.autoLeft || 0; editable: true }
+                            Text { text: "more periods"; color: root.cText; font.pixelSize: 13; textFormat: Text.PlainText }
+                            LogosButton { text: autoBox.value > 0 ? "Set" : "Turn off"
+                                onClicked: root.act("setAutoRenew", [modelData.id, autoBox.value], autoBox.value > 0 ? "Auto-renew set" : "Auto-renew off") }
                         }
                     }
                 }

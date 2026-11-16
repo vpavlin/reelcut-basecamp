@@ -212,6 +212,25 @@ Status: the lease program ships without reviews (rentals and periods sold only);
   byte-identical on the Basecamp side, no video copied; a local file import; cancel; Basecamp restart; worker restart.
 - **Not yet:** a test in the Basecamp GUI itself, and two different machines (the test was two sessions on one).
 
+### Done (step 2, market with leases on LEZ v0.4, same branch, not released)
+
+- **The link is encrypted end to end** (sealed envelopes and file streams with the pairing key; a market client's
+  key is the X25519 shared secret of the two keys).
+- **The lease program** `lez/reelcut_lease` (raw `lee_core`, LEZ v0.4.0-rc3): offer, rent N periods (pays the
+  treasury and extends the lease in one transaction; refused if the price or treasury changed since the payer read
+  them). Offers on Logos Messaging, checked on the chain.
+- **Trust:** a Basecamp trusts only its own sequencer and its own lease program (Settings, beside the wallet);
+  offers naming anything else are ignored. A worker opens a request before it asks the chain about the client.
+- **Paid time is enforced:** no new step after the lease ends; a running step stops 2 minutes after it.
+- **Auto-renew** (Settings, per rented worker: "renew while my jobs run there, up to N more periods"): while a job
+  is queued or running there, one more period is paid when less than max(3 min, a quarter period) is left, and
+  before a step is sent to a worker whose lease has ended. Nothing is paid for an idle worker. A job whose
+  budget ran out says so, and the worker refuses its next step until it's renewed.
+- **Reviewed twice by the SPEL agent** (program, then the C++ client and worker); every finding fixed.
+- **Tested** on a local chain through two logosctl sessions: rent, the refusals, auto-renew during a real job.
+- **Not yet:** the public LEZ testnet; a release (the VPS mock worker and lan03 still run the unencrypted 0.6.0
+  protocol); renting needs `lez_core` with the signing fix (logos-execution-zone-module PR #76) until it's released.
+
 ### Plan
 
 | # | What | Size | Needs from you |

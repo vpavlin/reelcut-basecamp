@@ -181,6 +181,9 @@ public:
     // your paying account through lez_core, and the lease is watched until the chain shows it. Progress in
     // snapshot().workers[].rental {state: paying|confirming|paid|failed, error, tx, paidThrough, offer}.
     std::string rentWorker(const std::string& workerId, int64_t periods);
+    // Auto-renew at a rented worker: while this Basecamp's jobs run there, pay one more period shortly before the
+    // paid time ends, up to `periods` more in all (0: off). snapshot().workers[].rental.autoLeft.
+    std::string setAutoRenew(const std::string& workerId, int64_t periods);
 
     void onContextReady() override;
 

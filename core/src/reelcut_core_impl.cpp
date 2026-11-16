@@ -1390,6 +1390,7 @@ struct ReelcutCorePrivate {
             // the key it was offered with must be the one on the chain: else it's someone else's address
             const std::string offeredKey = QByteArray::fromHex(QByteArray::fromStdString(jstr(marketOffers[id], "key", ""))).toStdString();
             if (offer->key != offeredKey) { r.error = "this offer's key isn't the one on the chain: not paying"; r.offer = json(); changed(); return; }
+            if (r.state != "failed" && r.state != "confirming") r.error.clear();   // read well: an older complaint is gone
             r.offer = {{"treasury", reelcut::lease::base58(offer->treasury)}, {"price", offer->priceLo}, {"priceHi", offer->priceHi}, {"periodMs", offer->periodMs},
                        {"maxPeriods", offer->maxPeriods}, {"open", offer->open}, {"rentals", offer->rentals}, {"periodsSold", offer->periodsSold}};
             const std::string lease = reelcut::lease::base58(reelcut::lease::leaseAccount(prog, wk, mkPublic));
@@ -1415,6 +1416,7 @@ struct ReelcutCorePrivate {
     {
         auto it = marketOffers.find(id);
         if (it == marketOffers.end()) return "Not a market worker.";
+        if (const std::string bad = offerUntrusted(it->second); !bad.empty()) return "This offer: " + bad + ".";
         if (lezConfig.empty() || lezStorage.empty() || lezPayer.empty()) return "Set your LEZ wallet and paying account in Settings first.";
         Rental& r = rentals[id];
         if (r.state == "paying" || r.state == "confirming") return "";
@@ -1422,7 +1424,6 @@ struct ReelcutCorePrivate {
         if (!jbool(r.offer, "open", false)) return "This worker takes no new rentals.";
         if (periods < 1 || periods > (int)jnum(r.offer, "maxPeriods", 1)) return "This worker rents 1 to " + std::to_string(jnum(r.offer, "maxPeriods", 1)) + " periods.";
         const json o = it->second;
-        if (const std::string bad = offerUntrusted(o); !bad.empty()) return "This offer: " + bad;
         std::string prog, wk, treasury, payer;
         if (!reelcut::lease::unbase58(mkProgram, prog) || !reelcut::lease::unbase58(jstr(o, "account", ""), wk) ||
             !reelcut::lease::unbase58(jstr(r.offer, "treasury", ""), treasury) || !reelcut::lease::unbase58(lezPayer, payer))
